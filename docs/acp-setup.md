@@ -160,10 +160,15 @@ directly.
 Edit `~/.hermes/config.yaml`:
 
 ```yaml
-model: openrouter/nous/hermes-3-llama-3.1-70b
+model:
+  provider: custom
+  default: ai/qwen3-coder-next
+  base_url: http://localhost:11434/v1
 ```
 
 Or set the `HERMES_MODEL` environment variable.
+
+For local-first editor setups, you can also pair a custom local endpoint with a curated fallback chain. ACP session model state will then advertise local models first while keeping cloud fallback entries limited to the configured fallback model instead of the entire public catalog.
 
 ### Toolsets
 
