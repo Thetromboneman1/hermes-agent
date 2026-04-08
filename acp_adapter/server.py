@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import ipaddress
+from urllib.parse import urlparse
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Deque, Optional
@@ -342,6 +344,7 @@ class HermesACPAgent(acp.Agent):
     def _discover_session_models(self, state: SessionState) -> list[str]:
         """Discover available models for the session's provider/runtime."""
         current = state.model or getattr(state.agent, "model", "") or ""
+        fast_model = os.getenv("HERMES_FAST_MODEL", "").strip()
         provider = getattr(state.agent, "provider", "")
         base_url = getattr(state.agent, "base_url", "")
         api_key = getattr(state.agent, "api_key", "")
@@ -372,9 +375,34 @@ class HermesACPAgent(acp.Agent):
                     entry_base = str(entry.get("base_url") or "").strip()
                     if not entry_base:
                         continue
+                    entry_model = str(entry.get("model") or "").strip()
                     entry_key = str(entry.get("api_key") or "").strip()
                     if "ollama.com" in entry_base.lower() and not entry_key:
                         entry_key = os.getenv("OLLAMA_API_KEY", "")
+
+                    parsed = urlparse(entry_base if "://" in entry_base else f"http://{entry_base}")
+                    host = (parsed.hostname or "").strip()
+                    is_private_endpoint = False
+                    if host:
+                        try:
+                            addr = ipaddress.ip_address(host)
+                            is_private_endpoint = bool(
+                                addr.is_private or addr.is_loopback or addr.is_link_local
+                            )
+                        except ValueError:
+                            is_private_endpoint = host in {
+                                "localhost",
+                                "host.docker.internal",
+                                "model-runner.docker.internal",
+                            }
+
+                    if entry_model:
+                        discovered.append(entry_model)
+
+                    # Keep cloud endpoints as curated fallback models only.
+                    if not is_private_endpoint:
+                        continue
+
                     entry_models = fetch_api_models(entry_key, entry_base)
                     if entry_models:
                         discovered.extend(entry_models)
@@ -387,21 +415,15 @@ class HermesACPAgent(acp.Agent):
                     if not isinstance(fb, dict):
                         continue
                     fb_model = str(fb.get("model") or "").strip()
-                    fb_base = str(fb.get("base_url") or "").strip()
-                    fb_key = str(fb.get("api_key") or "").strip()
                     if fb_model:
                         discovered.append(fb_model)
-                    if fb_base:
-                        if "ollama.com" in fb_base.lower() and not fb_key:
-                            fb_key = os.getenv("OLLAMA_API_KEY", "")
-                        fb_models = fetch_api_models(fb_key, fb_base)
-                        if fb_models:
-                            discovered.extend(fb_models)
         except Exception:
             logger.debug("Failed to discover ACP session models", exc_info=True)
 
         if current:
             discovered.insert(0, str(current))
+        if fast_model:
+            discovered.insert(1 if current else 0, fast_model)
 
         seen: set[str] = set()
         deduped: list[str] = []
