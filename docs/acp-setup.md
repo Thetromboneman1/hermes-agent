@@ -23,7 +23,18 @@ pip install -e ".[acp]"
 
 ## VS Code Setup
 
-### 1. Install the ACP Client extension
+### Option 1: Hermes AI Agent Extension
+
+For the local-first Docker workflow validated in the Hermes workspace docs, the recommended VS Code client is **Hermes AI Agent**.
+
+- Press `Ctrl+Shift+X` (or `Cmd+Shift+X` on macOS)
+- Search for **"Hermes AI Agent"**
+- Install publisher `joaompfp`
+- Reload VS Code
+
+The extension reads Hermes runtime configuration from `~/.hermes/config.yaml` and `~/.hermes/.env`, so provider, base URL, and fallback behavior stay consistent with the CLI and WebUI.
+
+### Option 2: Generic ACP Client
 
 Open VS Code and install **ACP Client** from the marketplace:
 
@@ -208,13 +219,13 @@ pip install -e ".[acp]"
 
 ### Permission denied for terminal commands
 
-If the editor blocks terminal commands, check your ACP Client extension
+If the editor blocks terminal commands, check your editor's ACP client
 settings for auto-approval or manual-approval preferences.
 
 ### Logs
 
 Hermes logs are written to stderr when running in ACP mode. Check:
-- VS Code: **Output** panel → select **ACP Client** or **Hermes Agent**
+- VS Code: **Output** panel → select **Hermes AI Agent**, **ACP Client**, or **Hermes Agent**
 - Zed: **View** → **Toggle Terminal** and check the process output
 - JetBrains: **Event Log** or the ACP tool window
 
