@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Deque, Optional
@@ -29,6 +30,8 @@ from acp.schema import (
     NewSessionResponse,
     PromptResponse,
     ResumeSessionResponse,
+    ModelInfo,
+    SessionModelState,
     SetSessionConfigOptionResponse,
     SetSessionModelResponse,
     SetSessionModeResponse,
@@ -273,7 +276,10 @@ class HermesACPAgent(acp.Agent):
         await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("New session %s (cwd=%s)", state.session_id, cwd)
         self._schedule_available_commands_update(state.session_id)
-        return NewSessionResponse(session_id=state.session_id)
+        return NewSessionResponse(
+            session_id=state.session_id,
+            models=self._build_session_model_state(state),
+        )
 
     async def load_session(
         self,
@@ -289,7 +295,7 @@ class HermesACPAgent(acp.Agent):
         await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("Loaded session %s", session_id)
         self._schedule_available_commands_update(session_id)
-        return LoadSessionResponse()
+        return LoadSessionResponse(models=self._build_session_model_state(state))
 
     async def resume_session(
         self,
@@ -305,7 +311,107 @@ class HermesACPAgent(acp.Agent):
         await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("Resumed session %s", state.session_id)
         self._schedule_available_commands_update(state.session_id)
-        return ResumeSessionResponse()
+        return ResumeSessionResponse(models=self._build_session_model_state(state))
+
+    def _build_session_model_state(self, state: SessionState) -> SessionModelState | None:
+        """Build ACP session model state for editor-side model pickers."""
+        model_ids = self._discover_session_models(state)
+        if not model_ids:
+            return None
+
+        current = state.model or getattr(state.agent, "model", "") or model_ids[0]
+        if current not in model_ids:
+            model_ids.insert(0, current)
+
+        available_models = [
+            ModelInfo(model_id=model_id, name=self._display_model_name(model_id))
+            for model_id in model_ids
+        ]
+        return SessionModelState(available_models=available_models, current_model_id=current)
+
+    @staticmethod
+    def _display_model_name(model_id: str) -> str:
+        """Render concise model names while preserving model ids for switching."""
+        name = str(model_id or "")
+        if name.startswith("docker.io/"):
+            name = name[len("docker.io/") :]
+        if name.endswith(":latest"):
+            name = name[: -len(":latest")]
+        return name or str(model_id)
+
+    def _discover_session_models(self, state: SessionState) -> list[str]:
+        """Discover available models for the session's provider/runtime."""
+        current = state.model or getattr(state.agent, "model", "") or ""
+        provider = getattr(state.agent, "provider", "")
+        base_url = getattr(state.agent, "base_url", "")
+        api_key = getattr(state.agent, "api_key", "")
+
+        discovered: list[str] = []
+        try:
+            from hermes_cli.models import fetch_api_models, normalize_provider, provider_model_ids
+            from hermes_cli.config import load_config
+
+            normalized = normalize_provider(provider)
+            if normalized == "custom":
+                live = fetch_api_models(str(api_key or ""), str(base_url or ""))
+                if live:
+                    discovered.extend(live)
+                else:
+                    discovered.extend(provider_model_ids("custom"))
+            else:
+                discovered.extend(provider_model_ids(normalized))
+
+            # Include models from named custom providers so ACP model pickers
+            # can switch directly between local and cloud endpoints.
+            cfg = load_config() or {}
+            custom_providers = cfg.get("custom_providers")
+            if isinstance(custom_providers, list):
+                for entry in custom_providers:
+                    if not isinstance(entry, dict):
+                        continue
+                    entry_base = str(entry.get("base_url") or "").strip()
+                    if not entry_base:
+                        continue
+                    entry_key = str(entry.get("api_key") or "").strip()
+                    if "ollama.com" in entry_base.lower() and not entry_key:
+                        entry_key = os.getenv("OLLAMA_API_KEY", "")
+                    entry_models = fetch_api_models(entry_key, entry_base)
+                    if entry_models:
+                        discovered.extend(entry_models)
+
+            # Also include explicit fallback models to keep picker options
+            # visible even if their endpoint is temporarily unavailable.
+            fallback_chain = cfg.get("fallback_providers")
+            if isinstance(fallback_chain, list):
+                for fb in fallback_chain:
+                    if not isinstance(fb, dict):
+                        continue
+                    fb_model = str(fb.get("model") or "").strip()
+                    fb_base = str(fb.get("base_url") or "").strip()
+                    fb_key = str(fb.get("api_key") or "").strip()
+                    if fb_model:
+                        discovered.append(fb_model)
+                    if fb_base:
+                        if "ollama.com" in fb_base.lower() and not fb_key:
+                            fb_key = os.getenv("OLLAMA_API_KEY", "")
+                        fb_models = fetch_api_models(fb_key, fb_base)
+                        if fb_models:
+                            discovered.extend(fb_models)
+        except Exception:
+            logger.debug("Failed to discover ACP session models", exc_info=True)
+
+        if current:
+            discovered.insert(0, str(current))
+
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for model_id in discovered:
+            text = str(model_id or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            deduped.append(text)
+        return deduped
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         state = self.session_manager.get_session(session_id)
