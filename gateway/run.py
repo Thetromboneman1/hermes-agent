@@ -29,6 +29,12 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
 
+try:
+    from agent.redact import RedactingFormatter
+except Exception:
+    # Fail open for stderr formatting if redaction module is unavailable.
+    RedactingFormatter = logging.Formatter
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.

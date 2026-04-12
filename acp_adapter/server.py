@@ -317,11 +317,27 @@ class HermesACPAgent(acp.Agent):
 
     def _build_session_model_state(self, state: SessionState) -> SessionModelState | None:
         """Build ACP session model state for editor-side model pickers."""
-        model_ids = self._discover_session_models(state)
+        raw_model_ids = self._discover_session_models(state)
+        if not raw_model_ids:
+            return None
+
+        # ACP schema requires plain strings; tests may provide MagicMock values.
+        # Keep only non-empty string model ids.
+        model_ids: list[str] = []
+        seen: set[str] = set()
+        for model_id in raw_model_ids:
+            if not isinstance(model_id, str):
+                continue
+            text = model_id.strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            model_ids.append(text)
         if not model_ids:
             return None
 
-        current = state.model or getattr(state.agent, "model", "") or model_ids[0]
+        current_candidate = state.model or getattr(state.agent, "model", "") or model_ids[0]
+        current = current_candidate.strip() if isinstance(current_candidate, str) else model_ids[0]
         if current not in model_ids:
             model_ids.insert(0, current)
 
@@ -343,7 +359,8 @@ class HermesACPAgent(acp.Agent):
 
     def _discover_session_models(self, state: SessionState) -> list[str]:
         """Discover available models for the session's provider/runtime."""
-        current = state.model or getattr(state.agent, "model", "") or ""
+        current_candidate = state.model or getattr(state.agent, "model", "") or ""
+        current = current_candidate.strip() if isinstance(current_candidate, str) else ""
         fast_model = os.getenv("HERMES_FAST_MODEL", "").strip()
         provider = getattr(state.agent, "provider", "")
         base_url = getattr(state.agent, "base_url", "")
@@ -421,7 +438,7 @@ class HermesACPAgent(acp.Agent):
             logger.debug("Failed to discover ACP session models", exc_info=True)
 
         if current:
-            discovered.insert(0, str(current))
+            discovered.insert(0, current)
         if fast_model:
             discovered.insert(1 if current else 0, fast_model)
 
