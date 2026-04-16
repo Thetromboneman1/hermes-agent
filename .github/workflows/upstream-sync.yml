@@ -1,0 +1,104 @@
+name: Sync with NousResearch upstream
+
+on:
+  schedule:
+    # Daily at 04:00 UTC (midnight US Eastern)
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      force_rebase:
+        description: 'Force rebase custom branches even if main unchanged'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync-main:
+    name: Sync main ← NousResearch/hermes-agent
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      before: ${{ steps.sync.outputs.before }}
+      after: ${{ steps.sync.outputs.after }}
+
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream --prune
+
+      - name: Sync main from upstream
+        id: sync
+        run: |
+          git checkout main
+          BEFORE=$(git rev-parse HEAD)
+          echo "before=$BEFORE" >> "$GITHUB_OUTPUT"
+
+          # Prefer fast-forward; fall back to merge commit
+          if git merge --ff-only upstream/main; then
+            echo "Fast-forward merge succeeded"
+          else
+            git merge upstream/main --no-edit --strategy-option=theirs
+            echo "Created merge commit (non-fast-forward)"
+          fi
+
+          AFTER=$(git rev-parse HEAD)
+          echo "after=$AFTER" >> "$GITHUB_OUTPUT"
+
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ main updated: $BEFORE → $AFTER"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️  main already up to date"
+          fi
+
+          git push origin main
+
+  rebase-custom-branches:
+    name: Rebase local-first-acp-optimizations
+    runs-on: ubuntu-latest
+    needs: sync-main
+    if: needs.sync-main.outputs.changed == 'true' || inputs.force_rebase == true
+
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Rebase local-first-acp-optimizations onto updated main
+        id: rebase
+        continue-on-error: true
+        run: |
+          BRANCH="local-first-acp-optimizations"
+          # Check branch exists in fork
+          if ! git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            echo "ℹ️  Branch $BRANCH not found in fork — skipping"
+            exit 0
+          fi
+          git checkout "$BRANCH"
+          git rebase main && \
+            git push origin "$BRANCH" --force-with-lease && \
+            echo "✅ $BRANCH rebased and pushed" || \
+            (git rebase --abort && \
+             echo "::warning::Rebase conflict on $BRANCH — manual intervention needed")
