@@ -47,6 +47,10 @@ jobs:
           BEFORE=$(git rev-parse HEAD)
           echo "before=$BEFORE" >> "$GITHUB_OUTPUT"
 
+          # Save the fork's workflow files before merging
+          mkdir -p /tmp/fork-workflows
+          cp -r .github/workflows/* /tmp/fork-workflows/ 2>/dev/null || true
+
           # Prefer fast-forward; fall back to merge commit
           if git merge --ff-only upstream/main; then
             echo "Fast-forward merge succeeded"
@@ -55,14 +59,15 @@ jobs:
             echo "Created merge commit (non-fast-forward)"
           fi
 
-          # Keep fork's workflow files (don't inherit upstream workflow changes)
-          # This prevents GitHub's restriction on GITHUB_TOKEN modifying workflows
-          git checkout HEAD -- .github/workflows/
-          
-          # If workflows were changed by merge, stage the revert and amend commit
-          if ! git diff --cached --quiet .github/workflows/; then
-            git add .github/workflows/
-            git commit --amend --no-edit || true
+          # Restore fork's workflow files to prevent GitHub App restriction
+          # (GitHub won't allow GITHUB_TOKEN to modify workflow files)
+          if [ -d /tmp/fork-workflows ] && [ "$(ls -A /tmp/fork-workflows)" ]; then
+            rm -rf .github/workflows/*
+            cp /tmp/fork-workflows/* .github/workflows/
+            if ! git diff --quiet .github/workflows/; then
+              git add .github/workflows/
+              git commit --amend --no-edit || true
+            fi
           fi
 
           AFTER=$(git rev-parse HEAD)
