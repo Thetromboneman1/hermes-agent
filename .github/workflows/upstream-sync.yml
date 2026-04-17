@@ -13,7 +13,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 jobs:
   sync-main:
@@ -54,6 +53,16 @@ jobs:
           else
             git merge upstream/main --no-edit --strategy-option=theirs
             echo "Created merge commit (non-fast-forward)"
+          fi
+
+          # Keep fork's workflow files (don't inherit upstream workflow changes)
+          # This prevents GitHub's restriction on GITHUB_TOKEN modifying workflows
+          git checkout HEAD -- .github/workflows/
+          
+          # If workflows were changed by merge, stage the revert and amend commit
+          if ! git diff --cached --quiet .github/workflows/; then
+            git add .github/workflows/
+            git commit --amend --no-edit || true
           fi
 
           AFTER=$(git rev-parse HEAD)
