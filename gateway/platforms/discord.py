@@ -80,6 +80,41 @@ def check_discord_requirements() -> bool:
     return DISCORD_AVAILABLE
 
 
+def _build_allowed_mentions():
+    """Build Discord ``AllowedMentions`` with safe defaults, overridable via env.
+
+    Discord bots default to parsing ``@everyone``, ``@here``, role pings, and
+    user pings when ``allowed_mentions`` is unset on the client — any LLM
+    output or echoed user content that contains ``@everyone`` would therefore
+    ping the whole server. We explicitly deny ``@everyone`` and role pings
+    by default and keep user / replied-user pings enabled so normal
+    conversation still works.
+
+    Override via environment variables (or ``discord.allow_mentions.*`` in
+    config.yaml):
+
+        DISCORD_ALLOW_MENTION_EVERYONE      default false  — @everyone + @here
+        DISCORD_ALLOW_MENTION_ROLES         default false  — @role pings
+        DISCORD_ALLOW_MENTION_USERS         default true   — @user pings
+        DISCORD_ALLOW_MENTION_REPLIED_USER  default true   — reply-ping author
+    """
+    if not DISCORD_AVAILABLE:
+        return None
+
+    def _b(name: str, default: bool) -> bool:
+        raw = os.getenv(name, "").strip().lower()
+        if not raw:
+            return default
+        return raw in ("true", "1", "yes", "on")
+
+    return discord.AllowedMentions(
+        everyone=_b("DISCORD_ALLOW_MENTION_EVERYONE", False),
+        roles=_b("DISCORD_ALLOW_MENTION_ROLES", False),
+        users=_b("DISCORD_ALLOW_MENTION_USERS", True),
+        replied_user=_b("DISCORD_ALLOW_MENTION_REPLIED_USER", True),
+    )
+
+
 class VoiceReceiver:
     """Captures and decodes voice audio from a Discord voice channel.
 
@@ -235,6 +270,7 @@ class VoiceReceiver:
         # Calculate dynamic RTP header size (RFC 9335 / rtpsize mode)
         cc = first_byte & 0x0F  # CSRC count
         has_extension = bool(first_byte & 0x10)  # extension bit
+        has_padding = bool(first_byte & 0x20)  # padding bit (RFC 3550 §5.1)
         header_size = 12 + (4 * cc) + (4 if has_extension else 0)
 
         if len(data) < header_size + 4:  # need at least header + nonce
@@ -277,6 +313,31 @@ class VoiceReceiver:
         # Skip encrypted extension data to get the actual opus payload
         if ext_data_len and len(decrypted) > ext_data_len:
             decrypted = decrypted[ext_data_len:]
+
+        # --- Strip RTP padding (RFC 3550 §5.1) ---
+        # When the P bit is set, the last payload byte holds the count of
+        # trailing padding bytes (including itself) that must be removed
+        # before further processing. Skipping this passes padding-contaminated
+        # bytes into DAVE/Opus and corrupts inbound audio.
+        if has_padding:
+            if not decrypted:
+                if self._packet_debug_count <= 10:
+                    logger.warning(
+                        "RTP padding bit set but no payload (ssrc=%d)", ssrc,
+                    )
+                return
+            pad_len = decrypted[-1]
+            if pad_len == 0 or pad_len > len(decrypted):
+                if self._packet_debug_count <= 10:
+                    logger.warning(
+                        "Invalid RTP padding length %d for payload size %d (ssrc=%d)",
+                        pad_len, len(decrypted), ssrc,
+                    )
+                return
+            decrypted = decrypted[:-pad_len]
+            if not decrypted:
+                # Padding consumed entire payload — nothing to decode
+                return
 
         # --- DAVE E2EE decrypt ---
         if self._dave_session:
@@ -530,10 +591,15 @@ class DiscordAdapter(BasePlatformAdapter):
             if proxy_url:
                 logger.info("[%s] Using proxy for Discord: %s", self.name, proxy_url)
 
-            # Create bot — proxy= for HTTP, connector= for SOCKS
+            # Create bot — proxy= for HTTP, connector= for SOCKS.
+            # allowed_mentions is set with safe defaults (no @everyone/roles)
+            # so LLM output or echoed user content can't ping the whole
+            # server; override per DISCORD_ALLOW_MENTION_* env vars or the
+            # discord.allow_mentions.* block in config.yaml.
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
+                allowed_mentions=_build_allowed_mentions(),
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure
@@ -807,7 +873,10 @@ class DiscordAdapter(BasePlatformAdapter):
             if reply_to and self._reply_to_mode != "off":
                 try:
                     ref_msg = await channel.fetch_message(int(reply_to))
-                    reference = ref_msg
+                    if hasattr(ref_msg, "to_reference"):
+                        reference = ref_msg.to_reference(fail_if_not_exists=False)
+                    else:
+                        reference = ref_msg
                 except Exception as e:
                     logger.debug("Could not fetch reply-to message: %s", e)
 
@@ -825,14 +894,20 @@ class DiscordAdapter(BasePlatformAdapter):
                     err_text = str(e)
                     if (
                         chunk_reference is not None
-                        and "error code: 50035" in err_text
-                        and "Cannot reply to a system message" in err_text
+                        and (
+                            (
+                                "error code: 50035" in err_text
+                                and "Cannot reply to a system message" in err_text
+                            )
+                            or "error code: 10008" in err_text
+                        )
                     ):
                         logger.warning(
-                            "[%s] Reply target %s is a Discord system message; retrying send without reply reference",
+                            "[%s] Reply target %s rejected the reply reference; retrying send without reply reference",
                             self.name,
                             reply_to,
                         )
+                        reference = None
                         msg = await channel.send(
                             content=chunk,
                             reference=None,

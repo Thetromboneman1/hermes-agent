@@ -78,6 +78,10 @@ QWEN_OAUTH_CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56"
 QWEN_OAUTH_TOKEN_URL = "https://chat.qwen.ai/api/v1/oauth2/token"
 QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 
+# Google Gemini OAuth (google-gemini-cli provider, Cloud Code Assist backend)
+DEFAULT_GEMINI_CLOUDCODE_BASE_URL = "cloudcode-pa://google"
+GEMINI_OAUTH_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 60  # refresh 60s before expiry
+
 
 # =============================================================================
 # Provider Registry
@@ -121,6 +125,12 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         name="Qwen OAuth",
         auth_type="oauth_external",
         inference_base_url=DEFAULT_QWEN_BASE_URL,
+    ),
+    "google-gemini-cli": ProviderConfig(
+        id="google-gemini-cli",
+        name="Google Gemini (OAuth)",
+        auth_type="oauth_external",
+        inference_base_url=DEFAULT_GEMINI_CLOUDCODE_BASE_URL,
     ),
     "copilot": ProviderConfig(
         id="copilot",
@@ -763,6 +773,28 @@ def is_source_suppressed(provider_id: str, source: str) -> bool:
         return False
 
 
+def unsuppress_credential_source(provider_id: str, source: str) -> bool:
+    """Clear a suppression marker so the source will be re-seeded on the next load.
+
+    Returns True if a marker was cleared, False if no marker existed.
+    """
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        suppressed = auth_store.get("suppressed_sources")
+        if not isinstance(suppressed, dict):
+            return False
+        provider_list = suppressed.get(provider_id)
+        if not isinstance(provider_list, list) or source not in provider_list:
+            return False
+        provider_list.remove(source)
+        if not provider_list:
+            suppressed.pop(provider_id, None)
+        if not suppressed:
+            auth_store.pop("suppressed_sources", None)
+        _save_auth_store(auth_store)
+        return True
+
+
 def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
     """Return persisted auth state for a provider, or None."""
     auth_store = _load_auth_store()
@@ -939,7 +971,7 @@ def resolve_provider(
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
-        "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
+        "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth", "google-gemini-cli": "google-gemini-cli", "gemini-cli": "google-gemini-cli", "gemini-oauth": "google-gemini-cli",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
         "mimo": "xiaomi", "xiaomi-mimo": "xiaomi",
         "aws": "bedrock", "aws-bedrock": "bedrock", "amazon-bedrock": "bedrock", "amazon": "bedrock",
@@ -1249,6 +1281,83 @@ def get_qwen_auth_status() -> Dict[str, Any]:
             "auth_file": str(auth_path),
             "error": str(exc),
         }
+
+
+# =============================================================================
+# Google Gemini OAuth (google-gemini-cli) — PKCE flow + Cloud Code Assist.
+#
+# Tokens live in ~/.hermes/auth/google_oauth.json (managed by agent.google_oauth).
+# The `base_url` here is the marker "cloudcode-pa://google" that run_agent.py
+# uses to construct a GeminiCloudCodeClient instead of the default OpenAI SDK.
+# Actual HTTP traffic goes to https://cloudcode-pa.googleapis.com/v1internal:*.
+# =============================================================================
+
+def resolve_gemini_oauth_runtime_credentials(
+    *,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """Resolve runtime OAuth creds for google-gemini-cli."""
+    try:
+        from agent.google_oauth import (
+            GoogleOAuthError,
+            _credentials_path,
+            get_valid_access_token,
+            load_credentials,
+        )
+    except ImportError as exc:
+        raise AuthError(
+            f"agent.google_oauth is not importable: {exc}",
+            provider="google-gemini-cli",
+            code="google_oauth_module_missing",
+        ) from exc
+
+    try:
+        access_token = get_valid_access_token(force_refresh=force_refresh)
+    except GoogleOAuthError as exc:
+        raise AuthError(
+            str(exc),
+            provider="google-gemini-cli",
+            code=exc.code,
+        ) from exc
+
+    creds = load_credentials()
+    base_url = DEFAULT_GEMINI_CLOUDCODE_BASE_URL
+    return {
+        "provider": "google-gemini-cli",
+        "base_url": base_url,
+        "api_key": access_token,
+        "source": "google-oauth",
+        "expires_at_ms": (creds.expires_ms if creds else None),
+        "auth_file": str(_credentials_path()),
+        "email": (creds.email if creds else "") or "",
+        "project_id": (creds.project_id if creds else "") or "",
+    }
+
+
+def get_gemini_oauth_auth_status() -> Dict[str, Any]:
+    """Return a status dict for `hermes auth list` / `hermes status`."""
+    try:
+        from agent.google_oauth import _credentials_path, load_credentials
+    except ImportError:
+        return {"logged_in": False, "error": "agent.google_oauth unavailable"}
+    auth_path = _credentials_path()
+    creds = load_credentials()
+    if creds is None or not creds.access_token:
+        return {
+            "logged_in": False,
+            "auth_file": str(auth_path),
+            "error": "not logged in",
+        }
+    return {
+        "logged_in": True,
+        "auth_file": str(auth_path),
+        "source": "google-oauth",
+        "api_key": creds.access_token,
+        "expires_at_ms": creds.expires_ms,
+        "email": creds.email,
+        "project_id": creds.project_id,
+    }
+
 
 
 # =============================================================================
@@ -2469,6 +2578,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_codex_auth_status()
     if target == "qwen-oauth":
         return get_qwen_auth_status()
+    if target == "google-gemini-cli":
+        return get_gemini_oauth_auth_status()
     if target == "copilot-acp":
         return get_external_process_provider_status(target)
     # API-key providers
@@ -3208,6 +3319,14 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
 
         inference_base_url = auth_state["inference_base_url"]
 
+        # Snapshot the prior active_provider BEFORE _save_provider_state
+        # overwrites it to "nous".  If the user picks "Skip (keep current)"
+        # during model selection below, we restore this so the user's previous
+        # provider (e.g. openrouter) is preserved.
+        with _auth_store_lock():
+            _prior_store = _load_auth_store()
+            prior_active_provider = _prior_store.get("active_provider")
+
         with _auth_store_lock():
             auth_store = _load_auth_store()
             _save_provider_state(auth_store, "nous", auth_state)
@@ -3267,6 +3386,27 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
             print(f"Login succeeded, but could not fetch available models. Reason: {message}")
 
         # Write provider + model atomically so config is never mismatched.
+        # If no model was selected (user picked "Skip (keep current)",
+        # model list fetch failed, or no curated models were available),
+        # preserve the user's previous provider — don't silently switch
+        # them to Nous with a mismatched model.  The Nous OAuth tokens
+        # stay saved for future use.
+        if not selected_model:
+            # Restore the prior active_provider that _save_provider_state
+            # overwrote to "nous".  config.yaml model.provider is left
+            # untouched, so the user's previous provider is fully preserved.
+            with _auth_store_lock():
+                auth_store = _load_auth_store()
+                if prior_active_provider:
+                    auth_store["active_provider"] = prior_active_provider
+                else:
+                    auth_store.pop("active_provider", None)
+                _save_auth_store(auth_store)
+            print()
+            print("No provider change. Nous credentials saved for future use.")
+            print("  Run `hermes model` again to switch to Nous Portal.")
+            return
+
         config_path = _update_config_for_provider(
             "nous", inference_base_url, default_model=selected_model,
         )

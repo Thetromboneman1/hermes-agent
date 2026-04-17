@@ -2618,6 +2618,9 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
         }
+        platform_group_env_map = {
+            Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
+        }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
             Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
@@ -2649,11 +2652,22 @@ class GatewayRunner:
 
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
+        group_allowlist = ""
+        if source.chat_type == "group":
+            group_allowlist = os.getenv(platform_group_env_map.get(source.platform, ""), "").strip()
         global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
 
-        if not platform_allowlist and not global_allowlist:
+        if not platform_allowlist and not group_allowlist and not global_allowlist:
             # No allowlists configured -- check global allow-all flag
             return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes")
+
+        # Some platforms authorize group traffic by chat ID rather than sender ID.
+        if group_allowlist and source.chat_type == "group" and source.chat_id:
+            allowed_group_ids = {
+                chat_id.strip() for chat_id in group_allowlist.split(",") if chat_id.strip()
+            }
+            if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
+                return True
 
         # Check if user is in any allowlist
         allowed_ids = set()
@@ -6889,7 +6903,7 @@ class GatewayRunner:
             except Exception as exc:
                 return f"✗ Failed to upload debug report: {exc}"
 
-            # Schedule auto-deletion after 1 hour
+            # Schedule auto-deletion after 6 hours
             _schedule_auto_delete(list(urls.values()))
 
             lines = [_GATEWAY_PRIVACY_NOTICE, "", "**Debug report uploaded:**", ""]
@@ -6898,7 +6912,7 @@ class GatewayRunner:
                 lines.append(f"`{label:<{label_width}}`  {url}")
 
             lines.append("")
-            lines.append("⏱ Pastes will auto-delete in 1 hour.")
+            lines.append("⏱ Pastes will auto-delete in 6 hours.")
             lines.append("For full log uploads, use `hermes debug share` from the CLI.")
             lines.append("Share these links with the Hermes team for support.")
             return "\n".join(lines)
@@ -7982,12 +7996,15 @@ class GatewayRunner:
                 if _adapter:
                     _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
                     _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
+                    _buffer_only = False
                     if source.platform == Platform.MATRIX:
                         _effective_cursor = ""
+                        _buffer_only = True
                     _consumer_cfg = StreamConsumerConfig(
                         edit_interval=_scfg.edit_interval,
                         buffer_threshold=_scfg.buffer_threshold,
                         cursor=_effective_cursor,
+                        buffer_only=_buffer_only,
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -8553,12 +8570,15 @@ class GatewayRunner:
                         # Some Matrix clients render the streaming cursor
                         # as a visible tofu/white-box artifact.  Keep
                         # streaming text on Matrix, but suppress the cursor.
+                        _buffer_only = False
                         if source.platform == Platform.MATRIX:
                             _effective_cursor = ""
+                            _buffer_only = True
                         _consumer_cfg = StreamConsumerConfig(
                             edit_interval=_scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
                             cursor=_effective_cursor,
+                            buffer_only=_buffer_only,
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
@@ -8816,7 +8836,7 @@ class GatewayRunner:
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
-                        asyncio.run_coroutine_threadsafe(
+                        _approval_result = asyncio.run_coroutine_threadsafe(
                             _status_adapter.send_exec_approval(
                                 chat_id=_status_chat_id,
                                 command=cmd,
@@ -8826,7 +8846,12 @@ class GatewayRunner:
                             ),
                             _loop_for_step,
                         ).result(timeout=15)
-                        return
+                        if _approval_result.success:
+                            return
+                        logger.warning(
+                            "Button-based approval failed (send returned error), falling back to text: %s",
+                            _approval_result.error,
+                        )
                     except Exception as _e:
                         logger.warning(
                             "Button-based approval failed, falling back to text: %s", _e
@@ -9456,6 +9481,7 @@ class GatewayRunner:
                 next_source = source
                 next_message = pending
                 next_message_id = None
+                next_channel_prompt = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     next_message = await self._prepare_inbound_message_text(
@@ -9466,6 +9492,7 @@ class GatewayRunner:
                     if next_message is None:
                         return result
                     next_message_id = getattr(pending_event, "message_id", None)
+                    next_channel_prompt = getattr(pending_event, "channel_prompt", None)
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -9489,7 +9516,7 @@ class GatewayRunner:
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
-                    channel_prompt=pending_event.channel_prompt,
+                    channel_prompt=next_channel_prompt,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
