@@ -888,3 +888,46 @@ display:
 #   # Names and usernames are NOT affected (user-chosen, publicly visible).
 #   # Routing/delivery still uses the original values internally.
 #   redact_pii: false
+
+# =============================================================================
+# Local Hardware Tuning (Ollama / LM Studio / vLLM)
+# =============================================================================
+# Configuration profile for running Hermes with local LLMs on consumer hardware.
+# This example uses Qwen 14B via Ollama, but works with any local inference server.
+#
+# IMPORTANT: Some Reddit/forum threads reference non-existent config keys:
+#   - "long_cache" ❌ NOT a Hermes key (use context_length instead)
+#   - "max_context" ❌ NOT a Hermes key (use context_length instead)
+#   - "api_mode" ❌ NOT a Hermes key (use provider: "custom" instead)
+# This config shows the VALID way to set up local models.
+#
+# Uncomment and adapt the section below for local hardware:
+#
+# model:
+#   default: "qwen:14b"
+#   provider: "custom"
+#   base_url: "http://localhost:11434/v1"  # Ollama default
+#   # For LM Studio, use: http://localhost:1234/v1
+#   # For vLLM, use: http://localhost:8000/v1
+#   context_length: 32768  # Adjust based on your model and VRAM
+#
+# agent:
+#   # Enable tool-use guidance for local models (improves JSON tool calling)
+#   tool_use_enforcement: true
+#   # Compression settings for limited VRAM
+#   compression: true
+#   compress_ratio: 0.5  # Keep 50% of history; adjust for your model
+#   compress_token_threshold: 2000  # Trigger compression at 2k tokens
+#   compress_before_each_turn: true  # Compress before every LLM call
+#
+# gateway:
+#   # Disable gateway features that add overhead
+#   default_gateway: ""
+#   enable_gateway: false
+#
+# execution:
+#   # Reduce parallelism on limited hardware
+#   max_concurrent_tools: 2
+#   tool_timeout: 30
+#
+# personality: "concise"  # Shorter responses = faster inference

@@ -48,6 +48,51 @@ hermes              # start chatting!
 
 ---
 
+## Local Model Tuning (Ollama / LM Studio / vLLM)
+
+Want to run Hermes with local LLMs on your own hardware? Start with Qwen 14B or another model that fits your GPU:
+
+1. **Start a local inference server:**
+   ```bash
+   # Ollama
+   ollama run qwen:14b
+
+   # LM Studio: Open the app, load a model, start local server on port 1234
+
+   # vLLM
+   python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-14B-Instruct
+   ```
+
+2. **Configure Hermes:**
+   ```bash
+   hermes model  # Choose "Custom (Ollama/LM Studio/vLLM)"
+   # Then set provider to custom, base_url to http://localhost:11434/v1 (Ollama) or http://localhost:1234/v1 (LM Studio)
+   ```
+
+3. **Enable tool-use enforcement** (critical for local models — prevents JSON narration bugs):
+   ```bash
+   hermes config set agent.tool_use_enforcement true
+   ```
+
+4. **Tune for your hardware** (in `~/.hermes/cli-config.yaml`):
+   ```yaml
+   agent:
+     compression: true
+     compress_ratio: 0.5        # Adjust based on available VRAM
+     compress_token_threshold: 2000
+   model:
+     context_length: 32768      # Reduce if running out of memory
+   ```
+
+⚠️ **Beware Reddit/forum snippets with these non-existent Hermes config keys:**
+- `long_cache`, `max_context` — Use `context_length` instead
+- `api_mode` — Use `provider: custom` instead
+- `auxiliary` in non-standard ways — Refer to [cli-config.yaml.example](cli-config.yaml.example) for correct structure
+
+See [Local Hardware Tuning](https://hermes-agent.nousresearch.com/docs/guides/local-llm-on-mac) in the full docs for more detail.
+
+---
+
 ## Getting Started
 
 ```bash
