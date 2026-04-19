@@ -1933,6 +1933,24 @@ class DiscordAdapter(BasePlatformAdapter):
         the "thinking..." indicator is replaced with that text; otherwise it
         is deleted so the channel isn't cluttered.
         """
+        # Log the invoker so ghost-command reports can be triaged.  Discord
+        # native slash invocations are always user-initiated (no bot can fire
+        # them), but mobile autocomplete / keyboard shortcuts / other users
+        # in the same channel are easy to miss in post-mortems.
+        try:
+            _user = interaction.user
+            _chan_id = getattr(interaction.channel, "id", None) or getattr(interaction, "channel_id", None)
+            logger.info(
+                "[Discord] slash '%s' invoked by user=%s id=%s channel=%s guild=%s",
+                command_text,
+                getattr(_user, "name", "?"),
+                getattr(_user, "id", "?"),
+                _chan_id,
+                getattr(interaction, "guild_id", None),
+            )
+        except Exception:
+            pass  # logging must never block command dispatch
+
         await interaction.response.defer(ephemeral=True)
         event = self._build_slash_event(interaction, command_text)
         await self.handle_message(event)
@@ -1993,6 +2011,11 @@ class DiscordAdapter(BasePlatformAdapter):
         @tree.command(name="stop", description="Stop the running Hermes agent")
         async def slash_stop(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/stop", "Stop requested~")
+
+        @tree.command(name="steer", description="Inject a message after the next tool call (no interrupt)")
+        @discord.app_commands.describe(prompt="Text to inject into the agent's next tool result")
+        async def slash_steer(interaction: discord.Interaction, prompt: str):
+            await self._run_simple_slash(interaction, f"/steer {prompt}".strip())
 
         @tree.command(name="compress", description="Compress conversation context")
         async def slash_compress(interaction: discord.Interaction):
