@@ -403,7 +403,11 @@ DEFAULT_CONFIG = {
         "container_persistent": True,   # Persist filesystem across sessions
         # Docker volume mounts — share host directories with the container.
         # Each entry is "host_path:container_path" (standard Docker -v syntax).
-        # Example: ["/home/user/projects:/workspace/projects", "/data:/data"]
+        # Example:
+        # ["/home/user/projects:/workspace/projects",
+        #  "/home/user/.hermes/cache/documents:/output"]
+        # For gateway MEDIA delivery, write inside Docker to /output/... and emit
+        # the host-visible path in MEDIA:, not the container path.
         "docker_volumes": [],
         # Explicit opt-in: mount the host cwd into /workspace for Docker sessions.
         # Default off because passing host directories into a sandbox weakens isolation.
@@ -470,13 +474,6 @@ DEFAULT_CONFIG = {
         },
     },
 
-    "smart_model_routing": {
-        "enabled": False,
-        "max_simple_chars": 160,
-        "max_simple_words": 28,
-        "cheap_model": {},
-    },
-    
     # Auxiliary model config — provider:model for each side task.
     # Format: provider is the provider name, model is the model slug.
     # "auto" for provider = auto-detect best available provider.
@@ -708,6 +705,14 @@ DEFAULT_CONFIG = {
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
+        # discord_server tool: restrict which actions the agent may call.
+        # Default (empty) = all actions allowed (subject to bot privileged intents).
+        # Accepts comma-separated string ("list_guilds,list_channels,fetch_messages")
+        # or YAML list. Unknown names are dropped with a warning at load time.
+        # Actions: list_guilds, server_info, list_channels, channel_info,
+        # list_roles, member_info, search_members, fetch_messages, list_pins,
+        # pin_message, unpin_message, create_thread, add_role, remove_role.
+        "server_actions": "",
     },
 
     # WhatsApp platform settings (gateway mode)
@@ -2861,24 +2866,11 @@ _FALLBACK_COMMENT = """
 #   minimax      (MINIMAX_API_KEY)     — MiniMax
 #   minimax-cn   (MINIMAX_CN_API_KEY)  — MiniMax (China)
 #
-# For custom OpenAI-compatible endpoints, add base_url and api_key_env.
+# For custom OpenAI-compatible endpoints, add base_url and key_env.
 #
 # fallback_model:
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
-#
-# ── Smart Model Routing ────────────────────────────────────────────────
-# Optional cheap-vs-strong routing for simple turns.
-# Keeps the primary model for complex work, but can route short/simple
-# messages to a cheaper model across providers.
-#
-# smart_model_routing:
-#   enabled: true
-#   max_simple_chars: 160
-#   max_simple_words: 28
-#   cheap_model:
-#     provider: openrouter
-#     model: google/gemini-2.5-flash
 """
 
 
@@ -2905,24 +2897,11 @@ _COMMENTED_SECTIONS = """
 #   minimax      (MINIMAX_API_KEY)     — MiniMax
 #   minimax-cn   (MINIMAX_CN_API_KEY)  — MiniMax (China)
 #
-# For custom OpenAI-compatible endpoints, add base_url and api_key_env.
+# For custom OpenAI-compatible endpoints, add base_url and key_env.
 #
 # fallback_model:
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
-#
-# ── Smart Model Routing ────────────────────────────────────────────────
-# Optional cheap-vs-strong routing for simple turns.
-# Keeps the primary model for complex work, but can route short/simple
-# messages to a cheaper model across providers.
-#
-# smart_model_routing:
-#   enabled: true
-#   max_simple_chars: 160
-#   max_simple_words: 28
-#   cheap_model:
-#     provider: openrouter
-#     model: google/gemini-2.5-flash
 """
 
 

@@ -2351,7 +2351,7 @@ def _model_flow_google_gemini_cli(_config, current_model=""):
         return
 
     models = list(_PROVIDER_MODELS.get("google-gemini-cli") or [])
-    default = current_model or (models[0] if models else "gemini-2.5-flash")
+    default = current_model or (models[0] if models else "gemini-3-flash-preview")
     selected = _prompt_model_selection(models, current_model=default)
     if selected:
         _save_model_choice(selected)
@@ -7001,6 +7001,13 @@ For more help on a command:
     )
     wh_sub.add_argument(
         "--secret", default="", help="HMAC secret (auto-generated if omitted)"
+    )
+    wh_sub.add_argument(
+        "--deliver-only",
+        action="store_true",
+        help="Skip the agent — deliver the rendered prompt directly as the "
+        "message. Zero LLM cost. Requires --deliver to be a real target "
+        "(not 'log').",
     )
 
     webhook_subparsers.add_parser(
