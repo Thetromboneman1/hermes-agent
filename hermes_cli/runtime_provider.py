@@ -29,6 +29,7 @@ from hermes_cli.auth import (
 )
 from hermes_cli.config import get_compatible_custom_providers, load_config
 from hermes_constants import OPENROUTER_BASE_URL
+from utils import base_url_host_matches, base_url_hostname
 
 
 def _normalize_custom_provider_name(value: str) -> str:
@@ -47,9 +48,10 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
       ``chat_completions``.
     """
     normalized = (base_url or "").strip().lower().rstrip("/")
-    if "api.x.ai" in normalized:
+    hostname = base_url_hostname(base_url)
+    if hostname == "api.x.ai":
         return "codex_responses"
-    if "api.openai.com" in normalized and "openrouter" not in normalized:
+    if hostname == "api.openai.com":
         return "codex_responses"
     if normalized.endswith("/anthropic"):
         return "anthropic_messages"
@@ -480,7 +482,7 @@ def _resolve_openrouter_runtime(
     # When hitting a custom endpoint (e.g. Z.ai, local LLM), prefer
     # OPENAI_API_KEY so the OpenRouter key doesn't leak to an unrelated
     # provider (issues #420, #560).
-    _is_openrouter_url = "openrouter.ai" in base_url
+    _is_openrouter_url = base_url_host_matches(base_url, "openrouter.ai")
     if _is_openrouter_url:
         api_key_candidates = [
             explicit_api_key,
