@@ -508,10 +508,13 @@ class PluginManager:
                 self._plugins[manifest.name] = loaded
                 logger.debug("Skipping disabled plugin '%s'", manifest.name)
                 continue
-            # Opt-out gate: when no enabled allow-list is configured (None),
-            # all discovered plugins are activated automatically.  Users can
-            # restrict which plugins run by setting plugins.enabled in config.
-            if enabled is not None and manifest.name not in enabled:
+            # Loading gate:
+            # - Bundled plugins are always opt-in (must be in plugins.enabled).
+            # - User/project/entrypoint plugins are opt-out: auto-loaded when
+            #   no allow-list is configured, filtered when one exists.
+            if (enabled is not None and manifest.name not in enabled) or (
+                enabled is None and manifest.source == "bundled"
+            ):
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = "not enabled in config (run `hermes plugins enable {}` to activate)".format(
                     manifest.name
