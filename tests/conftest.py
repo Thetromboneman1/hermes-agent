@@ -249,6 +249,19 @@ def _hermetic_environment(tmp_path, monkeypatch):
     except Exception:
         pass
 
+        # 6. Reset any hermes_cli.* loggers whose level was explicitly raised by
+        #    a previous test (e.g. via logging.getLogger("hermes_cli").setLevel()).
+        #    Without this, caplog.at_level(WARNING) tests fail in xdist workers
+        #    where an earlier test left a child logger at ERROR/CRITICAL.
+        try:
+            import logging as _logging
+            for _log_name, _log_obj in list(_logging.Logger.manager.loggerDict.items()):
+                if _log_name.startswith("hermes_cli") and isinstance(_log_obj, _logging.Logger):
+                    if _log_obj.level != _logging.NOTSET:
+                        monkeypatch.setattr(_log_obj, "level", _logging.NOTSET)
+        except Exception:
+            pass
+
 
 # Backward-compat alias — old tests reference this fixture name. Keep it
 # as a no-op wrapper so imports don't break.
