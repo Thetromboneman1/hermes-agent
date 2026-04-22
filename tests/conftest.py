@@ -249,50 +249,32 @@ def _hermetic_environment(tmp_path, monkeypatch):
     except Exception:
         pass
 
-        # 6. Reset any hermes_cli.* loggers whose level was explicitly raised by
-        #    a previous test (e.g. via logging.getLogger("hermes_cli").setLevel()).
-        #    Without this, caplog.at_level(WARNING) tests fail in xdist workers
-        #    where an earlier test left a child logger at ERROR/CRITICAL.
-        try:
-            import logging as _logging
-            for _log_name, _log_obj in list(_logging.Logger.manager.loggerDict.items()):
-                if _log_name.startswith("hermes_cli") and isinstance(_log_obj, _logging.Logger):
-                    if _log_obj.level != _logging.NOTSET:
-                        monkeypatch.setattr(_log_obj, "level", _logging.NOTSET)
-        except Exception:
-            pass
+    # 6. Reset any hermes_cli.* loggers whose level was explicitly raised by
+    #    a previous test (e.g. via logging.getLogger("hermes_cli").setLevel()).
+    #    Without this, caplog.at_level(WARNING) tests fail in xdist workers
+    #    where an earlier test left a child logger at ERROR/CRITICAL.
+    try:
+        import logging as _logging
+        for _log_name, _log_obj in list(_logging.Logger.manager.loggerDict.items()):
+            if _log_name.startswith("hermes_cli") and isinstance(_log_obj, _logging.Logger):
+                if _log_obj.level != _logging.NOTSET:
+                    monkeypatch.setattr(_log_obj, "level", _logging.NOTSET)
+    except Exception:
+        pass
 
-
-# Backward-compat alias — old tests reference this fixture name. Keep it
-# as a no-op wrapper so imports don't break.
-@pytest.fixture(autouse=True)
-def _isolate_hermes_home(_hermetic_environment):
-    """Alias preserved for any test that yields this name explicitly."""
-    return None
-
-
-@pytest.fixture()
-def tmp_dir(tmp_path):
-    """Provide a temporary directory that is cleaned up automatically."""
-    return tmp_path
-
-
-@pytest.fixture()
-def mock_config():
-    """Return a minimal hermes config dict suitable for unit tests."""
-    return {
-        "model": "test/mock-model",
-        "toolsets": ["terminal", "file"],
-        "max_turns": 10,
-        "terminal": {
-            "backend": "local",
-            "cwd": "/tmp",
-            "timeout": 30,
-        },
-        "compression": {"enabled": False},
-        "memory": {"memory_enabled": False, "user_profile_enabled": False},
-        "command_allowlist": [],
-    }
+    # 7. Reset approval module state so gateway tests don't bleed session-key
+    #    contextvars or session approval entries into subsequent tests.
+    try:
+        import tools.approval as _approval_mod
+        # Reset the per-context session key to its default ("" → falls back
+        # to env-var lookup, which the fixture already blanks above).
+        _approval_mod._approval_session_key.set("")
+        # Clear session approvals accumulated by previous tests so
+        # approve_session() / is_approved() behave deterministically.
+        with _approval_mod._lock:
+            _approval_mod._session_approved.clear()
+    except Exception:
+        pass
 
 
 # ── Global test timeout ─────────────────────────────────────────────────────
