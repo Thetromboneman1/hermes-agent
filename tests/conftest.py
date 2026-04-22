@@ -278,6 +278,39 @@ def _hermetic_environment(tmp_path, monkeypatch):
 
 
 # ── Global test timeout ─────────────────────────────────────────────────────
+# Backward-compat alias — old tests reference this fixture name. Keep it
+# as a no-op wrapper so imports don't break.
+@pytest.fixture(autouse=True)
+def _isolate_hermes_home(_hermetic_environment):
+    """Alias preserved for any test that yields this name explicitly."""
+    return None
+
+
+@pytest.fixture()
+def tmp_dir(tmp_path):
+    """Provide a temporary directory that is cleaned up automatically."""
+    return tmp_path
+
+
+@pytest.fixture()
+def mock_config():
+    """Return a minimal hermes config dict suitable for unit tests."""
+    return {
+        "model": "test/mock-model",
+        "toolsets": ["terminal", "file"],
+        "max_turns": 10,
+        "terminal": {
+                "backend": "local",
+                "cwd": "/tmp",
+                "timeout": 30,
+            },
+        "compression": {"enabled": False},
+        "memory": {"memory_enabled": False, "user_profile_enabled": False},
+        "command_allowlist": [],
+    }
+
+
+# ── Global test timeout ─────────────────────────────────────────────────────
 # Kill any individual test that takes longer than 30 seconds.
 # Prevents hanging tests (subprocess spawns, blocking I/O) from stalling the
 # entire test suite.
