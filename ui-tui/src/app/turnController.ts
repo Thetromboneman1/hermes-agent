@@ -39,6 +39,7 @@ class TurnController {
   bufRef = ''
   interrupted = false
   lastStatusNote = ''
+  pendingInlineDiffs: string[] = []
   persistedToolLabels = new Set<string>()
   protocolWarned = false
   reasoningText = ''
@@ -76,6 +77,7 @@ class TurnController {
     this.activeTools = []
     this.streamTimer = clear(this.streamTimer)
     this.bufRef = ''
+    this.pendingInlineDiffs = []
     this.pendingSegmentTools = []
     this.segmentMessages = []
 
@@ -95,14 +97,36 @@ class TurnController {
     this.interrupted = true
     gw.request<SessionInterruptResponse>('session.interrupt', { session_id: sid }).catch(() => {})
 
+    const segments = this.segmentMessages
     const partial = this.bufRef.trimStart()
+    const tools = this.pendingSegmentTools
 
-    partial ? appendMessage({ role: 'assistant', text: `${partial}\n\n*[interrupted]*` }) : sys('interrupted')
-
+    // Drain streaming/segment state off the nanostore before writing the
+    // preserved snapshot to the transcript — otherwise each flushed segment
+    // appears in both `turn.streamSegments` and the transcript for one frame.
     this.idle()
     this.clearReasoning()
     this.turnTools = []
     patchTurnState({ activity: [], outcome: '' })
+
+    for (const msg of segments) {
+      appendMessage(msg)
+    }
+
+    // Always surface an interruption indicator — if there's an in-flight
+    // `partial` or pending tools, fold them into a single assistant message;
+    // otherwise emit a sys note so the transcript always records that the
+    // turn was cancelled, even when only prior `segments` were preserved.
+    if (partial || tools.length) {
+      appendMessage({
+        role: 'assistant',
+        text: partial ? `${partial}\n\n*[interrupted]*` : '*[interrupted]*',
+        ...(tools.length && { tools })
+      })
+    } else {
+      sys('interrupted')
+    }
+
     patchUiState({ status: 'interrupted' })
     this.clearStatusTimer()
 
@@ -160,6 +184,22 @@ class TurnController {
     }, REASONING_PULSE_MS)
   }
 
+  queueInlineDiff(diffText: string) {
+    // Strip CLI chrome the gateway emits before the unified diff (e.g. a
+    // leading "┊ review diff" header written by `_emit_inline_diff` for the
+    // terminal printer). That header only makes sense as stdout dressing,
+    // not inside a markdown ```diff block.
+    const text = diffText
+      .replace(/^\s*┊[^\n]*\n?/, '')
+      .trim()
+
+    if (!text || this.pendingInlineDiffs.includes(text)) {
+      return
+    }
+
+    this.pendingInlineDiffs = [...this.pendingInlineDiffs, text]
+  }
+
   pushActivity(text: string, tone: ActivityItem['tone'] = 'info', replaceLabel?: string) {
     patchTurnState(state => {
       const base = replaceLabel
@@ -194,6 +234,7 @@ class TurnController {
     this.idle()
     this.clearReasoning()
     this.clearStatusTimer()
+    this.pendingInlineDiffs = []
     this.pendingSegmentTools = []
     this.segmentMessages = []
     this.turnTools = []
@@ -204,6 +245,17 @@ class TurnController {
     const rawText = (payload.rendered ?? payload.text ?? this.bufRef).trimStart()
     const split = splitReasoning(rawText)
     const finalText = split.text
+    // Skip appending if the assistant already narrated the diff inside a
+    // markdown fence of its own — otherwise we render two stacked diff
+    // blocks for the same edit.
+    const assistantAlreadyHasDiff = /```(?:diff|patch)\b/i.test(finalText)
+    const remainingInlineDiffs = assistantAlreadyHasDiff
+      ? []
+      : this.pendingInlineDiffs.filter(diff => !finalText.includes(diff))
+    const inlineDiffBlock = remainingInlineDiffs.length
+      ? `\`\`\`diff\n${remainingInlineDiffs.join('\n\n')}\n\`\`\``
+      : ''
+    const mergedText = [finalText, inlineDiffBlock].filter(Boolean).join('\n\n')
     const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim()
     const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\n\n')
     const savedReasoningTokens = savedReasoning ? estimateTokensRough(savedReasoning) : 0
@@ -211,10 +263,10 @@ class TurnController {
     const tools = this.pendingSegmentTools
     const finalMessages = [...this.segmentMessages]
 
-    if (finalText) {
+    if (mergedText) {
       finalMessages.push({
         role: 'assistant',
-        text: finalText,
+        text: mergedText,
         thinking: savedReasoning || undefined,
         thinkingTokens: savedReasoning ? savedReasoningTokens : undefined,
         toolTokens: savedToolTokens || undefined,
@@ -231,7 +283,7 @@ class TurnController {
     this.bufRef = ''
     patchTurnState({ activity: [], outcome: '' })
 
-    return { finalMessages, finalText, wasInterrupted }
+    return { finalMessages, finalText: mergedText, wasInterrupted }
   }
 
   recordMessageDelta({ rendered, text }: { rendered?: string; text?: string }) {
@@ -337,6 +389,7 @@ class TurnController {
     this.bufRef = ''
     this.interrupted = false
     this.lastStatusNote = ''
+    this.pendingInlineDiffs = []
     this.pendingSegmentTools = []
     this.protocolWarned = false
     this.segmentMessages = []
@@ -382,6 +435,7 @@ class TurnController {
     this.endReasoningPhase()
     this.clearReasoning()
     this.activeTools = []
+    this.pendingInlineDiffs = []
     this.turnTools = []
     this.toolTokenAcc = 0
     this.persistedToolLabels.clear()
