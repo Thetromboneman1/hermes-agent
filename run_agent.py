@@ -2290,7 +2290,9 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
-        cfg = get_provider_request_timeout(self.provider, self.model)
+        provider = getattr(self, "provider", "")
+        model = getattr(self, "model", "")
+        cfg = get_provider_request_timeout(provider, model)
         if cfg is not None:
             return cfg
         return float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
@@ -2309,7 +2311,9 @@ class AIAgent:
         explicitly configured a stale timeout, such as auto-disabling the
         detector for local endpoints.
         """
-        cfg = get_provider_stale_timeout(self.provider, self.model)
+        provider = getattr(self, "provider", "")
+        model = getattr(self, "model", "")
+        cfg = get_provider_stale_timeout(provider, model)
         if cfg is not None:
             return cfg, False
 
@@ -2322,7 +2326,7 @@ class AIAgent:
     def _compute_non_stream_stale_timeout(self, messages: list[dict[str, Any]]) -> float:
         """Compute the effective non-stream stale timeout for this request."""
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
-        base_url = getattr(self, "_base_url", None) or self.base_url or ""
+        base_url = getattr(self, "_base_url", None) or getattr(self, "base_url", "") or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
@@ -4418,7 +4422,8 @@ class AIAgent:
         client_kwargs = dict(client_kwargs)
         _validate_proxy_env_urls()
         _validate_base_url(client_kwargs.get("base_url"))
-        if self.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+        provider = getattr(self, "provider", "")
+        if provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
             from agent.copilot_acp_client import CopilotACPClient
 
             client = CopilotACPClient(**client_kwargs)
@@ -4429,7 +4434,7 @@ class AIAgent:
                 self._client_log_context(),
             )
             return client
-        if self.provider == "google-gemini-cli" or str(client_kwargs.get("base_url", "")).startswith("cloudcode-pa://"):
+        if provider == "google-gemini-cli" or str(client_kwargs.get("base_url", "")).startswith("cloudcode-pa://"):
             from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
 
             # Strip OpenAI-specific kwargs the Gemini client doesn't accept
@@ -4445,7 +4450,7 @@ class AIAgent:
                 self._client_log_context(),
             )
             return client
-        if self.provider == "gemini":
+        if provider == "gemini":
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
             base_url = str(client_kwargs.get("base_url", "") or "")
