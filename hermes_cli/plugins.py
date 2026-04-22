@@ -508,13 +508,10 @@ class PluginManager:
                 self._plugins[manifest.name] = loaded
                 logger.debug("Skipping disabled plugin '%s'", manifest.name)
                 continue
-            # Opt-in gate: plugins must be in the enabled allow-list.
-            # If the allow-list is missing (None), treat as "nothing enabled"
-            # — users have to explicitly enable plugins to load them.
-            # Memory and context_engine providers are excluded from this gate
-            # since they have their own single-select config (memory.provider
-            # / context.engine), not the enabled list.
-            if enabled is None or manifest.name not in enabled:
+            # Opt-out gate: when no enabled allow-list is configured (None),
+            # all discovered plugins are activated automatically.  Users can
+            # restrict which plugins run by setting plugins.enabled in config.
+            if enabled is not None and manifest.name not in enabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = "not enabled in config (run `hermes plugins enable {}` to activate)".format(
                     manifest.name

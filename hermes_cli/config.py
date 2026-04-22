@@ -1905,7 +1905,14 @@ def _normalize_custom_provider_entry(
     from urllib.parse import urlparse
 
     base_url = ""
-    for url_key in ("api", "url", "base_url"):
+    # When both legacy 'api' and 'url' aliases appear together, treat 'api' as the
+    # primary endpoint (legacy multi-URL config format).  In all other cases the
+    # explicit 'base_url' field takes highest priority.
+    if "url" in entry and "api" in entry:
+        _url_candidate_keys = ("api", "url", "base_url")
+    else:
+        _url_candidate_keys = ("base_url", "url", "api")
+    for url_key in _url_candidate_keys:
         raw_url = entry.get(url_key)
         if isinstance(raw_url, str) and raw_url.strip():
             candidate = raw_url.strip()
