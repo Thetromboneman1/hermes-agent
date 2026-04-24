@@ -262,6 +262,7 @@ _MAX_TOOL_WORKERS = 8
 _DESTRUCTIVE_PATTERNS = re.compile(
     r"""(?:^|\s|&&|\|\||;|`)(?:
         rm\s|rmdir\s|
+        cp\s|install\s|
         mv\s|
         sed\s+-i|
         truncate\s|
@@ -1547,6 +1548,17 @@ class AIAgent:
         if not isinstance(_agent_section, dict):
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+
+        # App-level API retry count (wraps each model API call).  Default 3,
+        # overridable via agent.api_max_retries in config.yaml.  See #11616.
+        try:
+            _raw_api_retries = _agent_section.get("api_max_retries", 3)
+            _api_retries = int(_raw_api_retries)
+            if _api_retries < 1:
+                _api_retries = 1  # 1 = no retry (single attempt)
+        except (TypeError, ValueError):
+            _api_retries = 3
+        self._api_max_retries = _api_retries
 
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
@@ -6771,42 +6783,6 @@ class AIAgent:
             cache[mode] = t
         return t
 
-    @staticmethod
-    def _nr_to_assistant_message(nr):
-        """Convert a NormalizedResponse to the SimpleNamespace shape downstream expects.
-
-        This is the single back-compat shim between the transport layer
-        (NormalizedResponse) and the agent loop (SimpleNamespace with
-        .content, .tool_calls, .reasoning, .reasoning_content,
-        .reasoning_details, .codex_reasoning_items, and per-tool-call
-        .call_id / .response_item_id).
-
-        TODO: Remove when downstream code reads NormalizedResponse directly.
-        """
-        tc_list = None
-        if nr.tool_calls:
-            tc_list = []
-            for tc in nr.tool_calls:
-                tc_ns = SimpleNamespace(
-                    id=tc.id,
-                    type="function",
-                    function=SimpleNamespace(name=tc.name, arguments=tc.arguments),
-                )
-                if tc.provider_data:
-                    for key in ("call_id", "response_item_id"):
-                        if tc.provider_data.get(key):
-                            setattr(tc_ns, key, tc.provider_data[key])
-                tc_list.append(tc_ns)
-        pd = nr.provider_data or {}
-        return SimpleNamespace(
-            content=nr.content,
-            tool_calls=tc_list or None,
-            reasoning=nr.reasoning,
-            reasoning_content=pd.get("reasoning_content"),
-            reasoning_details=pd.get("reasoning_details"),
-            codex_reasoning_items=pd.get("codex_reasoning_items"),
-        )
-
     def _prepare_anthropic_messages_for_api(self, api_messages: list) -> list:
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
@@ -7508,20 +7484,25 @@ class AIAgent:
                     ]
             elif self.api_mode == "anthropic_messages" and not _aux_available:
                 _tfn = self._get_transport()
-                _flush_nr = _tfn.normalize_response(response, strip_tool_prefix=self._is_anthropic_oauth)
-                if _flush_nr and _flush_nr.tool_calls:
+                _flush_result = _tfn.normalize_response(response, strip_tool_prefix=self._is_anthropic_oauth)
+                if _flush_result and _flush_result.tool_calls:
                     tool_calls = [
                         SimpleNamespace(
                             id=tc.id, type="function",
                             function=SimpleNamespace(name=tc.name, arguments=tc.arguments),
-                        ) for tc in _flush_nr.tool_calls
+                        ) for tc in _flush_result.tool_calls
                     ]
-            elif hasattr(response, "choices") and response.choices:
+            elif self.api_mode in ("chat_completions", "bedrock_converse"):
                 # chat_completions / bedrock — normalize through transport
-                _flush_cc_nr = self._get_transport().normalize_response(response)
-                _flush_msg = self._nr_to_assistant_message(_flush_cc_nr)
-                if _flush_msg.tool_calls:
-                    tool_calls = _flush_msg.tool_calls
+                _flush_result = self._get_transport().normalize_response(response)
+                if _flush_result.tool_calls:
+                    tool_calls = _flush_result.tool_calls
+            elif _aux_available and hasattr(response, "choices") and response.choices:
+                # Auxiliary client returned OpenAI-shaped response while main
+                # api_mode is codex/anthropic — extract tool_calls from .choices
+                _aux_msg = response.choices[0].message
+                if hasattr(_aux_msg, "tool_calls") and _aux_msg.tool_calls:
+                    tool_calls = _aux_msg.tool_calls
 
             for tc in tool_calls:
                 if tc.function.name == "memory":
@@ -8587,12 +8568,12 @@ class AIAgent:
                                    is_oauth=self._is_anthropic_oauth,
                                    preserve_dots=self._anthropic_preserve_dots())
                     summary_response = self._anthropic_messages_create(_ant_kw)
-                    _sum_nr = _tsum.normalize_response(summary_response, strip_tool_prefix=self._is_anthropic_oauth)
-                    final_response = (_sum_nr.content or "").strip()
+                    _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=self._is_anthropic_oauth)
+                    final_response = (_summary_result.content or "").strip()
                 else:
                     summary_response = self._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
-                    _sum_cc_nr = self._get_transport().normalize_response(summary_response)
-                    final_response = (_sum_cc_nr.content or "").strip()
+                    _summary_result = self._get_transport().normalize_response(summary_response)
+                    final_response = (_summary_result.content or "").strip()
 
             if final_response:
                 if "<think>" in final_response:
@@ -8617,8 +8598,8 @@ class AIAgent:
                                     max_tokens=self.max_tokens, reasoning_config=self.reasoning_config,
                                     preserve_dots=self._anthropic_preserve_dots())
                     retry_response = self._anthropic_messages_create(_ant_kw2)
-                    _retry_nr = _tretry.normalize_response(retry_response, strip_tool_prefix=self._is_anthropic_oauth)
-                    final_response = (_retry_nr.content or "").strip()
+                    _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=self._is_anthropic_oauth)
+                    final_response = (_retry_result.content or "").strip()
                 else:
                     summary_kwargs = {
                         "model": self.model,
@@ -8632,8 +8613,8 @@ class AIAgent:
                         summary_kwargs["extra_body"] = summary_extra_body
 
                     summary_response = self._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
-                    _retry_cc_nr = self._get_transport().normalize_response(summary_response)
-                    final_response = (_retry_cc_nr.content or "").strip()
+                    _retry_result = self._get_transport().normalize_response(summary_response)
+                    final_response = (_retry_result.content or "").strip()
 
                 if final_response:
                     if "<think>" in final_response:
@@ -9295,7 +9276,7 @@ class AIAgent:
             
             api_start_time = time.time()
             retry_count = 0
-            max_retries = 3
+            max_retries = self._api_max_retries
             primary_recovery_attempted = False
             max_compression_attempts = 3
             codex_auth_retry_attempted=False
@@ -9662,13 +9643,13 @@ class AIAgent:
                     elif self.api_mode == "bedrock_converse":
                         # Bedrock response already normalized at dispatch — use transport
                         _bt_fr = self._get_transport()
-                        _bt_fr_nr = _bt_fr.normalize_response(response)
-                        finish_reason = _bt_fr_nr.finish_reason
+                        _bedrock_result = _bt_fr.normalize_response(response)
+                        finish_reason = _bedrock_result.finish_reason
                     else:
                         _cc_fr = self._get_transport()
-                        _cc_fr_nr = _cc_fr.normalize_response(response)
-                        finish_reason = _cc_fr_nr.finish_reason
-                        assistant_message = self._nr_to_assistant_message(_cc_fr_nr)
+                        _finish_result = _cc_fr.normalize_response(response)
+                        finish_reason = _finish_result.finish_reason
+                        assistant_message = _finish_result
                         if self._should_treat_stop_as_truncated(
                             finish_reason,
                             assistant_message,
@@ -9693,12 +9674,12 @@ class AIAgent:
                         _trunc_msg = None
                         _trunc_transport = self._get_transport()
                         if self.api_mode == "anthropic_messages":
-                            _trunc_nr = _trunc_transport.normalize_response(
+                            _trunc_result = _trunc_transport.normalize_response(
                                 response, strip_tool_prefix=self._is_anthropic_oauth
                             )
                         else:
-                            _trunc_nr = _trunc_transport.normalize_response(response)
-                        _trunc_msg = self._nr_to_assistant_message(_trunc_nr)
+                            _trunc_result = _trunc_transport.normalize_response(response)
+                        _trunc_msg = _trunc_result
 
                         _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
                         _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
@@ -10599,9 +10580,30 @@ class AIAgent:
                         # Error is about the INPUT being too large — reduce context_length.
                         # Try to parse the actual limit from the error message
                         parsed_limit = parse_context_limit_from_error(error_msg)
+                        _provider_lower = (getattr(self, "provider", "") or "").lower()
+                        _base_lower = (getattr(self, "base_url", "") or "").rstrip("/").lower()
+                        is_minimax_provider = (
+                            _provider_lower in {"minimax", "minimax-cn"}
+                            or _base_lower.startswith((
+                                "https://api.minimax.io/anthropic",
+                                "https://api.minimaxi.com/anthropic",
+                            ))
+                        )
+                        minimax_delta_only_overflow = (
+                            is_minimax_provider
+                            and parsed_limit is None
+                            and "context window exceeds limit (" in error_msg
+                        )
                         if parsed_limit and parsed_limit < old_ctx:
                             new_ctx = parsed_limit
-                            self._vprint(f"{self.log_prefix}⚠️  Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})", force=True)
+                            self._vprint(f"{self.log_prefix}Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})", force=True)
+                        elif minimax_delta_only_overflow:
+                            new_ctx = old_ctx
+                            self._vprint(
+                                f"{self.log_prefix}Provider reported overflow amount only; "
+                                f"keeping context_length at {old_ctx:,} tokens and compressing.",
+                                force=True,
+                            )
                         else:
                             # Step down to the next probe tier
                             new_ctx = get_next_probe_tier(old_ctx)
@@ -10933,9 +10935,9 @@ class AIAgent:
                 _normalize_kwargs = {}
                 if self.api_mode == "anthropic_messages":
                     _normalize_kwargs["strip_tool_prefix"] = self._is_anthropic_oauth
-                _nr = _transport.normalize_response(response, **_normalize_kwargs)
-                assistant_message = self._nr_to_assistant_message(_nr)
-                finish_reason = _nr.finish_reason
+                normalized = _transport.normalize_response(response, **_normalize_kwargs)
+                assistant_message = normalized
+                finish_reason = normalized.finish_reason
                 
                 # Normalize content to string — some OpenAI-compatible servers
                 # (llama-server, etc.) return content as a dict or list instead
