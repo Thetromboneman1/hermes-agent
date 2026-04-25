@@ -1,5 +1,6 @@
 import atexit
 import concurrent.futures
+import contextvars
 import copy
 import json
 import logging
@@ -12,9 +13,17 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from hermes_constants import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
+from tui_gateway.transport import (
+    StdioTransport,
+    Transport,
+    bind_transport,
+    current_transport,
+    reset_transport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +61,11 @@ def _panic_hook(exc_type, exc_value, exc_tb):
     # Stderr goes through to the TUI as a gateway.stderr Activity line —
     # the first line here is what the user will see without opening any
     # log files.  Rest of the stack is still in the log for full context.
-    first = str(exc_value).strip().splitlines()[0] if str(exc_value).strip() else exc_type.__name__
+    first = (
+        str(exc_value).strip().splitlines()[0]
+        if str(exc_value).strip()
+        else exc_type.__name__
+    )
     print(f"[gateway-crash] {exc_type.__name__}: {first}", file=sys.stderr, flush=True)
     # Chain to the default hook so the process still terminates normally.
     sys.__excepthook__(exc_type, exc_value, exc_tb)
@@ -146,6 +159,11 @@ atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
 # of corrupting the JSON protocol.
 _real_stdout = sys.stdout
 sys.stdout = sys.stderr
+
+# Module-level stdio transport — fallback sink when no transport is bound via
+# contextvar or session. Stream resolved through a lambda so runtime monkey-
+# patches of `_real_stdout` (used extensively in tests) still land correctly.
+_stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 
 
 class _SlashWorker:
@@ -266,14 +284,24 @@ def _db_unavailable_error(rid, *, code: int):
 
 
 def write_json(obj: dict) -> bool:
-    line = json.dumps(obj, ensure_ascii=False) + "\n"
-    try:
-        with _stdout_lock:
-            _real_stdout.write(line)
-            _real_stdout.flush()
-        return True
-    except BrokenPipeError:
-        return False
+    """Emit one JSON frame. Routes via the most-specific transport available.
+
+    Precedence:
+
+    1. Event frames with a session id → the transport stored on that session,
+       so async events land with the client that owns the session even if
+       the emitting thread has no contextvar binding.
+    2. Otherwise the transport bound on the current context (set by
+       :func:`dispatch` for the lifetime of a request).
+    3. Otherwise the module-level stdio transport, matching the historical
+       behaviour and keeping tests that monkey-patch ``_real_stdout`` green.
+    """
+    if obj.get("method") == "event":
+        sid = ((obj.get("params") or {}).get("session_id")) or ""
+        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
+            return t.write(obj)
+
+    return (current_transport() or _stdio_transport).write(obj)
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
@@ -343,27 +371,40 @@ def handle_request(req: dict) -> dict | None:
     return fn(req.get("id"), req.get("params", {}))
 
 
-def dispatch(req: dict) -> dict | None:
+def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
     Returns a response dict when handled inline. Returns None when the
-    handler was scheduled on the pool; the worker writes its own
-    response via write_json when done.
+    handler was scheduled on the pool; the worker writes its own response
+    via the bound transport when done.
+
+    *transport* (optional): pins every write produced by this request —
+    including any events emitted by the handler — to the given transport.
+    Omitting it falls back to the module-level stdio transport, preserving
+    the original behaviour for ``tui_gateway.entry``.
     """
-    if req.get("method") not in _LONG_HANDLERS:
-        return handle_request(req)
+    t = transport or _stdio_transport
+    token = bind_transport(t)
+    try:
+        if req.get("method") not in _LONG_HANDLERS:
+            return handle_request(req)
 
-    def run():
-        try:
-            resp = handle_request(req)
-        except Exception as exc:
-            resp = _err(req.get("id"), -32000, f"handler error: {exc}")
-        if resp is not None:
-            write_json(resp)
+        # Snapshot the context so the pool worker sees the bound transport.
+        ctx = contextvars.copy_context()
 
-    _pool.submit(run)
+        def run():
+            try:
+                resp = handle_request(req)
+            except Exception as exc:
+                resp = _err(req.get("id"), -32000, f"handler error: {exc}")
+            if resp is not None:
+                t.write(resp)
 
-    return None
+        _pool.submit(lambda: ctx.run(run))
+
+        return None
+    finally:
+        reset_transport(token)
 
 
 def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
@@ -556,13 +597,17 @@ def _coerce_statusbar(raw) -> str:
 def _load_reasoning_config() -> dict | None:
     from hermes_constants import parse_reasoning_effort
 
-    effort = str(_load_cfg().get("agent", {}).get("reasoning_effort", "") or "").strip()
+    effort = str(
+        (_load_cfg().get("agent") or {}).get("reasoning_effort", "") or ""
+    ).strip()
     return parse_reasoning_effort(effort)
 
 
 def _load_service_tier() -> str | None:
     raw = (
-        str(_load_cfg().get("agent", {}).get("service_tier", "") or "").strip().lower()
+        str((_load_cfg().get("agent") or {}).get("service_tier", "") or "")
+        .strip()
+        .lower()
     )
     if not raw or raw in {"normal", "default", "standard", "off", "none"}:
         return None
@@ -572,11 +617,11 @@ def _load_service_tier() -> str | None:
 
 
 def _load_show_reasoning() -> bool:
-    return bool(_load_cfg().get("display", {}).get("show_reasoning", False))
+    return bool((_load_cfg().get("display") or {}).get("show_reasoning", False))
 
 
 def _load_tool_progress_mode() -> str:
-    raw = _load_cfg().get("display", {}).get("tool_progress", "all")
+    raw = (_load_cfg().get("display") or {}).get("tool_progress", "all")
     if raw is False:
         return "off"
     if raw is True:
@@ -590,8 +635,14 @@ def _load_enabled_toolsets() -> list[str] | None:
         from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
 
+        # Runtime toolset resolution must include default MCP servers so the
+        # agent can actually call them. Passing ``False`` here is the
+        # config-editing variant — used when we need to persist a toolset
+        # list without baking in implicit MCP defaults. Using the wrong
+        # variant at agent creation time makes MCP tools silently missing
+        # from the TUI. See PR #3252 for the original design split.
         enabled = sorted(
-            _get_platform_tools(load_config(), "cli", include_default_mcp_servers=False)
+            _get_platform_tools(load_config(), "cli", include_default_mcp_servers=True)
         )
         return enabled or None
     except Exception:
@@ -771,6 +822,39 @@ def _probe_credentials(agent) -> str:
     except Exception:
         pass
     return ""
+
+
+def _probe_config_health(cfg: dict) -> str:
+    """Flag bare YAML keys (`agent:` with no value → None) that silently
+    drop nested settings. Returns warning or ''."""
+    if not isinstance(cfg, dict):
+        return ""
+    warnings: list[str] = []
+    null_keys = sorted(k for k, v in cfg.items() if v is None)
+    if not null_keys:
+        pass
+    else:
+        keys = ", ".join(f"`{k}`" for k in null_keys)
+        warnings.append(
+            f"config.yaml has empty section(s): {keys}. "
+            f"Remove the line(s) or set them to `{{}}` — "
+            f"empty sections silently drop nested settings."
+        )
+    display_cfg = cfg.get("display")
+    agent_cfg = cfg.get("agent")
+    if isinstance(display_cfg, dict):
+        personality = str(display_cfg.get("personality", "") or "").strip().lower()
+        if (
+            personality
+            and personality not in {"default", "none", "neutral"}
+            and isinstance(agent_cfg, dict)
+            and agent_cfg.get("personalities") is None
+        ):
+            warnings.append(
+                "`display.personality` is set but `agent.personalities` is empty/null; "
+                "personality overlay will be skipped."
+            )
+    return " ".join(warnings).strip()
 
 
 def _session_info(agent) -> dict:
@@ -1059,28 +1143,6 @@ def _wire_callbacks(sid: str):
     set_secret_capture_callback(secret_cb)
 
 
-def _resolve_personality_prompt(cfg: dict) -> str:
-    """Resolve the active personality into a system prompt string."""
-    name = (cfg.get("display", {}).get("personality", "") or "").strip().lower()
-    if not name or name in ("default", "none", "neutral"):
-        return ""
-    try:
-        from cli import load_cli_config
-
-        personalities = load_cli_config().get("agent", {}).get("personalities", {})
-    except Exception:
-        try:
-            from hermes_cli.config import load_config as _load_full_cfg
-
-            personalities = _load_full_cfg().get("agent", {}).get("personalities", {})
-        except Exception:
-            personalities = cfg.get("agent", {}).get("personalities", {})
-    pval = personalities.get(name)
-    if pval is None:
-        return ""
-    return _render_personality_prompt(pval)
-
-
 def _render_personality_prompt(value) -> str:
     if isinstance(value, dict):
         parts = [value.get("system_prompt", "")]
@@ -1096,15 +1158,15 @@ def _available_personalities(cfg: dict | None = None) -> dict:
     try:
         from cli import load_cli_config
 
-        return load_cli_config().get("agent", {}).get("personalities", {}) or {}
+        return (load_cli_config().get("agent") or {}).get("personalities", {}) or {}
     except Exception:
         try:
             from hermes_cli.config import load_config as _load_full_cfg
 
-            return _load_full_cfg().get("agent", {}).get("personalities", {}) or {}
+            return (_load_full_cfg().get("agent") or {}).get("personalities", {}) or {}
         except Exception:
             cfg = cfg or _load_cfg()
-            return cfg.get("agent", {}).get("personalities", {}) or {}
+            return (cfg.get("agent") or {}).get("personalities", {}) or {}
 
 
 def _validate_personality(value: str, cfg: dict | None = None) -> tuple[str, str]:
@@ -1214,9 +1276,7 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     cfg = _load_cfg()
-    system_prompt = cfg.get("agent", {}).get("system_prompt", "") or ""
-    if not system_prompt:
-        system_prompt = _resolve_personality_prompt(cfg)
+    system_prompt = ((cfg.get("agent") or {}).get("system_prompt", "") or "").strip()
     runtime = resolve_runtime_provider(requested=None)
     return AIAgent(
         model=_resolve_model(),
@@ -1256,6 +1316,9 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
         "tool_progress_mode": _load_tool_progress_mode(),
         "edit_snapshots": {},
         "tool_started_at": {},
+        # Pin async event emissions to whichever transport created the
+        # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
+        "transport": current_transport() or _stdio_transport,
     }
     try:
         _sessions[sid]["slash_worker"] = _SlashWorker(
@@ -1398,6 +1461,7 @@ def _(rid, params: dict) -> dict:
         "slash_worker": None,
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
+        "transport": current_transport() or _stdio_transport,
     }
 
     def _build() -> None:
@@ -1456,6 +1520,10 @@ def _(rid, params: dict) -> dict:
             warn = _probe_credentials(agent)
             if warn:
                 info["credential_warning"] = warn
+            cfg_warn = _probe_config_health(_load_cfg())
+            if cfg_warn:
+                info["config_warning"] = cfg_warn
+                logger.warning(cfg_warn)
             _emit("session.info", sid, info)
         except Exception as e:
             session["agent_error"] = str(e)
@@ -1602,9 +1670,7 @@ def _(rid, params: dict) -> dict:
         return _db_unavailable_error(rid, code=5007)
     title, key = params.get("title", ""), session["session_key"]
     if not title:
-        return _ok(
-            rid, {"title": db.get_session_title(key) or "", "session_key": key}
-        )
+        return _ok(rid, {"title": db.get_session_title(key) or "", "session_key": key})
     try:
         db.set_session_title(key, title)
         return _ok(rid, {"title": title})
@@ -2231,7 +2297,9 @@ def _(rid, params: dict) -> dict:
                     f.write(trace)
             except Exception:
                 pass
-            print(f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            print(
+                f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
+            )
             _emit("error", sid, {"message": str(e)})
         finally:
             try:
@@ -2642,6 +2710,39 @@ def _(rid, params: dict) -> dict:
         _write_config_key("display.details_mode", nv)
         return _ok(rid, {"key": key, "value": nv})
 
+    if key.startswith("details_mode."):
+        # Per-section override: `details_mode.<section>` writes to
+        # `display.sections.<section>`.  Empty value clears the override
+        # and lets the section fall back to the global details_mode.
+        section = key.split(".", 1)[1]
+        allowed_sections = frozenset({"thinking", "tools", "subagents", "activity"})
+        if section not in allowed_sections:
+            return _err(rid, 4002, f"unknown section: {section}")
+
+        cfg = _load_cfg()
+        display = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
+        sections_cfg = (
+            display.get("sections") if isinstance(display.get("sections"), dict) else {}
+        )
+
+        nv = str(value or "").strip().lower()
+        if not nv:
+            sections_cfg.pop(section, None)
+            display["sections"] = sections_cfg
+            cfg["display"] = display
+            _save_cfg(cfg)
+            return _ok(rid, {"key": key, "value": ""})
+
+        allowed_dm = frozenset({"hidden", "collapsed", "expanded"})
+        if nv not in allowed_dm:
+            return _err(rid, 4002, f"unknown details_mode: {value}")
+
+        sections_cfg[section] = nv
+        display["sections"] = sections_cfg
+        cfg["display"] = display
+        _save_cfg(cfg)
+        return _ok(rid, {"key": key, "value": nv})
+
     if key == "thinking_mode":
         nv = str(value or "").strip().lower()
         allowed_tm = frozenset({"collapsed", "truncated", "full"})
@@ -2687,6 +2788,23 @@ def _(rid, params: dict) -> dict:
 
         _write_config_key("display.tui_statusbar", nv)
         return _ok(rid, {"key": key, "value": nv})
+
+    if key == "mouse":
+        raw = str(value or "").strip().lower()
+        display = _load_cfg().get("display") if isinstance(_load_cfg().get("display"), dict) else {}
+        current = bool(display.get("tui_mouse", True))
+
+        if raw in ("", "toggle"):
+            nv = not current
+        elif raw == "on":
+            nv = True
+        elif raw == "off":
+            nv = False
+        else:
+            return _err(rid, 4002, f"unknown mouse value: {value}")
+
+        _write_config_key("display.tui_mouse", nv)
+        return _ok(rid, {"key": key, "value": "on" if nv else "off"})
 
     if key in ("prompt", "personality", "skin"):
         try:
@@ -2756,18 +2874,21 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"prompt": _load_cfg().get("custom_prompt", "")})
     if key == "skin":
         return _ok(
-            rid, {"value": _load_cfg().get("display", {}).get("skin", "default")}
+            rid, {"value": (_load_cfg().get("display") or {}).get("skin", "default")}
         )
     if key == "personality":
         return _ok(
-            rid, {"value": _load_cfg().get("display", {}).get("personality", "default")}
+            rid,
+            {"value": (_load_cfg().get("display") or {}).get("personality", "default")},
         )
     if key == "reasoning":
         cfg = _load_cfg()
-        effort = str(cfg.get("agent", {}).get("reasoning_effort", "medium") or "medium")
+        effort = str(
+            (cfg.get("agent") or {}).get("reasoning_effort", "medium") or "medium"
+        )
         display = (
             "show"
-            if bool(cfg.get("display", {}).get("show_reasoning", False))
+            if bool((cfg.get("display") or {}).get("show_reasoning", False))
             else "hide"
         )
         return _ok(rid, {"value": effort, "display": display})
@@ -2775,7 +2896,7 @@ def _(rid, params: dict) -> dict:
         allowed_dm = frozenset({"hidden", "collapsed", "expanded"})
         raw = (
             str(
-                _load_cfg().get("display", {}).get("details_mode", "collapsed")
+                (_load_cfg().get("display") or {}).get("details_mode", "collapsed")
                 or "collapsed"
             )
             .strip()
@@ -2786,13 +2907,17 @@ def _(rid, params: dict) -> dict:
     if key == "thinking_mode":
         allowed_tm = frozenset({"collapsed", "truncated", "full"})
         cfg = _load_cfg()
-        raw = str(cfg.get("display", {}).get("thinking_mode", "") or "").strip().lower()
+        raw = (
+            str((cfg.get("display") or {}).get("thinking_mode", "") or "")
+            .strip()
+            .lower()
+        )
         if raw in allowed_tm:
             nv = raw
         else:
             dm = (
                 str(
-                    cfg.get("display", {}).get("details_mode", "collapsed")
+                    (cfg.get("display") or {}).get("details_mode", "collapsed")
                     or "collapsed"
                 )
                 .strip()
@@ -2801,7 +2926,7 @@ def _(rid, params: dict) -> dict:
             nv = "full" if dm == "expanded" else "collapsed"
         return _ok(rid, {"value": nv})
     if key == "compact":
-        on = bool(_load_cfg().get("display", {}).get("tui_compact", False))
+        on = bool((_load_cfg().get("display") or {}).get("tui_compact", False))
         return _ok(rid, {"value": "on" if on else "off"})
     if key == "statusbar":
         display = _load_cfg().get("display")
@@ -2809,6 +2934,10 @@ def _(rid, params: dict) -> dict:
             display.get("tui_statusbar", "top") if isinstance(display, dict) else "top"
         )
         return _ok(rid, {"value": _coerce_statusbar(raw)})
+    if key == "mouse":
+        display = _load_cfg().get("display")
+        on = display.get("tui_mouse", True) if isinstance(display, dict) else True
+        return _ok(rid, {"value": "on" if on else "off"})
     if key == "mtime":
         cfg_path = _hermes_home / "config.yaml"
         try:
@@ -3196,29 +3325,6 @@ def _(rid, params: dict) -> dict:
         # Fallback: no active run, treat as next-turn message
         return _ok(rid, {"type": "send", "message": arg})
 
-    if name == "plan":
-        try:
-            from agent.skill_commands import (
-                build_skill_invocation_message as _bsim,
-                build_plan_path,
-            )
-
-            user_instruction = arg or ""
-            plan_path = build_plan_path(user_instruction)
-            msg = _bsim(
-                "/plan",
-                user_instruction,
-                task_id=session.get("session_key", "") if session else "",
-                runtime_note=(
-                    "Save the markdown plan with write_file to this exact relative path "
-                    f"inside the active workspace/backend cwd: {plan_path}"
-                ),
-            )
-            if msg:
-                return _ok(rid, {"type": "send", "message": msg})
-        except Exception as e:
-            return _err(rid, 5030, f"plan skill failed: {e}")
-
     return _err(rid, 4018, f"not a quick/plugin/skill command: {name}")
 
 
@@ -3310,7 +3416,16 @@ def _list_repo_files(root: str) -> list[str]:
         if top_result.returncode == 0:
             top = top_result.stdout.decode("utf-8", "replace").strip()
             list_result = subprocess.run(
-                ["git", "-C", top, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                [
+                    "git",
+                    "-C",
+                    top,
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                ],
                 capture_output=True,
                 timeout=2.0,
                 check=False,
@@ -3319,7 +3434,9 @@ def _list_repo_files(root: str) -> list[str]:
                 for p in list_result.stdout.decode("utf-8", "replace").split("\0"):
                     if not p:
                         continue
-                    rel = os.path.relpath(os.path.join(top, p), root).replace(os.sep, "/")
+                    rel = os.path.relpath(os.path.join(top, p), root).replace(
+                        os.sep, "/"
+                    )
                     # Skip parents/siblings of cwd — keep the picker scoped
                     # to root-and-below, matching Cmd-P workspace semantics.
                     if rel.startswith("../"):
@@ -3453,12 +3570,7 @@ def _(rid, params: dict) -> dict:
         # editors like Cursor / VS Code do for Cmd-P. Path-ish queries (with
         # `/`, `./`, `~/`, `/abs`) fall through to the directory-listing
         # path so explicit navigation intent is preserved.
-        if (
-            is_context
-            and path_part
-            and "/" not in path_part
-            and prefix_tag != "folder"
-        ):
+        if is_context and path_part and "/" not in path_part and prefix_tag != "folder":
             root = os.getcwd()
             ranked: list[tuple[tuple[int, int], str, str]] = []
             for rel in _list_repo_files(root):
@@ -3662,7 +3774,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             _apply_personality_to_session(sid, session, new_prompt)
         elif name == "prompt" and agent:
             cfg = _load_cfg()
-            new_prompt = cfg.get("agent", {}).get("system_prompt", "") or ""
+            new_prompt = (cfg.get("agent") or {}).get("system_prompt", "") or ""
             agent.ephemeral_system_prompt = new_prompt or None
             agent._cached_system_prompt = None
         elif name == "compress" and agent:
@@ -3884,9 +3996,7 @@ def _(rid, params: dict) -> dict:
 
             voice_cfg = _load_cfg().get("voice", {})
             start_continuous(
-                on_transcript=lambda t: _voice_emit(
-                    "voice.transcript", {"text": t}
-                ),
+                on_transcript=lambda t: _voice_emit("voice.transcript", {"text": t}),
                 on_status=lambda s: _voice_emit("voice.status", {"state": s}),
                 on_silent_limit=lambda: _voice_emit(
                     "voice.transcript", {"no_speech_limit": True}
