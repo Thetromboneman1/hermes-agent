@@ -123,6 +123,16 @@ from utils import atomic_json_write, base_url_host_matches, base_url_hostname, e
 _QUIET_TOOL_DEFINITIONS_CACHE: dict[tuple[tuple[str, ...], tuple[str, ...]], list[dict[str, Any]]] = {}
 _QUIET_TOOL_DEFINITIONS_CACHE_LOCK = threading.Lock()
 
+# Cache the (client, aux_model) result of get_text_auxiliary_client("compression")
+# keyed by the main-runtime tuple.  Resolving the auxiliary provider traverses
+# hundreds of credential-pool entries (and sometimes makes a network call for
+# Copilot token exchange), which adds ~0.35–0.4 s per AIAgent construction.
+# Agents within the same process share the same credential environment, so the
+# result is stable across inits.  Tests that need a fresh resolution clear this
+# dict in the _hermetic_environment autouse fixture.
+_COMPRESSION_CLIENT_CACHE: dict[tuple, tuple] = {}
+_COMPRESSION_CLIENT_CACHE_LOCK = threading.Lock()
+
 
 def _get_cached_base_tool_definitions(
     *,
@@ -2464,10 +2474,22 @@ class AIAgent:
                 get_model_context_length,
             )
 
-            client, aux_model = get_text_auxiliary_client(
-                "compression",
-                main_runtime=self._current_main_runtime(),
+            _main_rt = self._current_main_runtime()
+            _compress_cache_key = (
+                _main_rt.get("provider", ""),
+                _main_rt.get("model", ""),
+                _main_rt.get("base_url", ""),
+                _main_rt.get("api_mode", ""),
             )
+            with _COMPRESSION_CLIENT_CACHE_LOCK:
+                if _compress_cache_key in _COMPRESSION_CLIENT_CACHE:
+                    client, aux_model = _COMPRESSION_CLIENT_CACHE[_compress_cache_key]
+                else:
+                    client, aux_model = get_text_auxiliary_client(
+                        "compression",
+                        main_runtime=_main_rt,
+                    )
+                    _COMPRESSION_CLIENT_CACHE[_compress_cache_key] = (client, aux_model)
             if client is None or not aux_model:
                 msg = (
                     "⚠ No auxiliary LLM provider configured — context "
