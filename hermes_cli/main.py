@@ -5110,7 +5110,7 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
             print("Install Node.js, then run:  cd web && npm install && npm run build")
         return not fatal
     print("→ Building web UI...")
-    r1 = _run_npm_install_deterministic(npm, web_dir, extra_args=("--silent",))
+    r1 = subprocess.run([npm, "install", "--silent"], cwd=web_dir, capture_output=True)
     if r1.returncode != 0:
         print(
             f"  {'✗' if fatal else '⚠'} Web UI npm install failed"
@@ -5821,10 +5821,11 @@ def _update_node_dependencies() -> None:
         if not (path / "package.json").exists():
             continue
 
-        result = _run_npm_install_deterministic(
-            npm,
-            path,
-            extra_args=("--silent", "--no-fund", "--no-audit", "--progress=false"),
+        result = subprocess.run(
+            [npm, "install", "--silent", "--no-fund", "--no-audit", "--progress=false"],
+            cwd=path,
+            capture_output=True,
+            text=True,
         )
         if result.returncode == 0:
             print(f"  ✓ {label}")
