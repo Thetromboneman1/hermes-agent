@@ -6021,6 +6021,9 @@ class AIAgent:
         Falls back to _interruptible_api_call on provider errors indicating
         streaming is not supported.
         """
+        if self._interrupt_requested:
+            raise InterruptedError("Agent interrupted before API call")
+
         if self.api_mode == "codex_responses":
             # Codex streams internally via _run_codex_stream. The main dispatch
             # in _interruptible_api_call already calls it; we just need to

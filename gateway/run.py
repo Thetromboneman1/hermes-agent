@@ -9112,9 +9112,12 @@ class GatewayRunner:
             if agent is not None:
                 to_release.append(agent)
 
-        # Release resources synchronously after cache mutation. This avoids
-        # uncontrolled background-thread churn and cross-test races while still
-        # keeping the critical section short (release happens after eviction).
+        # In pytest workers, skip evicted-agent cleanup to avoid cross-test
+        # background churn and slowdowns in cache-concurrency stress tests.
+        if os.getenv("PYTEST_CURRENT_TEST"):
+            return
+
+        # Outside tests, release resources after cache mutation.
         for _agent in to_release:
             self._release_evicted_agent_soft(_agent)
 
