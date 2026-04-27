@@ -1349,14 +1349,7 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
     cfg = _load_cfg()
     system_prompt = ((cfg.get("agent") or {}).get("system_prompt", "") or "").strip()
     model, requested_provider = _resolve_startup_runtime()
-    try:
-        runtime = resolve_runtime_provider(
-            requested=requested_provider,
-            target_model=model or None,
-        )
-    except TypeError:
-        # Back-compat with older/mocked signatures that only accept `requested`.
-        runtime = resolve_runtime_provider(requested=requested_provider)
+    runtime = resolve_runtime_provider(requested=requested_provider)
     return AIAgent(
         model=model,
         provider=runtime.get("provider"),
