@@ -181,6 +181,9 @@ def is_wsl() -> bool:
     """
     global _wsl_detected
 
+    if _wsl_detected is not None:
+        return _wsl_detected
+
     # Test mode: bypass process-global cache so concurrent/background calls
     # cannot race and pin a stale value before a test's patched /proc/version
     # read executes.
@@ -191,8 +194,6 @@ def is_wsl() -> bool:
         except Exception:
             return False
 
-    if _wsl_detected is not None:
-        return _wsl_detected
     try:
         with open("/proc/version", "r") as f:
             _wsl_detected = "microsoft" in f.read().lower()

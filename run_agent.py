@@ -120,6 +120,48 @@ from agent.trajectory import (
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 
 
+_QUIET_TOOL_DEFINITIONS_CACHE: dict[tuple[tuple[str, ...], tuple[str, ...]], list[dict[str, Any]]] = {}
+_QUIET_TOOL_DEFINITIONS_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_base_tool_definitions(
+    *,
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
+    quiet_mode: bool,
+) -> List[Dict[str, Any]]:
+    """Return per-agent tool definitions, caching the quiet-mode base surface.
+
+    AIAgent instances created in tight loops (for example gateway cache stress
+    tests and high-churn gateway sessions) do not need to rebuild the entire
+    static tool schema registry every time.  Cache only the quiet-mode path so
+    we preserve the existing user-facing enable/disable prints in interactive
+    runs. Always return a deep copy because individual agents may append extra
+    provider/plugin tools later in init.
+    """
+    if not quiet_mode:
+        return get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=quiet_mode,
+        )
+
+    cache_key = (
+        tuple(enabled_toolsets or ()),
+        tuple(disabled_toolsets or ()),
+    )
+    with _QUIET_TOOL_DEFINITIONS_CACHE_LOCK:
+        cached = _QUIET_TOOL_DEFINITIONS_CACHE.get(cache_key)
+        if cached is None:
+            cached = get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                quiet_mode=True,
+            )
+            _QUIET_TOOL_DEFINITIONS_CACHE[cache_key] = copy.deepcopy(cached)
+        return copy.deepcopy(cached)
+
+
 
 class _SafeWriter:
     """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
@@ -1467,7 +1509,7 @@ class AIAgent:
                       " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
 
         # Get available tools with filtering
-        self.tools = get_tool_definitions(
+        self.tools = _get_cached_base_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
