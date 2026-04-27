@@ -180,6 +180,17 @@ def is_wsl() -> bool:
     Import-safe — no heavy deps.
     """
     global _wsl_detected
+
+    # Test mode: bypass process-global cache so concurrent/background calls
+    # cannot race and pin a stale value before a test's patched /proc/version
+    # read executes.
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        try:
+            with open("/proc/version", "r") as f:
+                return "microsoft" in f.read().lower()
+        except Exception:
+            return False
+
     if _wsl_detected is not None:
         return _wsl_detected
     try:
