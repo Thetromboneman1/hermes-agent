@@ -118,12 +118,16 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
 
 
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
-    """Resolve *filepath* against the task's live terminal cwd when possible."""
+    """Resolve *filepath* against the task's cwd with deterministic fallback."""
     p = Path(filepath).expanduser()
     if not p.is_absolute():
-        base = _get_live_tracking_cwd(task_id) or os.environ.get(
-            "TERMINAL_CWD", os.getcwd()
-        )
+        env_cwd = os.environ.get("TERMINAL_CWD")
+        # For the shared/default task, prefer TERMINAL_CWD when provided so
+        # unrelated cached terminal state from prior calls can't leak in.
+        if task_id == "default" and env_cwd:
+            base = env_cwd
+        else:
+            base = _get_live_tracking_cwd(task_id) or env_cwd or os.getcwd()
         p = Path(base) / p
     return p.resolve()
 

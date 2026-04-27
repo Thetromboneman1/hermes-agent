@@ -9112,19 +9112,11 @@ class GatewayRunner:
             if agent is not None:
                 to_release.append(agent)
 
-        # Release evicted agents in a single background worker to avoid
-        # spawning hundreds of threads during concurrent cache churn tests.
-        if to_release:
-            def _release_batch(evicted_agents: List[Any]) -> None:
-                for _agent in evicted_agents:
-                    self._release_evicted_agent_soft(_agent)
-
-            threading.Thread(
-                target=_release_batch,
-                args=(to_release,),
-                daemon=True,
-                name="agent-cache-evict-batch",
-            ).start()
+        # Release resources synchronously after cache mutation. This avoids
+        # uncontrolled background-thread churn and cross-test races while still
+        # keeping the critical section short (release happens after eviction).
+        for _agent in to_release:
+            self._release_evicted_agent_soft(_agent)
 
     def _sweep_idle_cached_agents(self) -> int:
         """Evict cached agents whose AIAgent has been idle > _AGENT_CACHE_IDLE_TTL_SECS.
