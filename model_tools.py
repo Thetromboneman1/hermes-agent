@@ -472,9 +472,9 @@ def _coerce_number(value: str, integer_only: bool = False):
     # Keep NaN as string (not JSON-serializable, and NaN != NaN semantics are surprising).
     if f != f:
         return value
-    # Permit infinities for number-typed args; integer-only schemas still keep string form.
+    # Keep infinities as strings so strict JSON serialization remains safe.
     if f == float("inf") or f == float("-inf"):
-        return value if integer_only else f
+        return value
     # If it looks like an integer (no fractional part), return int
     if f == int(f):
         return int(f)

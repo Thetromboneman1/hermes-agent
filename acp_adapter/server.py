@@ -429,19 +429,9 @@ class HermesACPAgent(acp.Agent):
 
     def _build_session_model_state(self, state: SessionState) -> SessionModelState | None:
         """Build ACP session model state for editor-side model pickers."""
-        model_ids = self._discover_session_models(state)
-        if not model_ids:
-            return None
-
-        current = state.model or getattr(state.agent, "model", "") or model_ids[0]
-        if current not in model_ids:
-            model_ids.insert(0, current)
-
-        available_models = [
-            ModelInfo(model_id=model_id, name=self._display_model_name(model_id))
-            for model_id in model_ids
-        ]
-        return SessionModelState(available_models=available_models, current_model_id=current)
+        # Keep provider-qualified model ids (``provider:model``) so editor
+        # model pickers preserve runtime/provider context correctly.
+        return self._build_model_state(state)
 
     @staticmethod
     def _display_model_name(model_id: str) -> str:
