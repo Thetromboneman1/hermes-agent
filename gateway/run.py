@@ -9542,8 +9542,8 @@ class GatewayRunner:
         # Tool progress mode — resolved per-platform with env var fallback
         _resolved_tp = resolve_display_setting(user_config, platform_key, "tool_progress")
         progress_mode = (
-            _resolved_tp
-            or os.getenv("HERMES_TOOL_PROGRESS_MODE")
+            os.getenv("HERMES_TOOL_PROGRESS_MODE")
+            or _resolved_tp
             or "all"
         )
         # Disable tool progress for webhooks - they don't support message editing,

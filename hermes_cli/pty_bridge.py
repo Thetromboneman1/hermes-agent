@@ -111,6 +111,9 @@ class PtyBridge:
         # Let caller-supplied env fully override inheritance; if they pass
         # None we inherit the server's env (same semantics as subprocess).
         spawn_env = os.environ.copy() if env is None else env
+        if isinstance(spawn_env, dict) and not spawn_env.get("TERM"):
+            spawn_env = dict(spawn_env)
+            spawn_env["TERM"] = "xterm-256color"
         proc = ptyprocess.PtyProcess.spawn(  # type: ignore[union-attr]
             list(argv),
             cwd=cwd,

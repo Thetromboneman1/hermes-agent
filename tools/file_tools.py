@@ -163,6 +163,32 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(os.path.expanduser(filepath))
+    # User temp locations are intentionally writable by file tools. On macOS,
+    # tempfile paths often resolve under /private/var/... which would otherwise
+    # match the broad sensitive prefix block and break normal test/editor flows.
+    try:
+        temp_root = os.path.realpath(tempfile.gettempdir())
+    except Exception:
+        temp_root = ""
+    resolved_real = os.path.realpath(resolved)
+    normalized_real = os.path.realpath(normalized)
+    if temp_root and (
+        resolved_real == temp_root
+        or resolved_real.startswith(temp_root + os.sep)
+        or normalized_real == temp_root
+        or normalized_real.startswith(temp_root + os.sep)
+    ):
+        return None
+    # macOS temporary files commonly live under /var/folders (or the
+    # /private/var/folders mirror). Treat these as user-temp, not sensitive.
+    if (
+        resolved_real.startswith("/var/folders/")
+        or resolved_real.startswith("/private/var/folders/")
+        or normalized_real.startswith("/var/folders/")
+        or normalized_real.startswith("/private/var/folders/")
+    ):
+        return None
+
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
@@ -488,12 +514,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             task_data = _read_tracker.setdefault(task_id, {
                 "last_key": None, "consecutive": 0,
                 "read_history": set(), "dedup": {},
-                "dedup_hits": {},
+                "dedup_hits": {}, "read_timestamps": {},
             })
             # Backward-compat for pre-existing tracker entries that predate
             # dedup_hits (long-lived task or crossed an upgrade boundary).
             if "dedup_hits" not in task_data:
                 task_data["dedup_hits"] = {}
+            if "read_timestamps" not in task_data:
+                task_data["read_timestamps"] = {}
             cached_mtime = task_data.get("dedup", {}).get(dedup_key)
 
         if cached_mtime is not None:
