@@ -9112,14 +9112,18 @@ class GatewayRunner:
             if agent is not None:
                 to_release.append(agent)
 
-        # In pytest workers, skip evicted-agent cleanup to avoid cross-test
-        # background churn and slowdowns in cache-concurrency stress tests.
-        if os.getenv("PYTEST_CURRENT_TEST"):
-            return
-
-        # Outside tests, release resources after cache mutation.
+        # Dispatch cleanup to daemon threads — same pattern as
+        # _sweep_idle_cached_agents.  Running synchronously while holding
+        # _agent_cache_lock would block every other thread trying to insert
+        # into the cache; daemon threads release clients in the background
+        # without the lock.
         for _agent in to_release:
-            self._release_evicted_agent_soft(_agent)
+            threading.Thread(
+                target=self._release_evicted_agent_soft,
+                args=(_agent,),
+                daemon=True,
+                name="agent-cache-cap-evict",
+            ).start()
 
     def _sweep_idle_cached_agents(self) -> int:
         """Evict cached agents whose AIAgent has been idle > _AGENT_CACHE_IDLE_TTL_SECS.
