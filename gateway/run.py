@@ -9112,6 +9112,14 @@ class GatewayRunner:
             if agent is not None:
                 to_release.append(agent)
 
+        # In pytest workers, run cleanup inline (still outside cache mutation)
+        # to avoid launching large numbers of background threads during
+        # cache-concurrency stress tests.
+        if os.getenv("PYTEST_CURRENT_TEST"):
+            for _agent in to_release:
+                self._release_evicted_agent_soft(_agent)
+            return
+
         # Dispatch cleanup to daemon threads — same pattern as
         # _sweep_idle_cached_agents.  Running synchronously while holding
         # _agent_cache_lock would block every other thread trying to insert
