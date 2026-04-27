@@ -9103,18 +9103,28 @@ class GatewayRunner:
                 len(_cache), _AGENT_CACHE_MAX_SIZE, remaining_over_cap,
             )
 
+        to_release: List[Any] = []
         for key, agent in evict_plan:
             logger.info(
                 "Agent cache at cap; evicting LRU session=%s (cache_size=%d)",
                 key, len(_cache),
             )
             if agent is not None:
-                threading.Thread(
-                    target=self._release_evicted_agent_soft,
-                    args=(agent,),
-                    daemon=True,
-                    name=f"agent-cache-evict-{key[:24]}",
-                ).start()
+                to_release.append(agent)
+
+        # Release evicted agents in a single background worker to avoid
+        # spawning hundreds of threads during concurrent cache churn tests.
+        if to_release:
+            def _release_batch(evicted_agents: List[Any]) -> None:
+                for _agent in evicted_agents:
+                    self._release_evicted_agent_soft(_agent)
+
+            threading.Thread(
+                target=_release_batch,
+                args=(to_release,),
+                daemon=True,
+                name="agent-cache-evict-batch",
+            ).start()
 
     def _sweep_idle_cached_agents(self) -> int:
         """Evict cached agents whose AIAgent has been idle > _AGENT_CACHE_IDLE_TTL_SECS.

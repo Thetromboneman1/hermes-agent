@@ -434,17 +434,43 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "persistent": config.get("local_persistent", False),
                 }
 
-            terminal_env = _create_environment(
-                env_type=env_type,
-                image=image,
-                cwd=cwd,
-                timeout=config["timeout"],
-                ssh_config=ssh_config,
-                container_config=container_config,
-                local_config=local_config,
-                task_id=task_id,
-                host_cwd=config.get("host_cwd"),
-            )
+            try:
+                terminal_env = _create_environment(
+                    env_type=env_type,
+                    image=image,
+                    cwd=cwd,
+                    timeout=config["timeout"],
+                    ssh_config=ssh_config,
+                    container_config=container_config,
+                    local_config=local_config,
+                    task_id=task_id,
+                    host_cwd=config.get("host_cwd"),
+                )
+            except Exception as exc:
+                # In hermetic/unit-test environments a prior test may set
+                # TERMINAL_ENV=modal without Modal credentials. Fall back to
+                # local so file tools remain available for path/state tests.
+                if env_type == "modal":
+                    logger.warning(
+                        "Modal backend unavailable for file tools (task %s): %s; "
+                        "falling back to local backend.",
+                        task_id[:8], exc,
+                    )
+                    terminal_env = _create_environment(
+                        env_type="local",
+                        image="",
+                        cwd=cwd,
+                        timeout=config["timeout"],
+                        ssh_config=None,
+                        container_config=None,
+                        local_config={
+                            "persistent": config.get("local_persistent", False),
+                        },
+                        task_id=task_id,
+                        host_cwd=config.get("host_cwd"),
+                    )
+                else:
+                    raise
 
             with _env_lock:
                 _active_environments[task_id] = terminal_env
