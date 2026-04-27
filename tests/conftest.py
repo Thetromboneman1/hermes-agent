@@ -281,16 +281,16 @@ def _hermetic_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("AWS_METADATA_SERVICE_NUM_ATTEMPTS", "1")
 
     # 4c. Clear process-scoped agent caches that retain stale state across
-    #     tests in the same xdist worker.  Tests that mock get_tool_definitions
-    #     or get_text_auxiliary_client need a clean slate so their mocks are
-    #     actually called rather than bypassed by a cached result left behind
-    #     by a previous test.
-    try:
-        import run_agent as _run_agent_mod
-        _run_agent_mod._QUIET_TOOL_DEFINITIONS_CACHE.clear()
-        _run_agent_mod._COMPRESSION_CLIENT_CACHE.clear()
-    except (ImportError, AttributeError):
-        pass
+    #     tests in the same xdist worker.  Only touch run_agent if it is
+    #     already imported for this test process; importing it here would
+    #     execute unrelated module init in tests that never use the agent.
+    _run_agent_mod = sys.modules.get("run_agent")
+    if _run_agent_mod is not None:
+        try:
+            _run_agent_mod._QUIET_TOOL_DEFINITIONS_CACHE.clear()
+            _run_agent_mod._COMPRESSION_CLIENT_CACHE.clear()
+        except AttributeError:
+            pass
 
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
