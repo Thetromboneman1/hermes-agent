@@ -175,6 +175,128 @@ class TestPersistence:
 
         assert captured["enabled_toolsets"] == ["hermes-acp", "mcp-olympus", "mcp-exa"]
 
+    def test_create_session_prefers_local_webui_custom_provider(self, tmp_path, monkeypatch):
+        requested_values = []
+
+        def fake_resolve_runtime_provider(requested=None, **kwargs):
+            requested_values.append(requested)
+            return {
+                "provider": "custom",
+                "api_mode": "chat_completions",
+                "base_url": "http://localhost:8642/v1",
+                "api_key": "no-key-required",
+                "command": None,
+                "args": [],
+            }
+
+        def fake_agent(**kwargs):
+            return SimpleNamespace(model=kwargs.get("model"), enabled_toolsets=kwargs.get("enabled_toolsets"))
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {
+            "model": {"provider": "openrouter", "default": "qwen3-coder-next"},
+            "custom_providers": [
+                {
+                    "name": "Hermes WebUI",
+                    "base_url": "http://localhost:8642/v1",
+                    "model": "qwen3-coder-next",
+                }
+            ],
+        })
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        db = SessionDB(tmp_path / "state.db")
+
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            manager = SessionManager(db=db)
+            manager.create_session(cwd="/work")
+
+        assert requested_values[-1] == "custom:hermes-webui"
+
+    def test_create_session_prefers_local_provider_from_providers_dict(self, tmp_path, monkeypatch):
+        requested_values = []
+
+        def fake_resolve_runtime_provider(requested=None, **kwargs):
+            requested_values.append(requested)
+            return {
+                "provider": "custom",
+                "api_mode": "chat_completions",
+                "base_url": "http://localhost:8642/v1",
+                "api_key": "no-key-required",
+                "command": None,
+                "args": [],
+            }
+
+        def fake_agent(**kwargs):
+            return SimpleNamespace(model=kwargs.get("model"), enabled_toolsets=kwargs.get("enabled_toolsets"))
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {
+            "model": {"provider": "openrouter", "default": "qwen3-coder-next"},
+            "providers": {
+                "ai": {
+                    "name": "AI",
+                    "api": "http://localhost:8642/v1",
+                    "default_model": "qwen3-coder-next",
+                }
+            },
+        })
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        db = SessionDB(tmp_path / "state.db")
+
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            manager = SessionManager(db=db)
+            manager.create_session(cwd="/work")
+
+        assert requested_values[-1] == "custom:ai"
+
+    def test_create_session_prefers_local_docker_provider_over_openrouter(self, tmp_path, monkeypatch):
+        requested_values = []
+
+        def fake_resolve_runtime_provider(requested=None, **kwargs):
+            requested_values.append(requested)
+            return {
+                "provider": "custom",
+                "api_mode": "chat_completions",
+                "base_url": "http://model-runner.docker.internal/engines/llama.cpp/v1",
+                "api_key": "",
+                "command": None,
+                "args": [],
+            }
+
+        def fake_agent(**kwargs):
+            return SimpleNamespace(model=kwargs.get("model"), enabled_toolsets=kwargs.get("enabled_toolsets"))
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {
+            "model": {"provider": "openrouter", "default": "ai/qwen3-coder-next"},
+            "providers": {
+                "local-docker": {
+                    "name": "Local Docker",
+                    "api": "http://model-runner.docker.internal/engines/llama.cpp/v1",
+                    "default_model": "ai/qwen3-coder-next",
+                },
+                "ollama-cloud": {
+                    "name": "Ollama Cloud",
+                    "api": "https://ollama.com/v1",
+                    "default_model": "qwen3-coder-next",
+                },
+            },
+        })
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        db = SessionDB(tmp_path / "state.db")
+
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            manager = SessionManager(db=db)
+            manager.create_session(cwd="/work")
+
+        assert requested_values[-1] == "custom:local-docker"
+
     def test_create_session_writes_to_db(self, manager):
         state = manager.create_session(cwd="/project")
         db = manager._get_db()

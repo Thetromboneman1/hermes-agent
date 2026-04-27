@@ -172,6 +172,90 @@ class TestSessionOps:
         assert "Provider:" in resp.models.available_models[0].description
 
     @pytest.mark.asyncio
+    async def test_new_session_model_state_prioritizes_webui_custom_provider(self):
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(model="gpt-5.4", provider="openai-codex")
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+
+        with patch(
+            "hermes_cli.models.curated_models_for_provider",
+            return_value=[("gpt-5.4", "recommended")],
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "custom_providers": [
+                    {
+                        "name": "Hermes WebUI",
+                        "base_url": "http://localhost:8642/v1",
+                        "model": "qwen3-coder-next",
+                    }
+                ]
+            },
+        ):
+            resp = await acp_agent.new_session(cwd="/tmp")
+
+        assert isinstance(resp.models, SessionModelState)
+        assert resp.models.available_models[0].model_id == "custom:hermes-webui:qwen3-coder-next"
+        assert resp.models.available_models[0].name == "Hermes WebUI/qwen3-coder-next"
+
+    @pytest.mark.asyncio
+    async def test_new_session_model_state_includes_providers_dict_local_endpoint(self):
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(model="gpt-5.4", provider="openai-codex")
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+
+        with patch(
+            "hermes_cli.models.curated_models_for_provider",
+            return_value=[("gpt-5.4", "recommended")],
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "providers": {
+                    "ai": {
+                        "name": "AI",
+                        "api": "http://localhost:8642/v1",
+                        "default_model": "qwen3-coder-next",
+                    }
+                }
+            },
+        ):
+            resp = await acp_agent.new_session(cwd="/tmp")
+
+        assert isinstance(resp.models, SessionModelState)
+        ids = [m.model_id for m in resp.models.available_models]
+        assert "custom:ai:qwen3-coder-next" in ids
+
+    @pytest.mark.asyncio
+    async def test_new_session_model_state_prioritizes_local_docker_provider(self):
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(model="openrouter/gpt-5", provider="openrouter")
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+
+        with patch(
+            "hermes_cli.models.curated_models_for_provider",
+            return_value=[("openrouter/gpt-5", "recommended")],
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "providers": {
+                    "local-docker": {
+                        "name": "Local Docker",
+                        "api": "http://model-runner.docker.internal/engines/llama.cpp/v1",
+                        "default_model": "ai/qwen3-coder-next",
+                    }
+                }
+            },
+        ):
+            resp = await acp_agent.new_session(cwd="/tmp")
+
+        assert isinstance(resp.models, SessionModelState)
+        assert resp.models.available_models[0].model_id == "custom:local-docker:ai/qwen3-coder-next"
+        assert resp.models.available_models[0].description == "Local endpoint"
+
+    @pytest.mark.asyncio
     async def test_available_commands_include_help(self, agent):
         help_cmd = next(
             (cmd for cmd in agent._available_commands() if cmd.name == "help"),
@@ -425,6 +509,51 @@ class TestSessionConfiguration:
         assert state.agent.provider == "anthropic"
         assert state.agent.base_url == "https://anthropic.example/v1"
         assert runtime_calls[-1] == "anthropic"
+
+    @pytest.mark.asyncio
+    async def test_set_session_model_keeps_explicit_custom_provider_choice(self, tmp_path, monkeypatch):
+        runtime_calls = []
+
+        def fake_resolve_runtime_provider(requested=None, **kwargs):
+            runtime_calls.append(requested)
+            provider = requested or "openrouter"
+            return {
+                "provider": provider,
+                "api_mode": "chat_completions",
+                "base_url": "http://localhost:8642/v1",
+                "api_key": "no-key-required",
+                "command": None,
+                "args": [],
+            }
+
+        def fake_agent(**kwargs):
+            return SimpleNamespace(
+                model=kwargs.get("model"),
+                provider=kwargs.get("provider"),
+                base_url=kwargs.get("base_url"),
+                api_mode=kwargs.get("api_mode"),
+            )
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {
+            "model": {"provider": "openrouter", "default": "openrouter/gpt-5"}
+        })
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        manager = SessionManager(db=SessionDB(tmp_path / "state.db"))
+
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            acp_agent = HermesACPAgent(session_manager=manager)
+            state = manager.create_session(cwd="/tmp")
+            result = await acp_agent.set_session_model(
+                model_id="custom:hermes-webui:qwen3-coder-next",
+                session_id=state.session_id,
+            )
+
+        assert isinstance(result, SetSessionModelResponse)
+        assert state.model == "qwen3-coder-next"
+        assert runtime_calls[-1] == "custom:hermes-webui"
 
 
 # ---------------------------------------------------------------------------

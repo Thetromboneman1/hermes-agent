@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,132 @@ def _acp_stderr_print(*args, **kwargs) -> None:
     kwargs = dict(kwargs)
     kwargs.setdefault("file", sys.stderr)
     print(*args, **kwargs)
+
+
+def _normalize_custom_provider_name(value: str | None) -> str:
+    return str(value or "").strip().lower().replace(" ", "-")
+
+
+def _resolve_acp_default_provider(config: Dict[str, Any], configured_provider: Any) -> str | None:
+    """Prefer local Hermes WebUI custom providers for ACP sessions when possible.
+
+    Many configs set ``model.provider: custom`` plus a global
+    ``model.default`` / ``model.base_url`` and then list bare ``custom_providers``
+    entries (name + base_url, no per-entry ``model``). In that case the user
+    clearly intends one of those local endpoints to be the active provider, so
+    we still need to score them and return ``custom:<provider-key>``. Otherwise
+    the agent falls through to the literal ``custom`` provider with no
+    provider-key suffix and the picker can't link the running model back to a
+    named local endpoint.
+    """
+    requested = str(configured_provider or "").strip().lower()
+
+    model_section = config.get("model") if isinstance(config.get("model"), dict) else {}
+    default_model = str(model_section.get("default") or "").strip()
+    default_base_url = str(model_section.get("base_url") or "").strip().rstrip("/")
+
+    # If the user picked something explicit and non-generic, honor it. We treat
+    # bare "custom" as generic too, so we can still upgrade it to
+    # ``custom:<local-key>`` based on the configured endpoints below.
+    if requested and requested not in {"auto", "openrouter", "custom"}:
+        return requested
+
+    normalized_entries: list[dict[str, str]] = []
+
+    custom_providers = config.get("custom_providers")
+    if isinstance(custom_providers, list):
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+            normalized_entries.append(
+                {
+                    "name": str(entry.get("name") or "").strip(),
+                    "base_url": str(entry.get("base_url") or "").strip(),
+                    "model": str(entry.get("model") or "").strip(),
+                    "provider_key": str(entry.get("provider_key") or "").strip(),
+                }
+            )
+
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for key, entry in providers.items():
+            if not isinstance(entry, dict):
+                continue
+            normalized_entries.append(
+                {
+                    "name": str(entry.get("name") or key or "").strip(),
+                    "base_url": (
+                        str(entry.get("api") or "").strip()
+                        or str(entry.get("url") or "").strip()
+                        or str(entry.get("base_url") or "").strip()
+                    ),
+                    "model": str(entry.get("default_model") or "").strip()
+                    or str(entry.get("model") or "").strip(),
+                    "provider_key": str(key or "").strip(),
+                }
+            )
+
+    if not normalized_entries:
+        return requested or None
+
+    best_candidate: tuple[int, str] | None = None
+
+    for entry in normalized_entries:
+        entry_base = str(entry.get("base_url") or "").strip()
+        entry_model = str(entry.get("model") or "").strip()
+        # Backfill missing per-entry model from the global default when the
+        # endpoint matches model.base_url, so bare custom_providers entries
+        # (name + base_url only) still participate in scoring.
+        if not entry_model and default_model:
+            normalized_entry_base = entry_base.rstrip("/")
+            if normalized_entry_base and normalized_entry_base == default_base_url:
+                entry_model = default_model
+        if not entry_base or not entry_model:
+            continue
+        parsed = urlparse(entry_base if "://" in entry_base else f"http://{entry_base}")
+        host = (parsed.hostname or "").strip().lower()
+        is_local = host in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "host.docker.internal",
+            "model-runner.docker.internal",
+        }
+        if not is_local:
+            continue
+        provider_key = str(entry.get("provider_key") or "").strip()
+
+        provider_suffix = _normalize_custom_provider_name(provider_key or entry.get("name"))
+        if not provider_suffix:
+            provider_suffix = "custom"
+
+        entry_name = str(entry.get("name") or "").strip().lower()
+        score = 0
+
+        # Prefer explicit local Docker/model-runner entries first.
+        if "local-docker" in provider_suffix or "local-docker" in entry_name:
+            score += 6
+        if host in {"model-runner.docker.internal", "host.docker.internal"}:
+            score += 5
+        if "docker" in provider_suffix or "docker" in entry_name:
+            score += 3
+
+        # Keep WebUI endpoints as a strong local default when present.
+        if parsed.port == 8642 or "webui" in entry_name:
+            score += 4
+
+        # Prefer named provider keys over anonymous custom entries.
+        if provider_key:
+            score += 1
+
+        candidate = (score, f"custom:{provider_suffix}" if provider_suffix != "custom" else "custom")
+        if best_candidate is None or candidate[0] > best_candidate[0]:
+            best_candidate = candidate
+
+    if best_candidate is not None:
+        return best_candidate[1]
+
+    return requested or None
 
 
 def _register_task_cwd(task_id: str, cwd: str) -> None:
@@ -573,7 +700,8 @@ class SessionManager:
         }
 
         try:
-            runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+            default_provider = _resolve_acp_default_provider(config, config_provider)
+            runtime = resolve_runtime_provider(requested=requested_provider or default_provider)
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),

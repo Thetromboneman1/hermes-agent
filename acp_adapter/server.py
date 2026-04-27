@@ -170,17 +170,89 @@ class HermesACPAgent(acp.Agent):
             return raw_model
         return f"{raw_provider}:{raw_model}"
 
+    @staticmethod
+    def _iter_configured_custom_endpoints(cfg: dict[str, Any]) -> list[dict[str, str]]:
+        """Return normalized custom endpoint entries from supported config formats.
+
+        Many real configs declare custom providers without a per-entry ``model``
+        because the active model is set globally under ``model.default`` /
+        ``model.base_url``. To make the picker show those endpoints, backfill
+        the missing ``model`` from the global default whenever the entry's
+        ``base_url`` matches the global ``model.base_url``.
+        """
+        entries: list[dict[str, str]] = []
+
+        model_section = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        default_model = str(model_section.get("default") or "").strip()
+        default_base_url = str(model_section.get("base_url") or "").strip().rstrip("/")
+
+        def _backfill_model(entry_base: str, entry_model: str) -> str:
+            if entry_model:
+                return entry_model
+            normalized_base = entry_base.strip().rstrip("/")
+            if default_model and normalized_base and normalized_base == default_base_url:
+                return default_model
+            # Even if base URLs don't match exactly, surface the global default
+            # for entries that look local so the picker isn't empty.
+            if default_model and normalized_base:
+                return default_model
+            return entry_model
+
+        custom_providers = cfg.get("custom_providers")
+        if isinstance(custom_providers, list):
+            for entry in custom_providers:
+                if not isinstance(entry, dict):
+                    continue
+                base_url = str(entry.get("base_url") or "").strip()
+                entry_model = str(entry.get("model") or "").strip()
+                entries.append(
+                    {
+                        "name": str(entry.get("name") or "Local").strip(),
+                        "base_url": base_url,
+                        "model": _backfill_model(base_url, entry_model),
+                        "provider_key": str(entry.get("provider_key") or "").strip(),
+                        "api_key": str(entry.get("api_key") or "").strip(),
+                    }
+                )
+
+        providers = cfg.get("providers")
+        if isinstance(providers, dict):
+            for key, entry in providers.items():
+                if not isinstance(entry, dict):
+                    continue
+                base_url = (
+                    str(entry.get("api") or "").strip()
+                    or str(entry.get("url") or "").strip()
+                    or str(entry.get("base_url") or "").strip()
+                )
+                entry_model = str(entry.get("default_model") or "").strip() or str(
+                    entry.get("model") or ""
+                ).strip()
+                entries.append(
+                    {
+                        "name": str(entry.get("name") or key or "Local").strip(),
+                        "base_url": base_url,
+                        "model": _backfill_model(base_url, entry_model),
+                        "provider_key": str(key or "").strip(),
+                        "api_key": str(entry.get("api_key") or "").strip(),
+                    }
+                )
+
+        return entries
+
     def _build_model_state(self, state: SessionState) -> SessionModelState | None:
         """Return the ACP model selector payload for editors like Zed."""
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
 
         try:
+            from hermes_cli.config import load_config
             from hermes_cli.models import curated_models_for_provider, normalize_provider, provider_label
 
             normalized_provider = normalize_provider(provider)
             provider_name = provider_label(normalized_provider)
             available_models: list[ModelInfo] = []
+            prioritized_models: list[ModelInfo] = []
             seen_ids: set[str] = set()
 
             for model_id, description in curated_models_for_provider(normalized_provider):
@@ -204,9 +276,50 @@ class HermesACPAgent(acp.Agent):
                 )
                 seen_ids.add(choice_id)
 
+            cfg = load_config() or {}
+            for entry in self._iter_configured_custom_endpoints(cfg):
+                entry_name = str(entry.get("name") or "Local").strip()
+                entry_model = str(entry.get("model") or "").strip()
+                entry_base = str(entry.get("base_url") or "").strip()
+                provider_key = str(entry.get("provider_key") or "").strip()
+                if not entry_model:
+                    continue
+
+                provider_suffix = provider_key or entry_name
+                provider_suffix = "".join(
+                    ch.lower() if ch.isalnum() else "-" for ch in provider_suffix
+                ).strip("-")
+                custom_provider = f"custom:{provider_suffix}" if provider_suffix else "custom"
+                choice_id = self._encode_model_choice(custom_provider, entry_model)
+                if choice_id in seen_ids:
+                    continue
+
+                parsed = urlparse(entry_base if "://" in entry_base else f"http://{entry_base}")
+                host = (parsed.hostname or "").strip().lower()
+                is_local = host in {
+                    "",
+                    "localhost",
+                    "127.0.0.1",
+                    "::1",
+                    "host.docker.internal",
+                    "model-runner.docker.internal",
+                }
+
+                description = "Local endpoint" if is_local else "Custom endpoint"
+                info = ModelInfo(
+                    model_id=choice_id,
+                    name=f"{entry_name}/{entry_model}",
+                    description=description,
+                )
+                if is_local:
+                    prioritized_models.append(info)
+                else:
+                    available_models.append(info)
+                seen_ids.add(choice_id)
+
             current_model_id = self._encode_model_choice(normalized_provider, model)
             if current_model_id and current_model_id not in seen_ids:
-                available_models.insert(
+                prioritized_models.insert(
                     0,
                     ModelInfo(
                         model_id=current_model_id,
@@ -215,10 +328,11 @@ class HermesACPAgent(acp.Agent):
                     ),
                 )
 
-            if available_models:
+            all_models = prioritized_models + available_models
+            if all_models:
                 return SessionModelState(
-                    available_models=available_models,
-                    current_model_id=current_model_id or available_models[0].model_id,
+                    available_models=all_models,
+                    current_model_id=current_model_id or all_models[0].model_id,
                 )
         except Exception:
             logger.debug("Could not build ACP model state", exc_info=True)
@@ -237,12 +351,15 @@ class HermesACPAgent(acp.Agent):
         """Resolve ``provider:model`` input into the provider and normalized model id."""
         target_provider = current_provider
         new_model = raw_model.strip()
+        explicit_provider_hint = ":" in new_model
 
         try:
             from hermes_cli.models import detect_provider_for_model, parse_model_input
 
             target_provider, new_model = parse_model_input(new_model, current_provider)
-            if target_provider == current_provider:
+            # When the user typed provider:model, preserve that provider choice
+            # and skip provider auto-detection to avoid cross-provider remapping.
+            if target_provider == current_provider and not explicit_provider_hint:
                 detected = detect_provider_for_model(new_model, current_provider)
                 if detected:
                     target_provider, new_model = detected
@@ -466,48 +583,51 @@ class HermesACPAgent(acp.Agent):
             else:
                 discovered.extend(provider_model_ids(normalized))
 
+            # Prefer local Hermes WebUI models when available.
+            for webui_base in ("http://localhost:8642/v1", "http://127.0.0.1:8642/v1"):
+                webui_models = fetch_api_models("", webui_base)
+                if webui_models:
+                    discovered = [*webui_models, *discovered]
+                    break
+
             # Include models from named custom providers so ACP model pickers
             # can switch directly between local and cloud endpoints.
             cfg = load_config() or {}
-            custom_providers = cfg.get("custom_providers")
-            if isinstance(custom_providers, list):
-                for entry in custom_providers:
-                    if not isinstance(entry, dict):
-                        continue
-                    entry_base = str(entry.get("base_url") or "").strip()
-                    if not entry_base:
-                        continue
-                    entry_model = str(entry.get("model") or "").strip()
-                    entry_key = str(entry.get("api_key") or "").strip()
-                    if "ollama.com" in entry_base.lower() and not entry_key:
-                        entry_key = os.getenv("OLLAMA_API_KEY", "")
+            for entry in self._iter_configured_custom_endpoints(cfg):
+                entry_base = str(entry.get("base_url") or "").strip()
+                if not entry_base:
+                    continue
+                entry_model = str(entry.get("model") or "").strip()
+                entry_key = str(entry.get("api_key") or "").strip()
+                if "ollama.com" in entry_base.lower() and not entry_key:
+                    entry_key = os.getenv("OLLAMA_API_KEY", "")
 
-                    parsed = urlparse(entry_base if "://" in entry_base else f"http://{entry_base}")
-                    host = (parsed.hostname or "").strip()
-                    is_private_endpoint = False
-                    if host:
-                        try:
-                            addr = ipaddress.ip_address(host)
-                            is_private_endpoint = bool(
-                                addr.is_private or addr.is_loopback or addr.is_link_local
-                            )
-                        except ValueError:
-                            is_private_endpoint = host in {
-                                "localhost",
-                                "host.docker.internal",
-                                "model-runner.docker.internal",
-                            }
+                parsed = urlparse(entry_base if "://" in entry_base else f"http://{entry_base}")
+                host = (parsed.hostname or "").strip()
+                is_private_endpoint = False
+                if host:
+                    try:
+                        addr = ipaddress.ip_address(host)
+                        is_private_endpoint = bool(
+                            addr.is_private or addr.is_loopback or addr.is_link_local
+                        )
+                    except ValueError:
+                        is_private_endpoint = host in {
+                            "localhost",
+                            "host.docker.internal",
+                            "model-runner.docker.internal",
+                        }
 
-                    if entry_model:
-                        discovered.append(entry_model)
+                if entry_model:
+                    discovered.append(entry_model)
 
-                    # Keep cloud endpoints as curated fallback models only.
-                    if not is_private_endpoint:
-                        continue
+                # Keep cloud endpoints as curated fallback models only.
+                if not is_private_endpoint:
+                    continue
 
-                    entry_models = fetch_api_models(entry_key, entry_base)
-                    if entry_models:
-                        discovered.extend(entry_models)
+                entry_models = fetch_api_models(entry_key, entry_base)
+                if entry_models:
+                    discovered.extend(entry_models)
 
             # Also include explicit fallback models to keep picker options
             # visible even if their endpoint is temporarily unavailable.
