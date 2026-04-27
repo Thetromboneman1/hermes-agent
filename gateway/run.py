@@ -708,6 +708,9 @@ class GatewayRunner:
         import threading as _threading
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = _threading.Lock()
+        self._agent_cleanup_dispatch_lock = _threading.Lock()
+        self._agent_cleanup_queue = None
+        self._agent_cleanup_worker = None
 
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
@@ -9040,6 +9043,51 @@ class GatewayRunner:
         except Exception:
             pass
 
+    def _dispatch_evicted_agent_cleanup(self, agent: Any, *, source: str) -> None:
+        """Queue evicted-agent cleanup onto a bounded daemon worker.
+
+        Avoids two problematic extremes:
+        1) inline cleanup while holding _agent_cache_lock (can stall inserts)
+        2) spawning one thread per eviction (can create thread storms)
+        """
+        if agent is None:
+            return
+
+        # Lazy-init for tests that construct GatewayRunner via __new__.
+        _lock = getattr(self, "_agent_cleanup_dispatch_lock", None)
+        if _lock is None:
+            _lock = threading.Lock()
+            self._agent_cleanup_dispatch_lock = _lock
+
+        with _lock:
+            q = getattr(self, "_agent_cleanup_queue", None)
+            if q is None:
+                import queue as _queue
+                q = _queue.SimpleQueue()
+                self._agent_cleanup_queue = q
+
+            worker = getattr(self, "_agent_cleanup_worker", None)
+            if worker is None or not worker.is_alive():
+                def _cleanup_worker() -> None:
+                    while True:
+                        _agent = q.get()
+                        if _agent is None:
+                            return
+                        try:
+                            self._release_evicted_agent_soft(_agent)
+                        except Exception:
+                            pass
+
+                worker = threading.Thread(
+                    target=_cleanup_worker,
+                    daemon=True,
+                    name=f"agent-cache-cleanup-{source}",
+                )
+                self._agent_cleanup_worker = worker
+                worker.start()
+
+            q.put(agent)
+
     def _enforce_agent_cache_cap(self) -> None:
         """Evict oldest cached agents when cache exceeds _AGENT_CACHE_MAX_SIZE.
 
@@ -9112,26 +9160,10 @@ class GatewayRunner:
             if agent is not None:
                 to_release.append(agent)
 
-        # In pytest workers, run cleanup inline (still outside cache mutation)
-        # to avoid launching large numbers of background threads during
-        # cache-concurrency stress tests.
-        if os.getenv("PYTEST_CURRENT_TEST"):
-            for _agent in to_release:
-                self._release_evicted_agent_soft(_agent)
-            return
-
-        # Dispatch cleanup to daemon threads — same pattern as
-        # _sweep_idle_cached_agents.  Running synchronously while holding
-        # _agent_cache_lock would block every other thread trying to insert
-        # into the cache; daemon threads release clients in the background
-        # without the lock.
+        # Dispatch via a bounded daemon worker queue to keep insert path
+        # lock contention low without creating one thread per eviction.
         for _agent in to_release:
-            threading.Thread(
-                target=self._release_evicted_agent_soft,
-                args=(_agent,),
-                daemon=True,
-                name="agent-cache-cap-evict",
-            ).start()
+            self._dispatch_evicted_agent_cleanup(_agent, source="cap")
 
     def _sweep_idle_cached_agents(self) -> int:
         """Evict cached agents whose AIAgent has been idle > _AGENT_CACHE_IDLE_TTL_SECS.
@@ -9174,12 +9206,7 @@ class GatewayRunner:
                 "Agent cache idle-TTL evict: session=%s (idle=%.0fs)",
                 key, now - getattr(agent, "_last_activity_ts", now),
             )
-            threading.Thread(
-                target=self._release_evicted_agent_soft,
-                args=(agent,),
-                daemon=True,
-                name=f"agent-cache-idle-{key[:24]}",
-            ).start()
+            self._dispatch_evicted_agent_cleanup(agent, source="idle")
         return len(to_evict)
 
     # ------------------------------------------------------------------
