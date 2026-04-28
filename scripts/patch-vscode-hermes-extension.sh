@@ -21,8 +21,8 @@ fi
 TARGET="$EXT_DIR/dist/extension.js"
 [[ -f "$TARGET" ]] || { echo "missing $TARGET" >&2; exit 1; }
 
-# Idempotent: skip if already patched
-if grep -q "__hg.unshift" "$TARGET"; then
+# Idempotent: skip if already patched with v2 marker.
+if grep -q "__hg_prepend_order_v2" "$TARGET"; then
   echo "Already patched: $TARGET"
   exit 0
 fi
@@ -34,19 +34,34 @@ import sys, pathlib
 p = pathlib.Path(sys.argv[1])
 src = p.read_text()
 needle = 'return[m("Anthropic","anthropic",c,t),m("OpenAI Codex","openai-codex",p,n)]'
-if needle not in src:
-    sys.exit("anchor not found; extension layout changed")
 replacement = (
-    'const __hg=[m("Anthropic","anthropic",c,t),m("OpenAI Codex","openai-codex",p,n)];'
-    'try{if(Array.isArray(e?.groups)){for(const __g of e.groups){'
-    'if(!__g||!Array.isArray(__g.items))continue;'
-    '__hg.unshift({group:String(__g.label||__g.prefix||"Local"),items:__g.items.map(__it=>('
-    '{id:String(__it.id),label:String(__it.label||__it.name||__it.id),'
-    'command:String(__it.command||((__g.prefix||"custom")+":"+__it.id))}))})}}}'
-    'catch(__err){}'
-    'return __hg'
+  'const __hg=[m("Anthropic","anthropic",c,t),m("OpenAI Codex","openai-codex",p,n)];'
+  'try{if(Array.isArray(e?.groups)){'
+  'const __hg_prepend_order_v2=[];'
+  'for(const __g of e.groups){'
+  'if(!__g||!Array.isArray(__g.items))continue;'
+  '__hg_prepend_order_v2.push({group:String(__g.label||__g.prefix||"Local"),items:__g.items.map(__it=>('
+  '{id:String(__it.id),label:String(__it.label||__it.name||__it.id),'
+  'command:String(__it.command||((__g.prefix||"custom")+":"+__it.id))}))})}'
+  'for(let __i=__hg_prepend_order_v2.length-1;__i>=0;__i--){__hg.unshift(__hg_prepend_order_v2[__i])}'
+  '}}catch(__err){}'
+  'return __hg'
 )
-p.write_text(src.replace(needle, replacement, 1))
+
+if needle in src:
+  out = src.replace(needle, replacement, 1)
+elif "__hg.unshift" in src:
+  # Upgrade previously patched v1 payload in place.
+  start = src.find('const __hg=[m("Anthropic","anthropic",c,t),m("OpenAI Codex","openai-codex",p,n)];')
+  end = src.find('return __hg', start)
+  if start == -1 or end == -1:
+    sys.exit("existing patch shape not recognized; extension layout changed")
+  end += len('return __hg')
+  out = src[:start] + replacement + src[end:]
+else:
+  sys.exit("anchor not found; extension layout changed")
+
+p.write_text(out)
 print("patched", p)
 PY
 

@@ -62,6 +62,13 @@ GROUP_LABELS = {
     "ollama-cloud": "Ollama Cloud",
 }
 
+GROUP_PRIORITY = {
+    "local-docker": 0,
+    "omniroute-local": 1,
+    "omniroute-docker": 2,
+    "ollama-cloud": 3,
+}
+
 
 def _fetch_models(base_url: str, timeout: float = 2.0) -> list[str]:
     if not base_url:
@@ -182,6 +189,7 @@ def _build_groups(cfg: dict[str, Any]) -> list[dict[str, Any]]:
                 "label": GROUP_LABELS.get(name, name),
                 "prefix": "custom",
                 "items": items,
+                "_provider_name": name,
             }
         )
 
@@ -200,6 +208,17 @@ def _build_groups(cfg: dict[str, Any]) -> list[dict[str, Any]]:
                     "items": [{"id": default_model, "label": _label_for(default_model)}],
                 },
             )
+
+    # Stable ordering: keep Local Docker group on top, then OmniRoute groups,
+    # then everything else.
+    groups.sort(
+        key=lambda g: (
+            GROUP_PRIORITY.get(str(g.get("_provider_name") or ""), 999),
+            str(g.get("label") or "").lower(),
+        )
+    )
+    for g in groups:
+        g.pop("_provider_name", None)
     return groups
 
 
