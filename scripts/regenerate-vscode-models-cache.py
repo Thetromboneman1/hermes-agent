@@ -43,7 +43,9 @@ CACHE_PATH = HOME / ".hermes" / "models_dev_cache.json"
 
 # Pretty labels for known local Docker model IDs.
 KNOWN_LABELS = {
-    "ai/qwen3-coder-next": "Qwen3 Coder Next  ·  Docker llama.cpp",
+    "ai/devstral-small-2": "Devstral Small 2  ·  Docker llama.cpp",
+    "ai/qwen3.6": "Qwen3.6  ·  Docker llama.cpp",
+    "ai/qwen3-coder-next": "Qwen3 Coder Next  ·  Docker llama.cpp (rollback)",
     "ai/qwen3:8B-Q4_K_M": "Qwen3 8B  ·  Q4_K_M  ·  Docker llama.cpp",
     "ai/qwen3-embedding": "Qwen3 Embedding  ·  Docker llama.cpp",
 }
