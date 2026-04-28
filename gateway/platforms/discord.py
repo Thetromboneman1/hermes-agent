@@ -3295,7 +3295,6 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Build source
         guild = getattr(message, "guild", None)
-
         source = self.build_source(
             chat_id=str(effective_channel.id),
             chat_name=chat_name,
