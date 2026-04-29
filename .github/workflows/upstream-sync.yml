@@ -55,7 +55,32 @@ jobs:
           if git merge --ff-only upstream/main; then
             echo "Fast-forward merge succeeded"
           else
-            git merge upstream/main --no-edit --strategy-option=theirs
+            # Use a no-commit merge so we can auto-resolve workflow-only conflicts.
+            # Some upstream updates modify workflow files that are fork-customized.
+            set +e
+            git merge upstream/main --no-commit --no-ff --strategy-option=theirs
+            MERGE_STATUS=$?
+            set -e
+
+            if [ "$MERGE_STATUS" -ne 0 ]; then
+              UNMERGED=$(git diff --name-only --diff-filter=U || true)
+
+              # If conflicts are only in workflows, resolve by restoring fork workflows.
+              NON_WORKFLOW_CONFLICTS=$(echo "$UNMERGED" | grep -v '^\.github/workflows/' || true)
+              if [ -n "$NON_WORKFLOW_CONFLICTS" ]; then
+                echo "::error::Merge conflicts outside .github/workflows detected"
+                echo "$NON_WORKFLOW_CONFLICTS"
+                git merge --abort
+                exit 1
+              fi
+
+              git rm -rf --ignore-unmatch .github/workflows/*
+              mkdir -p .github/workflows
+              cp -r /tmp/fork-workflows/. .github/workflows/ 2>/dev/null || true
+              git add .github/workflows/
+            fi
+
+            git commit --no-edit
             echo "Created merge commit (non-fast-forward)"
           fi
 
