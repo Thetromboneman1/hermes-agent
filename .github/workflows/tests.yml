@@ -51,6 +51,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    continue-on-error: ${{ github.repository != 'NousResearch/hermes-agent' }}
     timeout-minutes: 20
     steps:
       - name: Checkout code
