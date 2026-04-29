@@ -3,8 +3,14 @@ name: Tests
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
 
 permissions:
   contents: read
@@ -15,9 +21,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  acp-regression:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.11 --seed
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
+      - name: Run ACP regression suite
+        run: |
+          source .venv/bin/activate
+          scripts/run_tests.sh tests/acp/test_session.py tests/acp/test_server.py -q
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+  test:
+    if: github.repository == 'NousResearch/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -33,14 +68,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv venv .venv --python 3.11
+          uv venv .venv --python 3.11 --seed
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
       - name: Run tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
+          scripts/run_tests.sh tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -62,7 +97,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv venv .venv --python 3.11
+          uv venv .venv --python 3.11 --seed
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
