@@ -646,6 +646,15 @@ file will silently overwrite recent fixes on main when squashed. Verify
 with `git diff HEAD~1..HEAD` after merging — unexpected deletions are a
 red flag.
 
+### Upstream sync merges can fail before workflow restoration
+The `upstream-sync.yml` workflow intentionally snapshots fork workflows,
+merges upstream `main`, then restores fork workflow files. In the non-FF
+path it now uses `git merge --no-commit --no-ff --strategy-option=theirs`
+so modify/delete conflicts in `.github/workflows/` can be auto-resolved by
+restoring the snapshot before commit. If any conflict appears outside
+`.github/workflows/`, the job must abort with an error and require manual
+conflict resolution.
+
 ### Don't wire in dead code without E2E validation
 Unused code that was never shipped was dead for a reason. Before wiring an
 unused module into a live code path, E2E test the real resolution chain
