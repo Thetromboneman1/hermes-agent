@@ -50,8 +50,8 @@ jobs:
           NOUS_API_KEY: ""
 
   test:
+    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
-    continue-on-error: ${{ github.repository != 'NousResearch/hermes-agent' }}
     timeout-minutes: 20
     steps:
       - name: Checkout code
