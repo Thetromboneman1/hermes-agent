@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: docker-${{ github.ref }}
@@ -82,5 +83,83 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: nousresearch/hermes-agent:${{ github.event.release.tag_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  fork-build-and-push:
+    # Fork-side companion: builds your customizations and publishes them to
+    # ghcr.io/<owner>/hermes-agent so docker-compose / pull workflows always
+    # have a fresh image with your patches. Skipped on the upstream repo
+    # (which uses the build-and-push job above).
+    if: github.repository != 'NousResearch/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          submodules: recursive
+
+      - name: Lowercase image namespace
+        id: ns
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - name: Build image (amd64, smoke test)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          platforms: linux/amd64
+          tags: ghcr.io/${{ steps.ns.outputs.owner }}/hermes-agent:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test image starts
+        run: |
+          docker run --rm \
+            -v /tmp/hermes-test:/opt/data \
+            --entrypoint /opt/hermes/docker/entrypoint.sh \
+            ghcr.io/${{ steps.ns.outputs.owner }}/hermes-agent:test --help
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'release'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push multi-arch image to GHCR (main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ steps.ns.outputs.owner }}/hermes-agent:latest
+            ghcr.io/${{ steps.ns.outputs.owner }}/hermes-agent:fork-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Push multi-arch image to GHCR (release)
+        if: github.event_name == 'release'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ghcr.io/${{ steps.ns.outputs.owner }}/hermes-agent:${{ github.event.release.tag_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
