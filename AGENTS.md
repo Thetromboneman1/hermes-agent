@@ -38,7 +38,7 @@ hermes-agent/
 │   │                     #   homeassistant, signal, matrix, mattermost, email, sms,
 │   │                     #   dingtalk, wecom, weixin, feishu, qqbot, bluebubbles,
 │   │                     #   webhook, api_server, ...). See ADDING_A_PLATFORM.md.
-│   └── builtin_hooks/    # Always-registered gateway hooks (boot-md, ...)
+│   └── builtin_hooks/    # Extension point for always-registered gateway hooks (none shipped)
 ├── plugins/              # Plugin system (see "Plugins" section below)
 │   ├── memory/           # Memory-provider plugins (honcho, mem0, supermemory, ...)
 │   ├── context_engine/   # Context-engine plugins
@@ -645,6 +645,15 @@ then re-apply the PR's commits). A stale branch's version of an unrelated
 file will silently overwrite recent fixes on main when squashed. Verify
 with `git diff HEAD~1..HEAD` after merging — unexpected deletions are a
 red flag.
+
+### Upstream sync merges can fail before workflow restoration
+The `upstream-sync.yml` workflow intentionally snapshots fork workflows,
+merges upstream `main`, then restores fork workflow files. In the non-FF
+path it now uses `git merge --no-commit --no-ff --strategy-option=theirs`
+so modify/delete conflicts in `.github/workflows/` can be auto-resolved by
+restoring the snapshot before commit. If any conflict appears outside
+`.github/workflows/`, the job must abort with an error and require manual
+conflict resolution.
 
 ### Don't wire in dead code without E2E validation
 Unused code that was never shipped was dead for a reason. Before wiring an

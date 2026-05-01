@@ -17,6 +17,50 @@ from hermes_cli.tools_config import (
 )
 
 
+def test_agent_disabled_toolsets_suppresses_across_platforms():
+    """agent.disabled_toolsets in config.yaml should remove those toolsets
+    from the enabled set, regardless of platform defaults or explicit config.
+    """
+    config = {
+        "agent": {"disabled_toolsets": ["memory"]},
+    }
+
+    cli_enabled = _get_platform_tools(config, "cli")
+    discord_enabled = _get_platform_tools(config, "discord")
+
+    assert "memory" not in cli_enabled
+    assert "memory" not in discord_enabled
+
+
+def test_agent_disabled_toolsets_with_explicit_platform_config():
+    """agent.disabled_toolsets should still suppress even when the platform
+    has an explicit toolset list that includes the disabled toolset.
+    """
+    config = {
+        "agent": {"disabled_toolsets": ["memory"]},
+        "platform_toolsets": {"cli": ["web", "terminal", "memory"]},
+    }
+
+    enabled = _get_platform_tools(config, "cli")
+
+    assert "memory" not in enabled
+    assert "web" in enabled
+    assert "terminal" in enabled
+
+
+def test_agent_disabled_toolsets_empty_list_is_noop():
+    """Empty or missing disabled_toolsets should not change behavior."""
+    config_empty = {"agent": {"disabled_toolsets": []}}
+    config_none = {"agent": {}}
+    config_missing = {}
+
+    default = _get_platform_tools({}, "cli")
+
+    assert _get_platform_tools(config_empty, "cli") == default
+    assert _get_platform_tools(config_none, "cli") == default
+    assert _get_platform_tools(config_missing, "cli") == default
+
+
 def test_get_platform_tools_uses_default_when_platform_not_configured():
     config = {}
 
@@ -76,7 +120,16 @@ def test_get_platform_tools_preserves_explicit_empty_selection():
 
     enabled = _get_platform_tools(config, "cli")
 
-    assert enabled == set()
+    # An explicit empty list disables every CONFIGURABLE toolset (web,
+    # terminal, memory, …). Non-configurable platform toolsets that ride
+    # along on the platform's default composite (e.g. `kanban`, whose tools
+    # live in _HERMES_CORE_TOOLS but aren't user-toggleable) are still
+    # auto-recovered by _get_platform_tools so saving via `hermes tools`
+    # doesn't silently drop them. The contract this test guards is the
+    # configurable side: nothing the user could have checked in the TUI
+    # checklist should reappear here.
+    configurable = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
+    assert enabled.isdisjoint(configurable)
 
 
 def test_apply_toolset_change_from_default_does_not_enable_default_off_toolsets():

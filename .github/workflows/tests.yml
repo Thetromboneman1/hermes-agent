@@ -36,9 +36,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv venv .venv --python 3.11
+          uv venv .venv --python 3.11 --seed
           source .venv/bin/activate
-          uv pip install -e "[all,dev]"
+          uv pip install -e ".[all,dev]"
 
       - name: Run ACP regression suite
         run: |
@@ -50,6 +50,7 @@ jobs:
           NOUS_API_KEY: ""
 
   test:
+    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -67,14 +68,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv venv .venv --python 3.11
+          uv venv .venv --python 3.11 --seed
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
       - name: Run tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
+          scripts/run_tests.sh tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -96,7 +97,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv venv .venv --python 3.11
+          uv venv .venv --python 3.11 --seed
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
