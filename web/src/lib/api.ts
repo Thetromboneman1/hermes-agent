@@ -69,6 +69,14 @@ export const api = {
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
   getModelInfo: () => fetchJSON<ModelInfoResponse>("/api/model/info"),
+  getModelOptions: () => fetchJSON<ModelOptionsResponse>("/api/model/options"),
+  getAuxiliaryModels: () => fetchJSON<AuxiliaryModelsResponse>("/api/model/auxiliary"),
+  setModelAssignment: (body: ModelAssignmentRequest) =>
+    fetchJSON<ModelAssignmentResponse>("/api/model/set", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   saveConfig: (config: Record<string, unknown>) =>
     fetchJSON<{ ok: boolean }>("/api/config", {
       method: "PUT",
@@ -123,6 +131,47 @@ export const api = {
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${id}/trigger`, { method: "POST" }),
   deleteCronJob: (id: string) =>
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${id}`, { method: "DELETE" }),
+
+  // Profiles (minimal)
+  getProfiles: () =>
+    fetchJSON<{ profiles: ProfileInfo[] }>("/api/profiles"),
+  createProfile: (body: { name: string; clone_from_default: boolean }) =>
+    fetchJSON<{ ok: boolean; name: string; path: string }>("/api/profiles", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  renameProfile: (name: string, newName: string) =>
+    fetchJSON<{ ok: boolean; name: string; path: string }>(
+      `/api/profiles/${encodeURIComponent(name)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ new_name: newName }),
+      },
+    ),
+  deleteProfile: (name: string) =>
+    fetchJSON<{ ok: boolean }>(
+      `/api/profiles/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+  getProfileSetupCommand: (name: string) =>
+    fetchJSON<{ command: string }>(
+      `/api/profiles/${encodeURIComponent(name)}/setup-command`,
+    ),
+  getProfileSoul: (name: string) =>
+    fetchJSON<{ content: string; exists: boolean }>(
+      `/api/profiles/${encodeURIComponent(name)}/soul`,
+    ),
+  updateProfileSoul: (name: string, content: string) =>
+    fetchJSON<{ ok: boolean }>(
+      `/api/profiles/${encodeURIComponent(name)}/soul`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      },
+    ),
 
   // Skills & Toolsets
   getSkills: () => fetchJSON<SkillInfo[]>("/api/skills"),
@@ -372,6 +421,16 @@ export interface AnalyticsResponse {
   };
 }
 
+export interface ProfileInfo {
+  name: string;
+  path: string;
+  is_default: boolean;
+  model: string | null;
+  provider: string | null;
+  has_env: boolean;
+  skill_count: number;
+}
+
 export interface ModelsAnalyticsModelEntry {
   model: string;
   provider: string;
@@ -471,6 +530,54 @@ export interface ModelInfoResponse {
     max_output_tokens?: number;
     model_family?: string;
   };
+}
+
+// ── Model options / assignment types ──────────────────────────────────
+
+export interface ModelOptionProvider {
+  name: string;
+  slug: string;
+  models?: string[];
+  total_models?: number;
+  is_current?: boolean;
+  is_user_defined?: boolean;
+  source?: string;
+  warning?: string;
+}
+
+export interface ModelOptionsResponse {
+  model?: string;
+  provider?: string;
+  providers?: ModelOptionProvider[];
+}
+
+export interface AuxiliaryTaskAssignment {
+  task: string;
+  provider: string;
+  model: string;
+  base_url: string;
+}
+
+export interface AuxiliaryModelsResponse {
+  tasks: AuxiliaryTaskAssignment[];
+  main: { provider: string; model: string };
+}
+
+export interface ModelAssignmentRequest {
+  scope: "main" | "auxiliary";
+  provider: string;
+  model: string;
+  /** For auxiliary: task slot name, "" for all, "__reset__" to reset all. */
+  task?: string;
+}
+
+export interface ModelAssignmentResponse {
+  ok: boolean;
+  scope?: string;
+  provider?: string;
+  model?: string;
+  tasks?: string[];
+  reset?: boolean;
 }
 
 // ── OAuth provider types ────────────────────────────────────────────────

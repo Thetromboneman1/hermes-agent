@@ -277,13 +277,21 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
-# Media extension sets — keep in sync with gateway/platforms/base.py:_process_message_background
-_AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a'})
+# Media extension sets — audio routing is centralized in gateway.platforms.base
+# via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
 _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
 
 
-def _send_media_via_adapter(adapter, chat_id: str, media_files: list, metadata: dict | None, loop, job: dict) -> None:
+def _send_media_via_adapter(
+    adapter,
+    chat_id: str,
+    media_files: list,
+    metadata: dict | None,
+    loop,
+    job: dict,
+    platform=None,
+) -> None:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
@@ -292,10 +300,13 @@ def _send_media_via_adapter(adapter, chat_id: str, media_files: list, metadata: 
     """
     from pathlib import Path
 
+    from gateway.platforms.base import should_send_media_as_audio
+
     for media_path, _is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
-            if ext in _AUDIO_EXTS:
+            route_platform = platform if platform is not None else getattr(adapter, "platform", None)
+            if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
                 coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
             elif ext in _VIDEO_EXTS:
                 coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
@@ -444,7 +455,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
                 # Send extracted media files as native attachments via the live adapter
                 if adapter_ok and media_files:
-                    _send_media_via_adapter(runtime_adapter, chat_id, media_files, send_metadata, loop, job)
+                    _send_media_via_adapter(
+                        runtime_adapter,
+                        chat_id,
+                        media_files,
+                        send_metadata,
+                        loop,
+                        job,
+                        platform=platform,
+                    )
 
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
@@ -1130,6 +1149,21 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise RuntimeError(
                 f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
             )
+
+        # If the agent itself reported failure (e.g. all retries exhausted on
+        # API errors, model abort, mid-run interrupt), do not silently mark the
+        # job as successful. run_agent populates `failed=True`/`completed=False`
+        # on these paths and may put the error into `final_response`, which
+        # would otherwise be delivered as if it were the agent's reply and the
+        # job's `last_status` set to "ok". Raise so the except handler below
+        # builds the proper failure tuple. (issue #17855)
+        if result.get("failed") is True or result.get("completed") is False:
+            _err_text = (
+                result.get("error")
+                or (result.get("final_response") or "").strip()
+                or "agent reported failure"
+            )
+            raise RuntimeError(_err_text)
 
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.

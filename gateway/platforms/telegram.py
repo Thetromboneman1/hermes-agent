@@ -290,14 +290,53 @@ class TelegramAdapter(BasePlatformAdapter):
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
 
-    @staticmethod
-    def _is_callback_user_authorized(user_id: str) -> bool:
+    def _is_callback_user_authorized(
+        self,
+        user_id: str,
+        *,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+    ) -> bool:
         """Return whether a Telegram inline-button caller may perform gated actions."""
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return False
+
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        auth_fn = getattr(runner, "_is_user_authorized", None)
+        if callable(auth_fn):
+            try:
+                from gateway.session import SessionSource
+
+                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+                if normalized_chat_type == "private":
+                    normalized_chat_type = "dm"
+                elif normalized_chat_type == "supergroup":
+                    normalized_chat_type = "forum" if thread_id is not None else "group"
+
+                source = SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id=str(chat_id or normalized_user_id),
+                    chat_type=normalized_chat_type,
+                    user_id=normalized_user_id,
+                    user_name=str(user_name).strip() if user_name else None,
+                    thread_id=str(thread_id) if thread_id is not None else None,
+                )
+                return bool(auth_fn(source))
+            except Exception:
+                logger.debug(
+                    "[Telegram] Falling back to env-only callback auth for user %s",
+                    normalized_user_id,
+                    exc_info=True,
+                )
+
         allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
         if not allowed_csv:
             return True
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-        return "*" in allowed_ids or user_id in allowed_ids
+        return "*" in allowed_ids or normalized_user_id in allowed_ids
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1321,6 +1360,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
         session_key: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an inline-keyboard update prompt (Yes / No buttons).
 
@@ -1338,11 +1378,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     InlineKeyboardButton("✗ No", callback_data="update_prompt:n"),
                 ]
             ])
+            thread_id = self._metadata_thread_id(metadata)
+            message_thread_id = self._message_thread_id_for_send(thread_id)
             msg = await self._bot.send_message(
                 chat_id=int(chat_id),
                 text=text,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard,
+                message_thread_id=message_thread_id,
                 **self._link_preview_kwargs(),
             )
             return SendResult(success=True, message_id=str(msg.message_id))
@@ -1760,6 +1803,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if not query or not query.data:
             return
         data = query.data
+        query_message = getattr(query, "message", None)
+        query_chat_id = getattr(query_message, "chat_id", None)
+        query_chat = getattr(query_message, "chat", None)
+        query_chat_type = getattr(query_chat, "type", None)
+        query_thread_id = getattr(query_message, "message_thread_id", None)
+        query_user_name = getattr(query.from_user, "first_name", None)
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):
@@ -1781,7 +1830,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 # Only authorized users may click approval buttons.
                 caller_id = str(getattr(query.from_user, "id", ""))
-                if not self._is_callback_user_authorized(caller_id):
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
@@ -1831,8 +1886,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 choice = parts[1]  # once, always, cancel
                 confirm_id = parts[2]
 
-                caller_id = str(getattr(query.from_user, "id", "")) 
-                if not self._is_callback_user_authorized(caller_id):
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
                     await query.answer(text="⛔ You are not authorized to answer this prompt.")
                     return
 
@@ -1891,7 +1952,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         answer = data.split(":", 1)[1]  # "y" or "n"
         caller_id = str(getattr(query.from_user, "id", ""))
-        if not self._is_callback_user_authorized(caller_id):
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
             await query.answer(text="⛔ You are not authorized to answer update prompts.")
             return
         await query.answer(text=f"Sent '{answer}' to the update process.")
@@ -1951,8 +2018,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
             
             with open(audio_path, "rb") as audio_file:
-                # .ogg files -> send as voice (round playable bubble)
-                if audio_path.endswith((".ogg", ".opus")):
+                ext = os.path.splitext(audio_path)[1].lower()
+                # .ogg / .opus files -> send as voice (round playable bubble)
+                if ext in (".ogg", ".opus"):
                     _voice_thread = self._metadata_thread_id(metadata)
                     msg = await self._bot.send_voice(
                         chat_id=int(chat_id),
@@ -1961,8 +2029,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         reply_to_message_id=int(reply_to) if reply_to else None,
                         message_thread_id=self._message_thread_id_for_send(_voice_thread),
                     )
-                else:
-                    # .mp3 and others -> send as audio file
+                elif ext in (".mp3", ".m4a"):
+                    # Telegram's Bot API sendAudio only accepts MP3 / M4A.
                     _audio_thread = self._metadata_thread_id(metadata)
                     msg = await self._bot.send_audio(
                         chat_id=int(chat_id),
@@ -1970,6 +2038,16 @@ class TelegramAdapter(BasePlatformAdapter):
                         caption=caption[:1024] if caption else None,
                         reply_to_message_id=int(reply_to) if reply_to else None,
                         message_thread_id=self._message_thread_id_for_send(_audio_thread),
+                    )
+                else:
+                    # Formats Telegram can't play natively (.wav, .flac, ...)
+                    # — fall back to document delivery instead of raising.
+                    return await self.send_document(
+                        chat_id=chat_id,
+                        file_path=audio_path,
+                        caption=caption,
+                        reply_to=reply_to,
+                        metadata=metadata,
                     )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1980,6 +2058,117 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return await super().send_voice(chat_id, audio_path, caption, reply_to)
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: List[tuple],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> None:
+        """Send a batch of images natively via Telegram's media group API.
+
+        Telegram's ``send_media_group`` bundles up to 10 photos/videos into
+        a single album. Larger batches are chunked. Animated GIFs cannot
+        go into a media group (they require ``send_animation``), so they
+        are peeled off and sent individually via the base default path.
+
+        URL-based photos go into the group directly; local files are
+        opened as byte streams. On failure the whole batch falls back to
+        the base adapter's per-image loop.
+        """
+        if not self._bot:
+            return
+        if not images:
+            return
+
+        try:
+            from telegram import InputMediaPhoto
+        except Exception as exc:  # pragma: no cover - missing SDK
+            logger.warning(
+                "[%s] InputMediaPhoto unavailable, falling back to per-image send: %s",
+                self.name, exc,
+            )
+            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+            return
+
+        # Peel off animations — they need send_animation, not send_media_group
+        animations: List[tuple] = []
+        photos: List[tuple] = []
+        for image_url, alt_text in images:
+            if not image_url.startswith("file://") and self._is_animation_url(image_url):
+                animations.append((image_url, alt_text))
+            else:
+                photos.append((image_url, alt_text))
+
+        # Animations: route through the base default (per-image send_animation)
+        if animations:
+            await super().send_multiple_images(
+                chat_id, animations, metadata, human_delay=human_delay,
+            )
+
+        if not photos:
+            return
+
+        from urllib.parse import unquote as _unquote
+        _thread = self._metadata_thread_id(metadata)
+        _thread_id = self._message_thread_id_for_send(_thread)
+
+        # Chunk into groups of 10 (Telegram's album limit)
+        CHUNK = 10
+        chunks = [photos[i:i + CHUNK] for i in range(0, len(photos), CHUNK)]
+
+        for chunk_idx, chunk in enumerate(chunks):
+            if human_delay > 0 and chunk_idx > 0:
+                await asyncio.sleep(human_delay)
+
+            media: List[Any] = []
+            opened_files: List[Any] = []
+            try:
+                for image_url, alt_text in chunk:
+                    caption = alt_text[:1024] if alt_text else None
+                    if image_url.startswith("file://"):
+                        local_path = _unquote(image_url[7:])
+                        if not os.path.exists(local_path):
+                            logger.warning(
+                                "[%s] Skipping missing image in media group: %s",
+                                self.name, local_path,
+                            )
+                            continue
+                        fh = open(local_path, "rb")
+                        opened_files.append(fh)
+                        media.append(InputMediaPhoto(media=fh, caption=caption))
+                    else:
+                        media.append(InputMediaPhoto(media=image_url, caption=caption))
+
+                if not media:
+                    continue
+
+                logger.info(
+                    "[%s] Sending media group of %d photo(s) (chunk %d/%d)",
+                    self.name, len(media), chunk_idx + 1, len(chunks),
+                )
+                await self._bot.send_media_group(
+                    chat_id=int(chat_id),
+                    media=media,
+                    message_thread_id=_thread_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
+                    self.name, chunk_idx + 1, len(chunks), e,
+                    exc_info=True,
+                )
+                # Fallback: send each photo in this chunk individually
+                await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay,
+                )
+            finally:
+                for fh in opened_files:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
 
     async def send_image_file(
         self,
