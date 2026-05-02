@@ -145,6 +145,8 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          provenance: false
+          sbom: false
           platforms: linux/amd64,linux/arm64
           tags: |
             ghcr.io/${{ steps.ns.outputs.owner }}/hermes-agent:latest
@@ -159,6 +161,8 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          provenance: false
+          sbom: false
           platforms: linux/amd64,linux/arm64
           tags: ghcr.io/${{ steps.ns.outputs.owner }}/hermes-agent:${{ github.event.release.tag_name }}
           cache-from: type=gha
