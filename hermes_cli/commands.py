@@ -399,6 +399,11 @@ def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = N
     return False
 
 
+def _requires_argument(args_hint: str) -> bool:
+    """Return True when selecting a command without text would be incomplete."""
+    return args_hint.strip().startswith("<")
+
+
 def gateway_help_lines() -> list[str]:
     """Generate gateway help text lines from the registry."""
     overrides = _resolve_config_gates()
@@ -455,7 +460,9 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
 
     Telegram command names cannot contain hyphens, so they are replaced with
     underscores.  Aliases are skipped -- Telegram shows one menu entry per
-    canonical command.
+    canonical command. Commands that require arguments are skipped because
+    selecting a Telegram BotCommand sends only ``/command`` and would execute
+    an incomplete command.
 
     Plugin-registered slash commands are included so plugins get native
     autocomplete in Telegram without touching core code.
@@ -465,10 +472,14 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
+        if _requires_argument(cmd.args_hint):
+            continue
         tg_name = _sanitize_telegram_name(cmd.name)
         if tg_name:
             result.append((tg_name, cmd.description))
-    for name, description, _args_hint in _iter_plugin_command_entries():
+    for name, description, args_hint in _iter_plugin_command_entries():
+        if _requires_argument(args_hint):
+            continue
         tg_name = _sanitize_telegram_name(name)
         if tg_name:
             result.append((tg_name, description))
@@ -502,9 +513,9 @@ def _sanitize_telegram_name(raw: str) -> str:
 
 
 def _clamp_command_names(
-    entries: list[tuple[str, str]],
+    entries: list[tuple[str, ...]],
     reserved: set[str],
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, ...]]:
     """Enforce 32-char command name limit with collision avoidance.
 
     Both Telegram and Discord cap slash command names at 32 characters.
@@ -512,10 +523,15 @@ def _clamp_command_names(
     (against *reserved* names or earlier entries in the same batch), the name is
     shortened to 31 chars and a digit ``0``-``9`` is appended to differentiate.
     If all 10 digit slots are taken the entry is silently dropped.
+
+    Accepts tuples of any length >= 2.  Extra elements beyond ``(name, desc)``
+    (e.g. ``cmd_key``) are passed through unchanged, so callers can attach
+    metadata that survives the rename.
     """
     used: set[str] = set(reserved)
-    result: list[tuple[str, str]] = []
-    for name, desc in entries:
+    result: list[tuple] = []
+    for entry in entries:
+        name, desc, *extra = entry
         if len(name) > _CMD_NAME_LIMIT:
             candidate = name[:_CMD_NAME_LIMIT]
             if candidate in used:
@@ -531,7 +547,7 @@ def _clamp_command_names(
         if name in used:
             continue
         used.add(name)
-        result.append((name, desc))
+        result.append((name, desc, *extra))
     return result
 
 
@@ -651,17 +667,15 @@ def _collect_gateway_skill_entries(
     except Exception:
         pass
 
-    # Clamp names; _clamp_command_names works on (name, desc) pairs so we
-    # need to zip/unzip.
-    skill_pairs = [(n, d) for n, d, _ in skill_triples]
-    key_by_pair = {(n, d): k for n, d, k in skill_triples}
-    skill_pairs = _clamp_command_names(skill_pairs, reserved_names)
+    # Clamp names; cmd_key is passed through as extra payload so it survives
+    # any clamp-induced renames.
+    skill_triples = _clamp_command_names(skill_triples, reserved_names)
 
     # Skills fill remaining slots — only tier that gets trimmed
     remaining = max(0, max_slots - len(all_entries))
-    hidden_count = max(0, len(skill_pairs) - remaining)
-    for n, d in skill_pairs[:remaining]:
-        all_entries.append((n, d, key_by_pair.get((n, d), "")))
+    hidden_count = max(0, len(skill_triples) - remaining)
+    for n, d, k in skill_triples[:remaining]:
+        all_entries.append((n, d, k))
 
     return all_entries[:max_slots], hidden_count
 
