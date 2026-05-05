@@ -7070,20 +7070,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as e:
             logger.debug("Skills sync during update failed: %s", e)
 
-        # Sync bundled skills to all other profiles
+        # Sync bundled skills to all profiles (including the active one).
+        # seed_profile_skills() uses subprocess with an explicit HERMES_HOME so
+        # it is not affected by sync_skills()'s module-level HERMES_HOME cache,
+        # which means the active profile is reliably synced regardless of whether
+        # the caller's HERMES_HOME env var points at the default or a named profile.
         try:
             from hermes_cli.profiles import (
                 list_profiles,
-                get_active_profile_name,
                 seed_profile_skills,
             )
 
-            active = get_active_profile_name()
-            other_profiles = [p for p in list_profiles() if p.name != active]
-            if other_profiles:
+            all_profiles = list_profiles()
+            if all_profiles:
                 print()
-                print("→ Syncing bundled skills to other profiles...")
-                for p in other_profiles:
+                print("→ Syncing bundled skills to all profiles...")
+                for p in all_profiles:
                     try:
                         r = seed_profile_skills(p.path, quiet=True)
                         if r:
@@ -8679,7 +8681,24 @@ def main():
     )
     cron_create.add_argument(
         "--script",
-        help="Path to a Python script whose stdout is injected into the prompt each run",
+        help=(
+            "Path to a script under ~/.hermes/scripts/. Default mode: "
+            "script stdout is injected into the agent's prompt each run. "
+            "With --no-agent: the script IS the job and its stdout is "
+            "delivered verbatim. .sh/.bash files run via bash, everything "
+            "else via Python."
+        ),
+    )
+    cron_create.add_argument(
+        "--no-agent",
+        dest="no_agent",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the LLM entirely — run --script on schedule and deliver "
+            "its stdout directly. Empty stdout = silent. Classic watchdog "
+            "pattern (memory alerts, disk alerts, CI pings)."
+        ),
     )
     cron_create.add_argument(
         "--workdir",
@@ -8721,7 +8740,29 @@ def main():
     )
     cron_edit.add_argument(
         "--script",
-        help="Path to a Python script whose stdout is injected into the prompt each run. Pass empty string to clear.",
+        help=(
+            "Path to a script under ~/.hermes/scripts/. Pass empty string to clear. "
+            "With --no-agent the script IS the job; otherwise its stdout is "
+            "injected into the agent's prompt each run."
+        ),
+    )
+    cron_edit.add_argument(
+        "--no-agent",
+        dest="no_agent",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Enable no-agent mode on this job (requires --script or an "
+            "existing script on the job)."
+        ),
+    )
+    cron_edit.add_argument(
+        "--agent",
+        dest="no_agent",
+        action="store_const",
+        const=False,
+        help="Disable no-agent mode on this job (reverts to LLM-driven execution).",
     )
     cron_edit.add_argument(
         "--workdir",
