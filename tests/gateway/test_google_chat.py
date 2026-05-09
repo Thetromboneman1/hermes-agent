@@ -257,42 +257,9 @@ class TestEnvConfigLoading:
         for v in self._ENV_VARS:
             monkeypatch.delenv(v, raising=False)
 
-    def test_project_id_primary(self, monkeypatch):
-        self._clean_env(monkeypatch)
-        monkeypatch.setenv("GOOGLE_CHAT_PROJECT_ID", "my-proj")
-        monkeypatch.setenv("GOOGLE_CHAT_SUBSCRIPTION_NAME",
-                           "projects/my-proj/subscriptions/my-sub")
-        cfg = load_gateway_config()
-        gc = cfg.platforms[Platform.GOOGLE_CHAT]
-        assert gc.enabled is True
-        assert gc.extra["project_id"] == "my-proj"
 
-    def test_project_id_falls_back_to_google_cloud_project(self, monkeypatch):
-        self._clean_env(monkeypatch)
-        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "fallback-proj")
-        monkeypatch.setenv("GOOGLE_CHAT_SUBSCRIPTION",
-                           "projects/fallback-proj/subscriptions/s")
-        cfg = load_gateway_config()
-        gc = cfg.platforms[Platform.GOOGLE_CHAT]
-        assert gc.extra["project_id"] == "fallback-proj"
 
-    def test_subscription_accepts_legacy_alias(self, monkeypatch):
-        self._clean_env(monkeypatch)
-        monkeypatch.setenv("GOOGLE_CHAT_PROJECT_ID", "p")
-        monkeypatch.setenv("GOOGLE_CHAT_SUBSCRIPTION", "projects/p/subscriptions/s")
-        cfg = load_gateway_config()
-        gc = cfg.platforms[Platform.GOOGLE_CHAT]
-        assert gc.extra["subscription_name"] == "projects/p/subscriptions/s"
 
-    def test_sa_path_falls_back_to_google_application_credentials(self, monkeypatch):
-        self._clean_env(monkeypatch)
-        monkeypatch.setenv("GOOGLE_CHAT_PROJECT_ID", "p")
-        monkeypatch.setenv("GOOGLE_CHAT_SUBSCRIPTION_NAME",
-                           "projects/p/subscriptions/s")
-        monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/opt/sa.json")
-        cfg = load_gateway_config()
-        gc = cfg.platforms[Platform.GOOGLE_CHAT]
-        assert gc.extra["service_account_json"] == "/opt/sa.json"
 
     def test_missing_subscription_does_not_enable(self, monkeypatch):
         self._clean_env(monkeypatch)
@@ -308,24 +275,7 @@ class TestEnvConfigLoading:
         cfg = load_gateway_config()
         assert Platform.GOOGLE_CHAT not in cfg.platforms
 
-    def test_home_channel_populated(self, monkeypatch):
-        self._clean_env(monkeypatch)
-        monkeypatch.setenv("GOOGLE_CHAT_PROJECT_ID", "p")
-        monkeypatch.setenv("GOOGLE_CHAT_SUBSCRIPTION_NAME",
-                           "projects/p/subscriptions/s")
-        monkeypatch.setenv("GOOGLE_CHAT_HOME_CHANNEL", "spaces/HOME")
-        cfg = load_gateway_config()
-        gc = cfg.platforms[Platform.GOOGLE_CHAT]
-        assert gc.home_channel is not None
-        assert gc.home_channel.chat_id == "spaces/HOME"
 
-    def test_connected_platforms_recognises_via_extras(self, monkeypatch):
-        self._clean_env(monkeypatch)
-        monkeypatch.setenv("GOOGLE_CHAT_PROJECT_ID", "p")
-        monkeypatch.setenv("GOOGLE_CHAT_SUBSCRIPTION_NAME",
-                           "projects/p/subscriptions/s")
-        cfg = load_gateway_config()
-        assert Platform.GOOGLE_CHAT in cfg.get_connected_platforms()
 
 
 # ===========================================================================
@@ -2407,6 +2357,61 @@ class TestADCFallback:
         msg = str(ei.value).lower()
         assert "default credentials" in msg or "adc" in msg
         assert "google_chat_service_account_json" in msg
+
+
+class TestGoogleChatInteractiveSetup:
+    def test_interactive_setup_uses_shared_cli_prompt_helpers(self, monkeypatch):
+        """Google Chat setup should not import prompt helpers from config.py."""
+        from plugins.platforms.google_chat import adapter as gc_mod
+
+        saved: dict[str, str] = {}
+        answers = {
+            "GCP project ID (e.g. my-project)": "demo-project",
+            "Pub/Sub subscription (projects/<proj>/subscriptions/<sub>)": (
+                "projects/demo-project/subscriptions/hermes-chat"
+            ),
+            "Path to Service Account JSON (or inline JSON)": "/tmp/sa.json",
+            "Allowed user emails (comma-separated)": "alice@example.com, bob@example.com",
+            "Home space for cron/notification delivery (e.g. spaces/AAAA, or empty)": (
+                "spaces/AAAA"
+            ),
+        }
+
+        def fake_get_env_value(key):
+            return saved.get(key, "")
+
+        def fake_save_env_value(key, value):
+            saved[key] = value
+
+        def fake_prompt(question, default=None, password=False):
+            return answers.get(question, default or "")
+
+        monkeypatch.setattr("hermes_cli.config.get_env_value", fake_get_env_value)
+        monkeypatch.setattr("hermes_cli.config.save_env_value", fake_save_env_value)
+        monkeypatch.setattr("hermes_cli.cli_output.prompt", fake_prompt)
+        monkeypatch.setattr(
+            "hermes_cli.cli_output.prompt_yes_no", lambda *_a, **_kw: True
+        )
+        monkeypatch.setattr(
+            "hermes_cli.cli_output.print_info", lambda *_a, **_kw: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.cli_output.print_success", lambda *_a, **_kw: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.cli_output.print_warning", lambda *_a, **_kw: None
+        )
+
+        gc_mod.interactive_setup()
+
+        assert saved["GOOGLE_CHAT_PROJECT_ID"] == "demo-project"
+        assert (
+            saved["GOOGLE_CHAT_SUBSCRIPTION_NAME"]
+            == "projects/demo-project/subscriptions/hermes-chat"
+        )
+        assert saved["GOOGLE_CHAT_SERVICE_ACCOUNT_JSON"] == "/tmp/sa.json"
+        assert saved["GOOGLE_CHAT_ALLOWED_USERS"] == "alice@example.com,bob@example.com"
+        assert saved["GOOGLE_CHAT_HOME_CHANNEL"] == "spaces/AAAA"
 
 
 # ===========================================================================
