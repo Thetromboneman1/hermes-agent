@@ -8793,8 +8793,17 @@ class AIAgent:
             "image/jpg": ".jpg",
         }.get(mime, ".jpg")
         tmp = tempfile.NamedTemporaryFile(prefix="anthropic_image_", suffix=suffix, delete=False)
-        with tmp:
-            tmp.write(base64.b64decode(data))
+        try:
+            with tmp:
+                tmp.write(base64.b64decode(data))
+        except Exception:
+            # delete=False means a corrupt/unsupported data URL would otherwise
+            # leak a zero-byte temp file on every failed materialization.
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            raise
         path = Path(tmp.name)
         return str(path), path
 
@@ -10080,6 +10089,25 @@ class AIAgent:
                     parent_session_id=old_session_id,
                 )
                 self._session_db_created = True
+                # Forward any standing /goal state from the parent session to
+                # the continuation session so the goal loop survives
+                # auto-compression. Without this rebind, _get_goal_manager()
+                # constructs a fresh manager keyed on the new session_id,
+                # load_goal() returns None, mgr.is_active() is False, and
+                # the loop silently dies mid-task. The goal is stored in
+                # state_meta under "goal:<sid>" by hermes_cli.goals.
+                try:
+                    _goal_meta_key_old = f"goal:{old_session_id}"
+                    _goal_meta_key_new = f"goal:{self.session_id}"
+                    _goal_blob = self._session_db.get_meta(_goal_meta_key_old)
+                    if _goal_blob:
+                        self._session_db.set_meta(_goal_meta_key_new, _goal_blob)
+                        logger.info(
+                            "goal: forwarded standing goal from %s → %s on compression",
+                            old_session_id, self.session_id,
+                        )
+                except Exception as exc:
+                    logger.debug("goal forward on compression failed: %s", exc)
                 # Auto-number the title for the continuation session
                 if old_title:
                     try:

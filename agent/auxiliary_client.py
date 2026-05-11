@@ -706,6 +706,16 @@ class _CodexCompletionsAdapter:
                     close()
                 except Exception:
                     logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
+            # The cached auxiliary client wraps this same ``self._client``
+            # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
+            # this instance).  After we close the httpx transport above, the
+            # cache must drop that entry — otherwise the next auxiliary call
+            # (compression retry, memory flush, etc.) reuses the dead client
+            # and fails fast with a connection error.  See issue #23432.
+            try:
+                _evict_cached_client_instance(self._client)
+            except Exception:
+                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
         def _check_cancelled() -> None:
             if deadline is not None and time.monotonic() >= deadline:
@@ -1820,6 +1830,113 @@ def _get_provider_chain() -> List[tuple]:
     ]
 
 
+# ── Auxiliary "recently 402'd" unhealthy-provider cache ────────────────────
+#
+# When an auxiliary provider returns HTTP 402 (Payment Required / credit
+# exhaustion), retrying it on every subsequent aux call is wasteful — the
+# provider stays depleted for hours or days, but the chain re-tries it as
+# the FIRST entry on every compression/title-gen/session-search call,
+# burns ~1 RTT, gets 402 again, then falls back. On a long Discord/LCM
+# session that adds up to dozens of doomed 402s.
+#
+# Solution: when ANY caller observes a payment error against a provider,
+# mark it unhealthy for ``_AUX_UNHEALTHY_TTL_SECONDS``. ``_resolve_auto``
+# Step-2 and ``_try_payment_fallback`` both consult this cache and skip
+# unhealthy entries (logging once per skip-reason so the user sees what
+# happened). Entries auto-expire so a topped-up account recovers without
+# manual intervention.
+#
+# Failure isolation: the cache is in-process only. A second hermes
+# process won't inherit the unhealthy mark — that's intentional, since
+# the user might be running two profiles with different OpenRouter keys.
+
+_AUX_UNHEALTHY_TTL_SECONDS = 600  # 10 minutes
+_aux_unhealthy_until: Dict[str, float] = {}
+_aux_unhealthy_logged_at: Dict[str, float] = {}
+
+# Map provider names that show up in resolved_provider / explicit-config
+# back to the chain labels used by _get_provider_chain(). Keep in sync
+# with the alias map in _try_payment_fallback below.
+_AUX_UNHEALTHY_LABEL_ALIASES = {
+    "openrouter": "openrouter",
+    "nous": "nous",
+    "custom": "local/custom",
+    "local/custom": "local/custom",
+    "openai-codex": "openai-codex",
+    "codex": "openai-codex",
+}
+
+
+def _normalize_chain_label(provider: str) -> str:
+    """Normalize a resolved_provider value to a chain label used by
+    ``_get_provider_chain()``. Falls back to the lowercased input for
+    direct API-key providers (deepseek, alibaba, minimax, etc.) which
+    each report their own provider name from the api-key chain.
+    """
+    if not provider:
+        return ""
+    p = str(provider).strip().lower()
+    return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
+
+
+def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None:
+    """Mark ``provider`` as recently-402'd, hidden from chain iteration
+    until the TTL expires. Called from the payment-fallback branches in
+    ``call_llm`` and ``acall_llm`` after a confirmed payment error.
+    """
+    label = _normalize_chain_label(provider)
+    if not label:
+        return
+    expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
+    _aux_unhealthy_until[label] = expires_at
+    logger.warning(
+        "Auxiliary: marking %s unhealthy for %ds (payment / credit error). "
+        "Subsequent auxiliary calls will skip it until %s.",
+        label,
+        int(ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS),
+        time.strftime("%H:%M:%S", time.localtime(expires_at)),
+    )
+
+
+def _is_provider_unhealthy(label: str) -> bool:
+    """True iff ``label`` is in the unhealthy cache and the TTL hasn't expired.
+    Lazily evicts expired entries so the cache stays small.
+    """
+    if not label:
+        return False
+    expires_at = _aux_unhealthy_until.get(label)
+    if expires_at is None:
+        return False
+    if time.time() >= expires_at:
+        _aux_unhealthy_until.pop(label, None)
+        _aux_unhealthy_logged_at.pop(label, None)
+        return False
+    return True
+
+
+def _log_skip_unhealthy(label: str, task: Optional[str] = None) -> None:
+    """Emit a single info-level log per minute when we skip an unhealthy
+    provider. Avoids spamming the log on bursty sessions while still
+    giving the user a trail.
+    """
+    now = time.time()
+    last = _aux_unhealthy_logged_at.get(label, 0.0)
+    if now - last >= 60:
+        _aux_unhealthy_logged_at[label] = now
+        expires_at = _aux_unhealthy_until.get(label, now)
+        logger.info(
+            "Auxiliary %s: skipping %s (recently returned payment error, retry in %ds)",
+            task or "call", label, max(0, int(expires_at - now)),
+        )
+
+
+def _reset_aux_unhealthy_cache() -> None:
+    """Clear the unhealthy cache. Used by tests and by a future explicit
+    user trigger (e.g. ``hermes config aux reset``)."""
+    _aux_unhealthy_until.clear()
+    _aux_unhealthy_logged_at.clear()
+
+
 def _is_payment_error(exc: Exception) -> bool:
     """Detect payment/credit/quota exhaustion errors.
 
@@ -1982,6 +2099,37 @@ def _evict_cached_clients(provider: str) -> None:
                 except Exception:
                     pass
             _client_cache.pop(key, None)
+
+
+def _evict_cached_client_instance(target: Any) -> bool:
+    """Drop the cache entry whose stored client is *target*.
+
+    Used when a specific cached client has been poisoned (closed httpx
+    transport after a timeout, broken streaming session, etc.) so the next
+    auxiliary call rebuilds rather than reusing the dead instance.
+
+    Walks ``CodexAuxiliaryClient`` wrappers via their ``_real_client`` so a
+    timeout that closes the underlying ``OpenAI`` client also evicts the
+    Codex shim that exposed it.
+
+    Returns True when at least one entry was evicted.
+    """
+    if target is None:
+        return False
+    evicted = False
+    with _client_cache_lock:
+        for key in list(_client_cache.keys()):
+            entry = _client_cache.get(key)
+            if entry is None:
+                continue
+            cached = entry[0]
+            if cached is None:
+                continue
+            real = getattr(cached, "_real_client", None)
+            if cached is target or real is target:
+                del _client_cache[key]
+                evicted = True
+    return evicted
 
 
 def _pool_cache_hint(
@@ -2261,6 +2409,10 @@ def _try_payment_fallback(
     for label, try_fn in _get_provider_chain():
         if label in skip_chain_labels:
             continue
+        if _is_provider_unhealthy(label):
+            _log_skip_unhealthy(label, task)
+            tried.append(f"{label} (unhealthy)")
+            continue
         client, model = try_fn()
         if client is not None:
             logger.info(
@@ -2337,21 +2489,34 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
             resolved_provider = "custom"
             explicit_base_url = runtime_base_url
             explicit_api_key = runtime_api_key or None
-        client, resolved = resolve_provider_client(
-            resolved_provider,
-            main_model,
-            explicit_base_url=explicit_base_url,
-            explicit_api_key=explicit_api_key,
-            api_mode=runtime_api_mode or None,
-        )
-        if client is not None:
-            logger.info("Auxiliary auto-detect: using main provider %s (%s)",
-                        main_provider, resolved or main_model)
-            return client, resolved or main_model
+        # Skip Step-1 if the main provider was recently 402'd. The unhealthy
+        # cache TTL bounds how long we bypass it, so a topped-up account
+        # recovers automatically. If we tried Step-1 anyway, every aux call
+        # on a depleted main provider would pay one doomed 402 RTT before
+        # falling to Step-2.
+        main_chain_label = _normalize_chain_label(resolved_provider)
+        if main_chain_label and _is_provider_unhealthy(main_chain_label):
+            _log_skip_unhealthy(main_chain_label)
+        else:
+            client, resolved = resolve_provider_client(
+                resolved_provider,
+                main_model,
+                explicit_base_url=explicit_base_url,
+                explicit_api_key=explicit_api_key,
+                api_mode=runtime_api_mode or None,
+            )
+            if client is not None:
+                logger.info("Auxiliary auto-detect: using main provider %s (%s)",
+                            main_provider, resolved or main_model)
+                return client, resolved or main_model
 
     # ── Step 2: aggregator / fallback chain ──────────────────────────────
     tried = []
     for label, try_fn in _get_provider_chain():
+        if _is_provider_unhealthy(label):
+            _log_skip_unhealthy(label)
+            tried.append(f"{label} (unhealthy)")
+            continue
         client, model = try_fn()
         if client is not None:
             if tried:
@@ -4183,6 +4348,13 @@ def call_llm(
         if should_fallback and is_auto:
             if _is_payment_error(first_err):
                 reason = "payment error"
+                # Resolve the actual provider label (resolved_provider may be
+                # "auto"; the client's base_url tells us which backend got the
+                # 402). Mark THAT label unhealthy so subsequent aux calls
+                # skip it instead of paying another doomed RTT.
+                _mark_provider_unhealthy(
+                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider
+                )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
             else:
@@ -4200,6 +4372,17 @@ def call_llm(
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
                 return _validate_llm_response(
                     fb_client.chat.completions.create(**fb_kwargs), task)
+        # Connection/timeout errors leave the cached client poisoned (closed
+        # httpx transport, half-read stream, dead async loop).  Drop it from
+        # the cache regardless of whether we found a fallback above so the
+        # next auxiliary call rebuilds a fresh client instead of reusing the
+        # dead one.  See issue #23432.
+        if _is_connection_error(first_err):
+            try:
+                _evict_cached_client_instance(client)
+            except Exception:
+                logger.debug("Auxiliary: cache eviction after connection error failed",
+                             exc_info=True)
         raise
 
 
@@ -4494,6 +4677,9 @@ async def async_call_llm(
         if should_fallback and is_auto:
             if _is_payment_error(first_err):
                 reason = "payment error"
+                _mark_provider_unhealthy(
+                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider
+                )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
             else:
@@ -4517,4 +4703,12 @@ async def async_call_llm(
                     fb_kwargs["model"] = async_fb_model
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
+        # Mirror the sync path: drop poisoned clients on connection/timeout
+        # so the next aux call rebuilds.  See issue #23432.
+        if _is_connection_error(first_err):
+            try:
+                _evict_cached_client_instance(client)
+            except Exception:
+                logger.debug("Auxiliary (async): cache eviction after connection error failed",
+                             exc_info=True)
         raise
