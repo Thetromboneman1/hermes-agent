@@ -104,8 +104,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<prompt>"),
     CommandDef("goal", "Set a standing goal Hermes works on across turns until achieved", "Session",
                args_hint="[text | pause | resume | clear | status]"),
-    CommandDef("subgoal", "Add or manage checklist items on the active goal", "Session",
-               args_hint="[text | complete N | impossible N | undo N | remove N | clear]"),
     CommandDef("status", "Show session info", "Session"),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
@@ -813,7 +811,7 @@ def discord_skill_commands_by_category(
     # names are marked with a sentinel so the warning distinguishes
     # "skill collided with a reserved command" from "two skills collided
     # on the 32-char clamp" — the latter is the rename-worthy case.
-    _names_used: dict[str, str] = {n: "<reserved>" for n in reserved_names}
+    _names_used: dict[str, str] = dict.fromkeys(reserved_names, "<reserved>")
     hidden = 0
 
     try:

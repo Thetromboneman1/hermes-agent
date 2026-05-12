@@ -50,7 +50,10 @@ AUTHOR_MAP = {
     "buraysandro9@gmail.com": "ygd58",
     "teknium@nousresearch.com": "teknium1",
     "piyushvp1@gmail.com": "thelumiereguy",
+    "421774554@qq.com": "wuli666",
     "harish.kukreja@gmail.com": "counterposition",
+    "1046611633@qq.com": "zhengyn0001",
+    "ahmed@abadr.net": "ahmedbadr3",
     "cleo@edaphic.xyz": "curiouscleo",
     "hirokazu.ogawa@kwansei.ac.jp": "hrkzogw",
     "datapod.k@gmail.com": "dandacompany",
@@ -86,6 +89,7 @@ AUTHOR_MAP = {
     "maksesipov@gmail.com": "Qwinty",
     "denisamania@gmail.com": "CalmProton",
     "308068+mbac@users.noreply.github.com": "mbac",
+    "nicoechaniz@altermundi.net": "nicoechaniz",
     "ninso112@proton.me": "Ninso112",
     "wesleysimplicio@live.com": "wesleysimplicio",
     "matthew.dean.cater@gmail.com": "SiliconID",
@@ -971,6 +975,15 @@ AUTHOR_MAP = {
     "jhin.lee@unity3d.com": "leehack",  # PR #22053 salvage (telegram DM topic reply fallback)
     # pander: empty email, salvaged via PR #19665 from #16126 by @ms-alan
     "ayman.a.kamal@hotmail.com": "A-kamal",  # PR #18678 (xAI image resolution fix)
+    # Kanban bug-fix batch salvage (May 2026)
+    "frowte3k@gmail.com": "Frowtek",  # salvage of #23206 (gateway --board auto-subscribe)
+    "sylw3st3rr@gmail.com": "Sylw3ster",  # salvage of #23252 (HERMES_KANBAN_BOARD restore)
+    "hello@dominikh.com": "dmnkhorvath",  # salvage of #23358 (kanban worker send_message)
+    "413011+smwbev@users.noreply.github.com": "smwbev",  # salvage of #23659 (aria-label colLabel)
+    "58116817+TurgutKural@users.noreply.github.com": "TurgutKural",  # salvage of #23356 (HERMES_HOME inject)
+    "openclaw@agent.local": "29206394",  # PR #22194 salvage (sudo -S brute-force guard, #9590)
+    "freedemon@gmail.com": "fr33d3m0n",  # PR #21128 salvage (sudo stdin/askpass DANGEROUS, #17873 cat 4)
+    "zhaowh3613@outlook.com": "VinceZcrikl",  # PR #23647 salvage (npm UTF-8 decode on GBK Windows)
 }
 
 
@@ -1415,7 +1428,7 @@ def main():
     print(f"  SemVer:          v{current_version} → v{new_version}")
     print(f"  Previous tag:    {prev_tag or '(none — first release)'}")
     print(f"  Commits:         {len(commits)}")
-    print(f"  Unique authors:  {len(set(c['github_author'] for c in commits))}")
+    print(f"  Unique authors:  {len({c['github_author'] for c in commits})}")
     print(f"  Mode:            {'PUBLISH' if args.publish else 'DRY RUN'}")
     print(f"{'='*60}")
     print()
