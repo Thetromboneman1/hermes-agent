@@ -64,6 +64,13 @@ def _load_firecrawl_cls() -> type:
     """Import and cache ``firecrawl.Firecrawl``."""
     global _FIRECRAWL_CLS_CACHE
     if _FIRECRAWL_CLS_CACHE is None:
+        try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+            _lazy_ensure("search.firecrawl", prompt=False)
+        except ImportError:
+            pass
+        except Exception as e:
+            raise ImportError(str(e))
         from firecrawl import Firecrawl as _cls
         _FIRECRAWL_CLS_CACHE = _cls
     return _FIRECRAWL_CLS_CACHE
@@ -358,6 +365,13 @@ def _get_parallel_client():
 
     Requires PARALLEL_API_KEY environment variable.
     """
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("search.parallel", prompt=False)
+    except ImportError:
+        pass
+    except Exception as e:
+        raise ImportError(str(e))
     from parallel import Parallel
     global _parallel_client
     if _parallel_client is None:
@@ -376,6 +390,13 @@ def _get_async_parallel_client():
 
     Requires PARALLEL_API_KEY environment variable.
     """
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("search.parallel", prompt=False)
+    except ImportError:
+        pass
+    except Exception as e:
+        raise ImportError(str(e))
     from parallel import AsyncParallel
     global _async_parallel_client
     if _async_parallel_client is None:
@@ -408,7 +429,9 @@ def _tavily_request(endpoint: str, payload: dict) -> dict:
     payload["api_key"] = api_key
     url = f"{_TAVILY_BASE_URL}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
-    response = httpx.post(url, json=payload, timeout=60)
+    # Tavily /crawl requires Bearer auth in header (body-only auth returns 401)
+    headers = {"Authorization": f"Bearer {api_key}"} if endpoint.strip("/") == "crawl" else {}
+    response = httpx.post(url, json=payload, headers=headers, timeout=60)
     response.raise_for_status()
     return response.json()
 
@@ -570,7 +593,8 @@ def _resolve_web_extract_auxiliary(model: Optional[str] = None) -> tuple[Optiona
     extra_body: Dict[str, Any] = {}
     if client is not None and _is_nous_auxiliary_client(client):
         from agent.auxiliary_client import get_auxiliary_extra_body
-        extra_body = get_auxiliary_extra_body() or {"tags": ["product=hermes-agent"]}
+        from agent.portal_tags import nous_portal_tags
+        extra_body = get_auxiliary_extra_body() or {"tags": nous_portal_tags()}
 
     return client, effective_model, extra_body
 
@@ -990,6 +1014,13 @@ def _get_exa_client():
 
     Requires EXA_API_KEY environment variable.
     """
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("search.exa", prompt=False)
+    except ImportError:
+        pass
+    except Exception as e:
+        raise ImportError(str(e))
     from exa_py import Exa
     global _exa_client
     if _exa_client is None:
