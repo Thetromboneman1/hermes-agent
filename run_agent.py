@@ -1275,7 +1275,7 @@ class AIAgent:
             self.api_mode = api_mode
         elif self.provider == "openai-codex":
             self.api_mode = "codex_responses"
-        elif self.provider == "xai":
+        elif self.provider in {"xai", "xai-oauth"}:
             self.api_mode = "codex_responses"
         elif (provider_name is None) and (
             self._base_url_hostname == "chatgpt.com"
@@ -1664,6 +1664,9 @@ class AIAgent:
                 if base_url_host_matches(effective_base, "openrouter.ai"):
                     from agent.auxiliary_client import build_or_headers
                     client_kwargs["default_headers"] = build_or_headers()
+                elif base_url_host_matches(effective_base, "integrate.api.nvidia.com"):
+                    from agent.auxiliary_client import build_nvidia_nim_headers
+                    client_kwargs["default_headers"] = build_nvidia_nim_headers(effective_base)
                 elif base_url_host_matches(effective_base, "api.routermint.com"):
                     client_kwargs["default_headers"] = _routermint_headers()
                 elif base_url_host_matches(effective_base, "api.githubcopilot.com"):
@@ -1702,9 +1705,15 @@ class AIAgent:
                     }
                     if _provider_timeout is not None:
                         client_kwargs["timeout"] = _provider_timeout
-                    # Preserve any default_headers the router set
-                    if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
-                        client_kwargs["default_headers"] = dict(_routed_client._default_headers)
+                    # Preserve provider-specific headers the router set.  The
+                    # OpenAI SDK stores caller-provided default_headers in
+                    # _custom_headers; older/mocked clients may expose
+                    # _default_headers instead.
+                    _routed_headers = getattr(_routed_client, "_custom_headers", None)
+                    if not _routed_headers:
+                        _routed_headers = getattr(_routed_client, "_default_headers", None)
+                    if _routed_headers:
+                        client_kwargs["default_headers"] = dict(_routed_headers)
                 else:
                     # When the user explicitly chose a non-OpenRouter provider
                     # but no credentials were found, fail fast with a clear
@@ -1753,8 +1762,11 @@ class AIAgent:
                                 }
                                 if _provider_timeout is not None:
                                     client_kwargs["timeout"] = _provider_timeout
-                                if hasattr(_fb_client, "_default_headers") and _fb_client._default_headers:
-                                    client_kwargs["default_headers"] = dict(_fb_client._default_headers)
+                                _fb_headers = getattr(_fb_client, "_custom_headers", None)
+                                if not _fb_headers:
+                                    _fb_headers = getattr(_fb_client, "_default_headers", None)
+                                if _fb_headers:
+                                    client_kwargs["default_headers"] = dict(_fb_headers)
                                 _fb_resolved = True
                                 break
                         if not _fb_resolved:
@@ -3015,6 +3027,24 @@ class AIAgent:
             parts.append(f"{type(e).__name__}({msg})" if msg else type(e).__name__)
         return " <- ".join(parts) if parts else type(error).__name__
 
+    def _is_provider_stream_parse_error(self, error: BaseException) -> bool:
+        """Return True for malformed provider streaming data from SDK parsers.
+
+        Some Anthropic-compatible streaming providers can send a malformed
+        event-stream frame.  The Anthropic SDK surfaces that as a plain
+        ``ValueError`` such as ``expected ident at line 1 column 149``.  That
+        is provider wire-format trouble, not local request validation, so it
+        should follow the same retry path as a truncated JSON body.
+        """
+        if getattr(self, "api_mode", None) != "anthropic_messages":
+            return False
+        if not isinstance(error, ValueError):
+            return False
+        if isinstance(error, (UnicodeEncodeError, json.JSONDecodeError)):
+            return False
+        message = str(error).strip().lower()
+        return "expected ident at line" in message
+
     def _log_stream_retry(
         self,
         *,
@@ -3225,11 +3255,20 @@ class AIAgent:
             except Exception:
                 _aux_cfg_provider = ""
             if client is None or not aux_model:
-                msg = (
-                    "⚠ No auxiliary LLM provider configured — context "
-                    "compression will drop middle turns without a summary. "
-                    "Run `hermes setup` or set OPENROUTER_API_KEY."
-                )
+                if _aux_cfg_provider and _aux_cfg_provider != "auto":
+                    msg = (
+                        "⚠ Configured auxiliary compression provider "
+                        f"'{_aux_cfg_provider}' is unavailable — context "
+                        "compression will drop middle turns without a summary. "
+                        "Check auxiliary.compression in config.yaml and "
+                        "reauthenticate that provider."
+                    )
+                else:
+                    msg = (
+                        "⚠ No auxiliary LLM provider configured — context "
+                        "compression will drop middle turns without a summary. "
+                        "Run `hermes setup` or set OPENROUTER_API_KEY."
+                    )
                 self._compression_warning = msg
                 self._emit_status(msg)
                 logger.warning(
@@ -4955,6 +4994,101 @@ class AIAgent:
         _save_trajectory_to_file(trajectory, self.model, completed)
 
     @staticmethod
+    def _is_entitlement_failure(
+        error_context: Optional[Dict[str, Any]],
+        status_code: Optional[int],
+    ) -> bool:
+        """Detect subscription/entitlement 403s that masquerade as auth failures.
+
+        Returned True only when the body text matches a known entitlement
+        shape AND the status is 401/403.  Refreshing an OAuth token cannot
+        fix an unsubscribed account, so callers should surface the error
+        instead of looping the credential pool.
+
+        Current matches:
+          * xAI OAuth: "do not have an active Grok subscription" /
+            "out of available resources" / "does not have permission" + "grok"
+
+        Extend here for new providers as we discover them (Anthropic's
+        Claude Max OAuth entitlement errors look distinct enough today that
+        the existing 1M-context-beta branch handles them; revisit if other
+        subscription tiers start producing the same loop signature).
+        """
+        if status_code not in (401, 403, None):
+            return False
+        if not isinstance(error_context, dict):
+            return False
+        message = str(error_context.get("message") or "").lower()
+        reason = str(error_context.get("reason") or "").lower()
+        haystack = f"{message} {reason}"
+        if not haystack.strip():
+            return False
+        if "do not have an active grok subscription" in haystack:
+            return True
+        if "out of available resources" in haystack and "grok" in haystack:
+            return True
+        if "does not have permission" in haystack and "grok" in haystack:
+            return True
+        return False
+
+    @staticmethod
+    def _decorate_xai_entitlement_error(detail: str) -> str:
+        """Append a neutral hint when xAI's OAuth surface returns the
+        permission-denied 403.
+
+        xAI's ``/v1/responses`` endpoint replies to several distinct failure
+        modes with the SAME body::
+
+            {"code": "The caller does not have permission to execute the
+             specified operation", "error": "You have either run out of
+             available resources or do not have an active Grok subscription.
+             Manage subscriptions at https://grok.com/?_s=usage or subscribe
+             at https://grok.com/supergrok"}
+
+        That body covers several real causes we cannot distinguish without
+        more info from xAI.  The most common (and least obvious) one is
+        that **X Premium+ does NOT include API access** — only standalone
+        SuperGrok subscribers can use Hermes against xai-oauth.  Lots of
+        users see Grok in their X app, assume it works here too, and hit
+        this 403 with no idea why.  Lead the hint with that.
+
+        Other possible causes:
+          * No Grok subscription at all
+          * SuperGrok tier doesn't include the requested model (e.g.
+            grok-4.3 may need a higher tier)
+          * Monthly quota exhausted (the ``?_s=usage`` URL hints at this)
+
+        Surface the raw xAI text verbatim and point at
+        https://grok.com/?_s=usage where the user can see WHICH applies.
+
+        Matched once per detail string — won't double-decorate if the
+        upstream already concatenated the same text.
+        """
+        if not detail:
+            return detail
+        lower = detail.lower()
+        is_entitlement = (
+            "do not have an active grok subscription" in lower
+            or ("out of available resources" in lower and "grok" in lower)
+            or ("does not have permission" in lower and "grok" in lower)
+        )
+        if not is_entitlement:
+            return detail
+        hint = (
+            " — xAI rejected this OAuth account. NOTE: X Premium+ does NOT "
+            "include xAI API access — only standalone SuperGrok subscribers "
+            "can use this provider. Other possible causes: no Grok "
+            "subscription, your tier doesn't include this model, or your "
+            "quota is exhausted. Check https://grok.com/?_s=usage to see "
+            "which, or run `/model` to switch providers."
+        )
+        # Idempotency: detect prior decoration by a substring unique to the
+        # hint (not present in xAI's own body text).
+        if "X Premium+ does NOT include" in detail:
+            return detail
+        return f"{detail}{hint}"
+
+    @staticmethod
     def _summarize_api_error(error: Exception) -> str:
         """Extract a human-readable one-liner from an API error.
 
@@ -4963,6 +5097,12 @@ class AIAgent:
         str(error) for everything else.
         """
         raw = str(error)
+
+        if (
+            isinstance(error, ValueError)
+            and "expected ident at line" in raw.lower()
+        ):
+            return f"Malformed provider streaming response: {raw[:300]}"
 
         # Cloudflare / proxy HTML pages: grab the <title> for a clean summary
         if "<!DOCTYPE" in raw or "<html" in raw:
@@ -4987,12 +5127,12 @@ class AIAgent:
             if msg:
                 status_code = getattr(error, "status_code", None)
                 prefix = f"HTTP {status_code}: " if status_code else ""
-                return f"{prefix}{msg[:300]}"
+                return AIAgent._decorate_xai_entitlement_error(f"{prefix}{msg[:300]}")
 
         # Fallback: truncate the raw string but give more room than 200 chars
         status_code = getattr(error, "status_code", None)
         prefix = f"HTTP {status_code}: " if status_code else ""
-        return f"{prefix}{raw[:500]}"
+        return AIAgent._decorate_xai_entitlement_error(f"{prefix}{raw[:500]}")
 
     def _mask_api_key_for_logs(self, key: Optional[str]) -> Optional[str]:
         if not key:
@@ -7044,18 +7184,48 @@ class AIAgent:
             except RuntimeError as exc:
                 err_text = str(exc)
                 missing_completed = "response.completed" in err_text
-                if missing_completed and attempt < max_stream_retries:
+                # The OpenAI SDK's Responses streaming state machine raises
+                # ``RuntimeError("Expected to have received `response.created`
+                # before `<event-type>`")`` when the first SSE event from the
+                # server is anything other than ``response.created`` — and it
+                # discards the event's payload before we can read it.  Three
+                # real-world backends emit a different first frame:
+                #
+                #   * xAI on grok-4.x OAuth — sends ``error`` (issues
+                #     reported around the May 2026 SuperGrok rollout when
+                #     multi-turn conversations replay encrypted reasoning
+                #     content the OAuth tier rejects)
+                #   * codex-lb relays — send ``codex.rate_limits`` (#14634)
+                #   * custom Responses relays — send ``response.in_progress``
+                #     (#8133)
+                #
+                # In all three cases the underlying byte stream is still
+                # readable: a non-stream ``responses.create(stream=True)``
+                # fallback succeeds and surfaces the real provider error as
+                # a normal exception with body+status_code attached, which
+                # ``_summarize_api_error`` can then translate into a useful
+                # user-facing line.  Treat ``response.created`` prelude
+                # errors the same way we already treat ``response.completed``
+                # postlude errors.
+                prelude_error = (
+                    "Expected to have received `response.created`" in err_text
+                    or "Expected to have received \"response.created\"" in err_text
+                )
+                if (missing_completed or prelude_error) and attempt < max_stream_retries:
                     logger.debug(
-                        "Responses stream closed before completion (attempt %s/%s); retrying. %s",
+                        "Responses stream %s (attempt %s/%s); retrying. %s",
+                        "prelude rejected" if prelude_error else "closed before completion",
                         attempt + 1,
                         max_stream_retries + 1,
                         self._client_log_context(),
                     )
                     continue
-                if missing_completed:
+                if missing_completed or prelude_error:
                     logger.debug(
-                        "Responses stream did not emit response.completed; falling back to create(stream=True). %s",
+                        "Responses stream %s; falling back to create(stream=True). %s err=%s",
+                        "rejected before response.created" if prelude_error else "did not emit response.completed",
                         self._client_log_context(),
+                        err_text,
                     )
                     return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 raise
@@ -7139,15 +7309,60 @@ class AIAgent:
         raise RuntimeError("Responses create(stream=True) fallback did not emit a terminal response.")
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
-        if self.api_mode != "codex_responses" or self.provider != "openai-codex":
+        if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
+            return False
+
+        # Guard against silent account swap.
+        #
+        # When an agent is using a non-singleton credential — e.g. a manual
+        # pool entry (``hermes auth add xai-oauth``) whose tokens belong to
+        # a different account than the loopback_pkce singleton, or an agent
+        # constructed with an explicit ``api_key=`` arg — force-refreshing
+        # the singleton here and adopting its tokens silently re-routes the
+        # rest of the conversation onto the singleton's account.  The
+        # credential pool's reactive recovery (``_recover_with_credential_pool``)
+        # is the right channel for that case; this path is the
+        # singleton-only fallback used when the pool can't recover, and
+        # MUST only fire when the agent really is on singleton tokens.
+        try:
+            if self.provider == "openai-codex":
+                from hermes_cli.auth import resolve_codex_runtime_credentials
+
+                singleton_now = resolve_codex_runtime_credentials(
+                    refresh_if_expiring=False,
+                )
+            else:
+                from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
+
+                singleton_now = resolve_xai_oauth_runtime_credentials(
+                    refresh_if_expiring=False,
+                )
+        except Exception as exc:
+            logger.debug("%s singleton read failed: %s", self.provider, exc)
+            return False
+
+        singleton_key = str(singleton_now.get("api_key") or "").strip()
+        active_key = str(self.api_key or "").strip()
+        if singleton_key and active_key and singleton_key != active_key:
+            logger.debug(
+                "%s singleton tokens differ from the active api_key; "
+                "skipping singleton force-refresh to avoid silent account swap. "
+                "Reactive credential rotation should go through the pool.",
+                self.provider,
+            )
             return False
 
         try:
-            from hermes_cli.auth import resolve_codex_runtime_credentials
+            if self.provider == "openai-codex":
+                from hermes_cli.auth import resolve_codex_runtime_credentials
 
-            creds = resolve_codex_runtime_credentials(force_refresh=force)
+                creds = resolve_codex_runtime_credentials(force_refresh=force)
+            else:
+                from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
+
+                creds = resolve_xai_oauth_runtime_credentials(force_refresh=force)
         except Exception as exc:
-            logger.debug("Codex credential refresh failed: %s", exc)
+            logger.debug("%s credential refresh failed: %s", self.provider, exc)
             return False
 
         api_key = creds.get("api_key")
@@ -7162,7 +7377,7 @@ class AIAgent:
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
 
-        if not self._replace_primary_openai_client(reason="codex_credential_refresh"):
+        if not self._replace_primary_openai_client(reason=f"{self.provider}_credential_refresh"):
             return False
 
         return True
@@ -7289,12 +7504,18 @@ class AIAgent:
         return True
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
-        from agent.auxiliary_client import _AI_GATEWAY_HEADERS, build_or_headers
+        from agent.auxiliary_client import (
+            _AI_GATEWAY_HEADERS,
+            build_nvidia_nim_headers,
+            build_or_headers,
+        )
 
         if base_url_host_matches(base_url, "openrouter.ai"):
             self._client_kwargs["default_headers"] = build_or_headers()
         elif base_url_host_matches(base_url, "ai-gateway.vercel.sh"):
             self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
+        elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
+            self._client_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
         elif base_url_host_matches(base_url, "api.routermint.com"):
             self._client_kwargs["default_headers"] = _routermint_headers()
         elif base_url_host_matches(base_url, "api.githubcopilot.com"):
@@ -7419,6 +7640,24 @@ class AIAgent:
             return False, True
 
         if effective_reason == FailoverReason.auth:
+            # Subscription/entitlement 403s look like auth failures on the
+            # wire but refresh cannot fix them — the OAuth token is
+            # already valid; the account simply lacks the entitlement
+            # (e.g. xAI OAuth without SuperGrok/X Premium for grok-4.3).
+            # Without this guard, ``try_refresh_current()`` keeps minting
+            # fresh tokens against the same unsubscribed account and the
+            # main agent loop spins re-issuing the same 403 until the
+            # user Ctrl+C's.  Surface the error instead so the friendly
+            # entitlement hint from ``_summarize_api_error`` can land.
+            if self._is_entitlement_failure(error_context, status_code):
+                logger.info(
+                    "Credential %s — entitlement-shaped 403 from %s; "
+                    "skipping pool refresh (account lacks subscription, "
+                    "not a transient auth failure).",
+                    status_code if status_code is not None else "auth",
+                    self.provider or "provider",
+                )
+                return False, has_retried_429
             refreshed = pool.try_refresh_current()
             if refreshed is not None:
                 logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
@@ -8313,6 +8552,7 @@ class AIAgent:
                         _is_conn_err = isinstance(
                             e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
                         )
+                        _is_stream_parse_err = self._is_provider_stream_parse_error(e)
 
                         # If the stream died AFTER some tokens were delivered:
                         # normally we don't retry (the user already saw text,
@@ -8352,7 +8592,10 @@ class AIAgent:
                                         for phrase in _SSE_PREVIEW_PHRASES
                                     )
                             _is_transient = (
-                                _is_timeout or _is_conn_err or _is_sse_conn_err_preview
+                                _is_timeout
+                                or _is_conn_err
+                                or _is_sse_conn_err_preview
+                                or _is_stream_parse_err
                             )
                             _can_silent_retry = (
                                 _partial_tool_in_flight
@@ -8450,7 +8693,7 @@ class AIAgent:
                                     for phrase in _SSE_CONN_PHRASES
                                 )
 
-                        if _is_timeout or _is_conn_err or _is_sse_conn_err:
+                        if _is_timeout or _is_conn_err or _is_sse_conn_err or _is_stream_parse_err:
                             # Transient network / timeout error. Retry the
                             # streaming request with a fresh connection first.
                             if _stream_attempt < _max_stream_retries:
@@ -8491,12 +8734,20 @@ class AIAgent:
                                 mid_tool_call=False,
                                 diag=request_client_holder.get("diag"),
                             )
-                            self._emit_status(
-                                "❌ Connection to provider failed after "
-                                f"{_max_stream_retries + 1} attempts. "
-                                "The provider may be experiencing issues — "
-                                "try again in a moment."
-                            )
+                            if _is_stream_parse_err:
+                                self._emit_status(
+                                    "❌ Provider returned malformed streaming data after "
+                                    f"{_max_stream_retries + 1} attempts. "
+                                    "The provider may be experiencing issues — "
+                                    "try again in a moment."
+                                )
+                            else:
+                                self._emit_status(
+                                    "❌ Connection to provider failed after "
+                                    f"{_max_stream_retries + 1} attempts. "
+                                    "The provider may be experiencing issues — "
+                                    "try again in a moment."
+                                )
                         else:
                             _err_lower = str(e).lower()
                             _is_stream_unsupported = (
@@ -9631,7 +9882,7 @@ class AIAgent:
                     and "/backend-api/codex" in self._base_url_lower
                 )
             )
-            is_xai_responses = self.provider == "xai" or self._base_url_hostname == "api.x.ai"
+            is_xai_responses = self.provider in {"xai", "xai-oauth"} or self._base_url_hostname == "api.x.ai"
             _msgs_for_codex = self._prepare_messages_for_non_vision_model(api_messages)
             return _ct.build_kwargs(
                 model=self.model,
@@ -12207,7 +12458,7 @@ class AIAgent:
         codex_ack_continuations = 0
         length_continue_retries = 0
         truncated_tool_call_retries = 0
-        truncated_response_prefix = ""
+        truncated_response_parts: List[str] = []
         compression_attempts = 0
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
@@ -12668,16 +12919,30 @@ class AIAgent:
 
                     try:
                         from hermes_cli.plugins import invoke_hook as _invoke_hook
+                        request_messages = api_kwargs.get("messages")
+                        if not isinstance(request_messages, list):
+                            request_messages = api_kwargs.get("input")
+                        if not isinstance(request_messages, list):
+                            request_messages = api_messages
+                        # Shallow-copy the outer list so plugins that retain the
+                        # reference for async snapshotting don't observe later
+                        # mutations of api_messages.  The inner dicts are not
+                        # mutated by the agent loop, so a shallow copy is
+                        # sufficient; a deepcopy would walk every tool result
+                        # and base64 image on every API call.
                         _invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
                             session_id=self.session_id or "",
+                            user_message=original_user_message,
+                            conversation_history=list(messages),
                             platform=self.platform or "",
                             model=self.model,
                             provider=self.provider,
                             base_url=self.base_url,
                             api_mode=self.api_mode,
                             api_call_count=api_call_count,
+                            request_messages=list(request_messages) if isinstance(request_messages, list) else [],
                             message_count=len(api_messages),
                             tool_count=len(self.tools or []),
                             approx_input_tokens=approx_tokens,
@@ -13100,7 +13365,7 @@ class AIAgent:
                                 interim_msg = self._build_assistant_message(assistant_message, finish_reason)
                                 messages.append(interim_msg)
                                 if assistant_message.content:
-                                    truncated_response_prefix += assistant_message.content
+                                    truncated_response_parts.append(assistant_message.content)
 
                                 if length_continue_retries < 3:
                                     self._vprint(
@@ -13121,7 +13386,7 @@ class AIAgent:
                                     restart_with_length_continuation = True
                                     break
 
-                                partial_response = self._strip_think_blocks(truncated_response_prefix).strip()
+                                partial_response = self._strip_think_blocks("".join(truncated_response_parts)).strip()
                                 self._cleanup_task_resources(effective_task_id)
                                 self._persist_session(messages, conversation_history)
                                 return {
@@ -13686,13 +13951,14 @@ class AIAgent:
 
                     if (
                         self.api_mode == "codex_responses"
-                        and self.provider == "openai-codex"
+                        and self.provider in {"openai-codex", "xai-oauth"}
                         and status_code == 401
                         and not codex_auth_retry_attempted
                     ):
                         codex_auth_retry_attempted = True
                         if self._try_refresh_codex_client_credentials(force=True):
-                            self._vprint(f"{self.log_prefix}🔐 Codex auth refreshed after 401. Retrying request...")
+                            _label = "xAI OAuth" if self.provider == "xai-oauth" else "Codex"
+                            self._vprint(f"{self.log_prefix}🔐 {_label} auth refreshed after 401. Retrying request...")
                             continue
                     if (
                         self.api_mode == "chat_completions"
@@ -14279,11 +14545,16 @@ class AIAgent:
                     # provider/network failure (malformed response body,
                     # truncated stream, routing layer corruption), not a
                     # local programming bug, and should be retried (#14782).
+                    # Exclude Anthropic stream parser ValueErrors for the
+                    # same reason: third-party Anthropic-compatible providers
+                    # can emit malformed event-stream frames that SDK parsers
+                    # raise as plain ValueError.
                     is_local_validation_error = (
                         isinstance(api_error, (ValueError, TypeError))
                         and not isinstance(
                             api_error, (UnicodeEncodeError, json.JSONDecodeError)
                         )
+                        and not self._is_provider_stream_parse_error(api_error)
                         # ssl.SSLError (and its subclass SSLCertVerificationError)
                         # inherits from OSError *and* ValueError via Python MRO,
                         # so the isinstance(ValueError) check above would
@@ -14332,11 +14603,15 @@ class AIAgent:
                         self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
                         # Actionable guidance for common auth errors
                         if classified.is_auth or classified.reason == FailoverReason.billing:
-                            if _provider == "openai-codex" and status_code == 401:
-                                self._vprint(f"{self.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
-                                self._vprint(f"{self.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:", force=True)
-                                self._vprint(f"{self.log_prefix}      1. Run `codex` in your terminal to generate fresh tokens.", force=True)
-                                self._vprint(f"{self.log_prefix}      2. Then run `hermes auth` to re-authenticate.", force=True)
+                            if _provider in {"openai-codex", "xai-oauth"} and status_code == 401:
+                                if _provider == "openai-codex":
+                                    self._vprint(f"{self.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
+                                    self._vprint(f"{self.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:", force=True)
+                                    self._vprint(f"{self.log_prefix}      1. Run `codex` in your terminal to generate fresh tokens.", force=True)
+                                    self._vprint(f"{self.log_prefix}      2. Then run `hermes auth` to re-authenticate.", force=True)
+                                else:
+                                    self._vprint(f"{self.log_prefix}   💡 xAI OAuth token was rejected (HTTP 401). To fix:", force=True)
+                                    self._vprint(f"{self.log_prefix}      re-authenticate with xAI Grok OAuth (SuperGrok Subscription) from `hermes model`.", force=True)
                             else:
                                 self._vprint(f"{self.log_prefix}   💡 Your API key was rejected by the provider. Check:", force=True)
                                 self._vprint(f"{self.log_prefix}      • Is the key valid? Run: hermes setup", force=True)
@@ -14582,7 +14857,9 @@ class AIAgent:
                         finish_reason=finish_reason,
                         message_count=len(api_messages),
                         response_model=getattr(response, "model", None),
+                        response=response,
                         usage=self._usage_summary_for_api_request_hook(response),
+                        assistant_message=assistant_message,
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),
                     )
@@ -15325,9 +15602,9 @@ class AIAgent:
 
                     codex_ack_continuations = 0
 
-                    if truncated_response_prefix:
-                        final_response = truncated_response_prefix + final_response
-                        truncated_response_prefix = ""
+                    if truncated_response_parts:
+                        final_response = "".join(truncated_response_parts) + final_response
+                        truncated_response_parts = []
                         length_continue_retries = 0
                     
                     final_response = self._strip_think_blocks(final_response).strip()
