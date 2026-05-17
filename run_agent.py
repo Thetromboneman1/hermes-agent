@@ -393,6 +393,19 @@ def _is_destructive_command(cmd: str) -> bool:
     return False
 
 
+def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
+    """Check if an MCP tool comes from a server with parallel tool calls enabled.
+
+    Lazy-imports from ``tools.mcp_tool`` to avoid circular dependencies.
+    Returns False if the MCP module is not available.
+    """
+    try:
+        from tools.mcp_tool import is_mcp_tool_parallel_safe
+        return is_mcp_tool_parallel_safe(tool_name)
+    except Exception:
+        return False
+
+
 def _should_parallelize_tool_batch(tool_calls) -> bool:
     """Return True when a tool-call batch is safe to run concurrently."""
     if len(tool_calls) <= 1:
@@ -432,7 +445,9 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
             continue
 
         if tool_name not in _PARALLEL_SAFE_TOOLS:
-            return False
+            # Check if it's an MCP tool from a server that opted into parallel calls.
+            if not _is_mcp_tool_parallel_safe(tool_name):
+                return False
 
     return True
 
@@ -1093,6 +1108,45 @@ def _qwen_portal_headers() -> dict:
         "X-DashScope-UserAgent": _ua,
         "X-DashScope-AuthType": "qwen-oauth",
     }
+
+
+class _StreamErrorEvent(Exception):
+    """Synthesized provider error surfaced from a Responses ``error`` SSE frame.
+
+    Some Codex-style Responses backends (xAI for subscription/quota
+    failures, custom relays under malformed-tool-call conditions) emit a
+    standalone ``type=error`` frame instead of routing the failure
+    through ``response.failed`` or returning an HTTP 4xx.  The fallback
+    streaming path raises this exception so ``_summarize_api_error`` and
+    ``_extract_api_error_context`` see a familiar ``.body`` /
+    ``.status_code`` shape and the entitlement detector can match the
+    underlying provider message ("do not have an active Grok
+    subscription", etc.).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[str] = None,
+        param: Optional[str] = None,
+        status_code: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.param = param
+        self.status_code = status_code
+        # OpenAI SDK-shaped body so _extract_api_error_context /
+        # _summarize_api_error / classify_api_error all pick it up.
+        self.body: Dict[str, Any] = {
+            "error": {
+                "message": message,
+                "code": code,
+                "param": param,
+                "type": "error",
+            }
+        }
 
 
 class AIAgent:
@@ -2007,7 +2061,7 @@ class AIAgent:
             try:
                 _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
-                if _mem_provider_name:
+                if _mem_provider_name and _mem_provider_name.strip():
                     from agent.memory_manager import MemoryManager as _MemoryManager
                     from plugins.memory import load_memory_provider as _load_mem
                     self._memory_manager = _MemoryManager()
@@ -4332,6 +4386,21 @@ class AIAgent:
                     # owns the loop and the agent-loop tools dispatch.
                     if _parent_api_mode == "codex_app_server":
                         _parent_api_mode = "codex_responses"
+                    # skip_memory=True keeps the review fork from
+                    # touching external memory plugins (honcho, mem0,
+                    # supermemory, etc.).  Without it, the fork's
+                    # __init__ rebuilds its own _memory_manager from
+                    # config, scoped to the parent's session_id, and
+                    # run_conversation() then leaks the harness prompt
+                    # into the user's real memory namespace via three
+                    # ingestion sites: on_turn_start (cadence + turn
+                    # message), prefetch_all (recall query), and
+                    # sync_all (harness prompt + review output recorded
+                    # as a (user, assistant) turn pair).  Built-in
+                    # MEMORY.md / USER.md state is re-bound from the
+                    # parent below so memory(action="add") writes from
+                    # the review still land on disk; the review just
+                    # has zero side effects on external providers.
                     review_agent = AIAgent(
                         model=self.model,
                         max_iterations=16,
@@ -4343,6 +4412,7 @@ class AIAgent:
                         api_key=_parent_runtime.get("api_key") or None,
                         credential_pool=getattr(self, "_credential_pool", None),
                         parent_session_id=self.session_id,
+                        skip_memory=True,
                     )
                     review_agent._memory_write_origin = "background_review"
                     review_agent._memory_write_context = "background_review"
@@ -5032,63 +5102,6 @@ class AIAgent:
         return False
 
     @staticmethod
-    def _decorate_xai_entitlement_error(detail: str) -> str:
-        """Append a neutral hint when xAI's OAuth surface returns the
-        permission-denied 403.
-
-        xAI's ``/v1/responses`` endpoint replies to several distinct failure
-        modes with the SAME body::
-
-            {"code": "The caller does not have permission to execute the
-             specified operation", "error": "You have either run out of
-             available resources or do not have an active Grok subscription.
-             Manage subscriptions at https://grok.com/?_s=usage or subscribe
-             at https://grok.com/supergrok"}
-
-        That body covers several real causes we cannot distinguish without
-        more info from xAI.  The most common (and least obvious) one is
-        that **X Premium+ does NOT include API access** — only standalone
-        SuperGrok subscribers can use Hermes against xai-oauth.  Lots of
-        users see Grok in their X app, assume it works here too, and hit
-        this 403 with no idea why.  Lead the hint with that.
-
-        Other possible causes:
-          * No Grok subscription at all
-          * SuperGrok tier doesn't include the requested model (e.g.
-            grok-4.3 may need a higher tier)
-          * Monthly quota exhausted (the ``?_s=usage`` URL hints at this)
-
-        Surface the raw xAI text verbatim and point at
-        https://grok.com/?_s=usage where the user can see WHICH applies.
-
-        Matched once per detail string — won't double-decorate if the
-        upstream already concatenated the same text.
-        """
-        if not detail:
-            return detail
-        lower = detail.lower()
-        is_entitlement = (
-            "do not have an active grok subscription" in lower
-            or ("out of available resources" in lower and "grok" in lower)
-            or ("does not have permission" in lower and "grok" in lower)
-        )
-        if not is_entitlement:
-            return detail
-        hint = (
-            " — xAI rejected this OAuth account. NOTE: X Premium+ does NOT "
-            "include xAI API access — only standalone SuperGrok subscribers "
-            "can use this provider. Other possible causes: no Grok "
-            "subscription, your tier doesn't include this model, or your "
-            "quota is exhausted. Check https://grok.com/?_s=usage to see "
-            "which, or run `/model` to switch providers."
-        )
-        # Idempotency: detect prior decoration by a substring unique to the
-        # hint (not present in xAI's own body text).
-        if "X Premium+ does NOT include" in detail:
-            return detail
-        return f"{detail}{hint}"
-
-    @staticmethod
     def _summarize_api_error(error: Exception) -> str:
         """Extract a human-readable one-liner from an API error.
 
@@ -5127,12 +5140,12 @@ class AIAgent:
             if msg:
                 status_code = getattr(error, "status_code", None)
                 prefix = f"HTTP {status_code}: " if status_code else ""
-                return AIAgent._decorate_xai_entitlement_error(f"{prefix}{msg[:300]}")
+                return f"{prefix}{msg[:300]}"
 
         # Fallback: truncate the raw string but give more room than 200 chars
         status_code = getattr(error, "status_code", None)
         prefix = f"HTTP {status_code}: " if status_code else ""
-        return AIAgent._decorate_xai_entitlement_error(f"{prefix}{raw[:500]}")
+        return f"{prefix}{raw[:500]}"
 
     def _mask_api_key_for_logs(self, key: Optional[str]) -> Optional[str]:
         if not key:
@@ -5177,7 +5190,7 @@ class AIAgent:
         if isinstance(body, dict):
             payload = body.get("error") if isinstance(body.get("error"), dict) else body
         if isinstance(payload, dict):
-            reason = payload.get("code") or payload.get("error")
+            reason = payload.get("code") or payload.get("type") or payload.get("error")
             if isinstance(reason, str) and reason.strip():
                 context["reason"] = reason.strip()
             message = payload.get("message") or payload.get("error_description")
@@ -7254,6 +7267,34 @@ class AIAgent:
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")
 
+                # ``error`` SSE frames carry the provider's real failure
+                # reason (subscription / quota / model-not-available /
+                # rejected-reasoning-replay) but never appear in the
+                # ``{completed, incomplete, failed}`` terminal set, so the
+                # raw loop below would silently consume them and end with
+                # "did not emit a terminal response".  xAI in particular
+                # emits ``type=error`` as the FIRST frame for OAuth
+                # accounts whose Grok subscription is missing/exhausted —
+                # the SDK's stream helper raises ``RuntimeError(Expected
+                # to have received response.created before error)`` which
+                # the caller catches and routes here, expecting this
+                # fallback to surface the message.  Synthesize an
+                # APIError-shaped exception so ``_summarize_api_error``
+                # and the credential-pool entitlement detector see the
+                # real text instead of a generic RuntimeError.
+                if event_type == "error":
+                    err_message = getattr(event, "message", None)
+                    if not err_message and isinstance(event, dict):
+                        err_message = event.get("message")
+                    err_code = getattr(event, "code", None)
+                    if not err_code and isinstance(event, dict):
+                        err_code = event.get("code")
+                    err_param = getattr(event, "param", None)
+                    if not err_param and isinstance(event, dict):
+                        err_param = event.get("param")
+                    err_message = (err_message or "stream emitted error event").strip()
+                    raise _StreamErrorEvent(err_message, code=err_code, param=err_param)
+
                 # Collect output items and text deltas for backfill
                 if event_type == "response.output_item.done":
                     done_item = getattr(event, "item", None)
@@ -7625,7 +7666,15 @@ class AIAgent:
             return False, has_retried_429
 
         if effective_reason == FailoverReason.rate_limit:
-            if not has_retried_429:
+            usage_limit_reached = False
+            if error_context:
+                context_reason = str(error_context.get("reason") or "").lower()
+                context_message = str(error_context.get("message") or "").lower()
+                usage_limit_reached = (
+                    "usage_limit_reached" in context_reason
+                    or "usage limit has been reached" in context_message
+                )
+            if not has_retried_429 and not usage_limit_reached:
                 return False, True
             rotate_status = status_code if status_code is not None else 429
             next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
@@ -9154,6 +9203,7 @@ class AIAgent:
                     self.model, base_url=self.base_url,
                     api_key=self.api_key, provider=self.provider,
                     config_context_length=getattr(self, "_config_context_length", None),
+                    custom_providers=self._custom_providers,
                 )
                 self.context_compressor.update_model(
                     model=self.model,
@@ -9190,6 +9240,14 @@ class AIAgent:
         ``gateway/run.py``), so this restoration IS needed there too.
         """
         if not self._fallback_activated:
+            # Reset the chain index even when no fallback was activated this
+            # turn.  Without this, a turn where _try_activate_fallback() was
+            # called but returned False (chain exhausted or provider not
+            # configured) leaves _fallback_index >= len(_fallback_chain) while
+            # _fallback_activated stays False.  The next turn skips this block
+            # entirely, stranding the index and silently blocking all future
+            # fallback attempts for the session.  Fixes #20465.
+            self._fallback_index = 0
             return False
 
         if getattr(self, "_rate_limited_until", 0) > time.monotonic():
@@ -9975,6 +10033,11 @@ class AIAgent:
             if _ephemeral_out is not None:
                 self._ephemeral_max_output_tokens = None
 
+            # Strip image parts for non-vision models that have provider profiles
+            # (e.g. DeepSeek, Kimi). The legacy path below already does this, but
+            # registered providers with profiles were bypassing the strip.
+            api_messages = self._prepare_messages_for_non_vision_model(api_messages)
+
             return _ct.build_kwargs(
                 model=self.model,
                 messages=api_messages,
@@ -10081,6 +10144,7 @@ class AIAgent:
             "openai/",
             "x-ai/",
             "google/gemini-2",
+            "google/gemma-4",
             "qwen/qwen3",
             "tencent/hy3-preview",
             "xiaomi/",
@@ -10378,12 +10442,16 @@ class AIAgent:
         Kimi ``/coding`` and Moonshot thinking mode both require
         ``reasoning_content`` on every assistant tool-call message; omitting
         it causes the next replay to fail with HTTP 400.
+
+        Also detects Kimi models served through third-party providers (e.g.
+        ollama-cloud) by matching ``kimi`` in the model name.
         """
         return (
             self.provider in {"kimi-coding", "kimi-coding-cn"}
             or base_url_host_matches(self.base_url, "api.kimi.com")
             or base_url_host_matches(self.base_url, "moonshot.ai")
             or base_url_host_matches(self.base_url, "moonshot.cn")
+            or "kimi" in (self.model or "").lower()
         )
 
     def _needs_deepseek_tool_reasoning(self) -> bool:
@@ -14169,6 +14237,39 @@ class AIAgent:
                             "interrupted": True,
                         }
                     
+                    # Actionable hint for GitHub Models (Azure) 413 errors.
+                    # The free tier enforces a hard 8K token cap per request,
+                    # which Hermes' system prompt + tool schemas alone exceed.
+                    # Compression can't help — the floor is the system prompt
+                    # itself, not the conversation — so surface a clear "not
+                    # compatible" message instead of looping into three futile
+                    # compression attempts.
+                    if (
+                        status_code == 413
+                        and isinstance(_base, str)
+                        and "models.inference.ai.azure.com" in _base
+                    ):
+                        self._vprint(
+                            f"{self.log_prefix}   💡 GitHub Models free tier (models.inference.ai.azure.com) caps every",
+                            force=True,
+                        )
+                        self._vprint(
+                            f"{self.log_prefix}      request at ~8K tokens. Hermes' system prompt + tool schemas baseline",
+                            force=True,
+                        )
+                        self._vprint(
+                            f"{self.log_prefix}      exceeds that floor, so this endpoint cannot run an agentic loop.",
+                            force=True,
+                        )
+                        self._vprint(
+                            f"{self.log_prefix}      Use the `copilot` provider with a Copilot subscription token (`hermes",
+                            force=True,
+                        )
+                        self._vprint(
+                            f"{self.log_prefix}      setup` → GitHub Copilot), or pick any other provider.",
+                            force=True,
+                        )
+
                     # Check for 413 payload-too-large BEFORE generic 4xx handler.
                     # A 413 is a payload-size error — the correct response is to
                     # compress history and retry, not abort immediately.
