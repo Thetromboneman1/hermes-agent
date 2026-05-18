@@ -184,6 +184,7 @@ AUTHOR_MAP = {
     "santoshhumagain1887@gmail.com": "npmisantosh",
     "39641663+luarss@users.noreply.github.com": "luarss",
     "16263913+zccyman@users.noreply.github.com": "zccyman",
+    "zccyman@users.noreply.github.com": "zccyman",  # PR #26998 (auxiliary fallback chain)
     "ahmetosrak@Ahmet-MacBook-Air.local": "Osraka",
     "98612432+Osraka@users.noreply.github.com": "Osraka",
     "112634774+ryptotalent@users.noreply.github.com": "ryptotalent",
@@ -1057,6 +1058,7 @@ AUTHOR_MAP = {
     "openclaw@agent.local": "29206394",  # PR #22194 salvage (sudo -S brute-force guard, #9590)
     "freedemon@gmail.com": "fr33d3m0n",  # PR #21128 salvage (sudo stdin/askpass DANGEROUS, #17873 cat 4)
     "zhaowh3613@outlook.com": "VinceZcrikl",  # PR #23647 salvage (npm UTF-8 decode on GBK Windows)
+    "abcdjmm970703@gmail.com": "JabberELF",  # PR #20238 seed (session_search dual-mode, evolved into single-shape)
     "anton.kuenzi@gmail.com": "ZeterMordio",  # PR #11754 salvage (zsh completion compdef + _arguments syntax)
     "23yntong@stu.edu.cn": "iuyup",  # PR #6155 salvage (shell=True hardening)
     "86501179+1RB@users.noreply.github.com": "1RB",  # PR #25462 salvage (discord forwarded messages)
@@ -1096,6 +1098,7 @@ AUTHOR_MAP = {
     "4296245+matthewlai@users.noreply.github.com": "matthewlai",
     "109617724+0xchainer@users.noreply.github.com": "0xchainer",  # PR #27154/27138/27147 salvage
     "201800237+kronexoi@users.noreply.github.com": "kronexoi",  # PR #27167 salvage (Teams port fallback)
+    "283442588+EloquentBrush0x@users.noreply.github.com": "EloquentBrush0x",  # PR #26642 salvage (post_setup parity)
     # batch salvage (May 2026 LHF run, group 2)
     "shellybotmoyer@example.com": "shellybotmoyer",  # PR #26661 (kanban --severity >=)
     "coulson@shellybotmoyer.com": "shellybotmoyer",  # PR #25576 (credential_pool ISO rehydrate)
@@ -1137,6 +1140,30 @@ AUTHOR_MAP = {
     "sp_ps@Mac-mini.lan": "phoenixshen",  # PR #26768 (respect user-configured vision model)
     "1594534+phoenixshen@users.noreply.github.com": "phoenixshen",
     "147827411+AhmetArif0@users.noreply.github.com": "AhmetArif0",  # PR #26635 (line proxy env vars)
+    # batch salvage (May 2026 LHF run, group 5)
+    "hari@Hariharans-MacBook-Air-8.local": "haran2001",  # PR #27070 (i18n catalog test)
+    "hariharan15151@gmail.com": "haran2001",  # PR #27068 (qwen3.6-plus 1M context)
+    "56040092+haran2001@users.noreply.github.com": "haran2001",
+    "1472110+ms-alan@users.noreply.github.com": "ms-alan",  # PR #26443 (reload-skills tab completion)
+    "ganlinbupt@gmail.com": "godlin-gh",  # PR #26118 (ACP polished tools)
+    "wesley.simplicio.ext@siemens-energy.com": "wesleysimplicio",  # PR #25777 (xterm.js native selection)
+    "6108320+wesleysimplicio@users.noreply.github.com": "wesleysimplicio",
+    "carryzuo00@gmail.com": "Carry00",  # PR #26851 (doctor SSH env vars)
+    "alaamohanad169-ship-it@users.noreply.github.com": "alaamohanad169-ship-it",  # PR #26036 (telegram typing after send)
+    "vigo@hermes": "hawknewton",  # PR #26294 (bedrock boto3 lazy_deps)
+    "211668+hawknewton@users.noreply.github.com": "hawknewton",
+    "quenvix00@gmail.com": "QuenVix",  # PR #26761/26772 salvage
+    "164776164+QuenVix@users.noreply.github.com": "QuenVix",
+    "262945885+Mind-Dragon@users.noreply.github.com": "Mind-Dragon",  # PR #26966 salvage
+    "soynchuux@gmail.com": "soynchux",  # PR #27060 salvage
+    "209694554+soynchux@users.noreply.github.com": "soynchux",
+    # batch salvage (May 2026 LHF run, group 6 — final)
+    "6666242+bird@users.noreply.github.com": "bird",  # PR #25219 (gateway docker exit-75 restart)
+    "david@loadmagic.ai": "davidcampbelldc",  # PR #26834 (web_server proxy_headers=False)
+    "165905879+davidcampbelldc@users.noreply.github.com": "davidcampbelldc",
+    "hoangv.pham0803@gmail.com": "hehehe0803",  # PR #26212 salvage (codex kanban writable root)
+    "26063003+hehehe0803@users.noreply.github.com": "hehehe0803",
+    "38348871+vaddisrinivas@users.noreply.github.com": "vaddisrinivas",  # PR #26394 salvage (Docker messaging extra)
 }
 
 
