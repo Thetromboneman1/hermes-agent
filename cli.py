@@ -6501,12 +6501,6 @@ class HermesCLI:
         if self.agent:
             self.agent.session_id = new_session_id
             self.agent.session_start = now
-            # Redirect the JSON session log to the new branch session file so
-            # messages written after branching land in the correct file.
-            if hasattr(self.agent, "session_log_file") and hasattr(self.agent, "logs_dir"):
-                self.agent.session_log_file = (
-                    self.agent.logs_dir / f"session_{new_session_id}.json"
-                )
             self.agent.reset_session_state()
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
@@ -14429,13 +14423,54 @@ def main(
             # Only print the final response and parseable session info.
             cli.tool_progress_mode = "off"
             if cli._ensure_runtime_credentials():
-                effective_query = query
+                effective_query: Any = query
                 if single_query_images:
-                    effective_query = cli._preprocess_images_with_vision(
-                        query,
-                        single_query_images,
-                        announce=False,
-                    )
+                    # Honour the same image-routing decision used by the
+                    # interactive path. With a vision-capable model (incl.
+                    # custom-provider models declared via
+                    # `model.supports_vision: true`), attach images natively
+                    # as image_url content parts. Otherwise fall back to the
+                    # text-pipeline (vision_analyze pre-description).
+                    _img_mode = "text"
+                    _build_parts = None
+                    try:
+                        from agent.image_routing import (
+                            build_native_content_parts as _build_parts,  # noqa: F811
+                        )
+                        from agent.image_routing import decide_image_input_mode
+                        from hermes_cli.config import load_config
+
+                        _img_mode = decide_image_input_mode(
+                            (cli.provider or "").strip(),
+                            (cli.model or "").strip(),
+                            load_config(),
+                        )
+                    except Exception:
+                        _img_mode = "text"
+
+                    if _img_mode == "native" and _build_parts is not None:
+                        try:
+                            _parts, _skipped = _build_parts(
+                                query if isinstance(query, str) else "",
+                                [str(p) for p in single_query_images],
+                            )
+                            if any(p.get("type") == "image_url" for p in _parts):
+                                effective_query = _parts
+                            else:
+                                # All images unreadable — text fallback.
+                                effective_query = cli._preprocess_images_with_vision(
+                                    query, single_query_images, announce=False,
+                                )
+                        except Exception:
+                            effective_query = cli._preprocess_images_with_vision(
+                                query, single_query_images, announce=False,
+                            )
+                    else:
+                        effective_query = cli._preprocess_images_with_vision(
+                            query,
+                            single_query_images,
+                            announce=False,
+                        )
                 turn_route = cli._resolve_turn_agent_config(effective_query)
                 if turn_route["signature"] != cli._active_agent_route_signature:
                     cli.agent = None
