@@ -44,7 +44,7 @@ jobs:
       - name: Run ACP regression suite
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh tests/acp/test_session.py tests/acp/test_server.py -q
+          scripts/run_tests.sh tests/acp/test_session.py tests/acp/test_server.py -- -q
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
@@ -76,7 +76,7 @@ jobs:
       - name: Run tests
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short
+          scripts/run_tests.sh tests/ -- -q --ignore=tests/integration --ignore=tests/e2e --tb=short
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
