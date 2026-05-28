@@ -71,6 +71,7 @@ from tools.tool_backend_helpers import (
     coerce_modal_mode,
     has_direct_modal_credentials,
     managed_nous_tools_enabled,
+    nous_tool_gateway_unavailable_message,
     resolve_modal_backend_state,
 )
 
@@ -1118,13 +1119,19 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             if modal_state["managed_mode_blocked"]:
                 raise ValueError(
                     "Modal backend is configured for managed mode, but "
-                    "a paid Nous subscription is required for the Tool Gateway and no direct "
-                    "Modal credentials/config were found. Log in with `hermes model` or "
-                    "choose TERMINAL_MODAL_MODE=direct/auto."
+                    "Nous Tool Gateway access is not currently available and no direct "
+                    "Modal credentials/config were found. "
+                    + nous_tool_gateway_unavailable_message(
+                        "managed Modal execution",
+                    )
+                    + " Choose TERMINAL_MODAL_MODE=direct/auto to use direct Modal credentials."
                 )
             if modal_state["mode"] == "managed":
                 raise ValueError(
-                    "Modal backend is configured for managed mode, but the managed tool gateway is unavailable."
+                    "Modal backend is configured for managed mode, but the managed tool gateway is unavailable. "
+                    + nous_tool_gateway_unavailable_message(
+                        "managed Modal execution",
+                    )
                 )
             if modal_state["mode"] == "direct":
                 raise ValueError(
@@ -1901,6 +1908,85 @@ def terminal_tool(
                         "that never exit (servers, watchers, daemons)."
                     )
 
+                # Nudge: homebrewed CI watcher built from `gh pr view`
+                # `--json statusCheckRollup` or `gh pr checks` piped through
+                # `jq` is the #1 cause of silent CI-watcher failures in
+                # hermes-agent dev work. May 2026 PRs that surfaced this
+                # exact failure mode: #31329, #31448, #31695, #31709, #31745,
+                # #32264, #33131. Failure modes seen:
+                #   * `gh pr view --json statusCheckRollup --jq ...` with
+                #     `from_entries` choking on null `conclusion` keys, loop
+                #     silently exits with empty status, never terminates.
+                #   * `for i in $(seq 1 60); do ... 2>&1` block-buffered stdout
+                #     never flushed to background-process capture; SIGTERM
+                #     cuts the buffer before flush; `process(action='log')`
+                #     returns total_lines=0 forever.
+                #   * conclusion vs. status field confusion: filtering for
+                #     `PENDING` in `.conclusion` while in-progress checks have
+                #     empty conclusion → poller declares all-green while 18/23
+                #     checks still IN_PROGRESS.
+                #   * grepping for TTY-only banners ("All checks were
+                #     successful") that never appear when stdout is piped.
+                # The canonical patterns in the green-ci-policy skill avoid
+                # every one of these — drive the loop off exit codes or on
+                # tab-separated `awk -F"\t" "$2==\"pending\""` (column 2).
+                # The detector here is deliberately narrow: it flags the
+                # statusCheckRollup JSON-API path and the `gh pr checks` +
+                # jq combination, but NOT the canonical column-2 awk
+                # poller (which uses awk on tabs, not as a generic
+                # stdout parser). When we detect the homebrew shape, point
+                # the agent at the canonical snippet rather than letting
+                # it ship another broken poller.
+                if background and command:
+                    _gh = ("gh pr view" in command or "gh pr checks" in command)
+                    _has_jq = (
+                        " jq " in command or "| jq" in command or "$(jq" in command
+                    )
+                    _bad_shape = (
+                        # The JSON-API anti-pattern. Even without jq, going
+                        # through `--json statusCheckRollup` + parsing puts
+                        # you in conclusion-vs-status field hell.
+                        "statusCheckRollup" in command
+                        # gh pr checks piped to jq is also wrong — `gh pr
+                        # checks` doesn't emit JSON, so any `| jq` here is
+                        # confused intent. The canonical column-2 poller
+                        # uses awk-on-tabs, not jq.
+                        or (_gh and _has_jq)
+                    )
+                    if _bad_shape:
+                        existing = result_data.get("hint", "")
+                        canonical_hint = (
+                            "This looks like a homebrewed CI poller built from "
+                            "`gh pr view --json statusCheckRollup` and/or "
+                            "`gh pr checks | jq`. That shape has burned us "
+                            "repeatedly in hermes-agent dev work (PRs #31329, "
+                            "#31448, #31695, #31709, #31745, #32264, #33131) — "
+                            "stdout buffering kills output capture, jq null-key "
+                            "edge cases silently exit the loop, conclusion-vs-"
+                            "status field confusion exits early with bogus "
+                            "all-green verdicts, TTY-only summary banners "
+                            "never appear when piped. Use the canonical "
+                            "snippets in the green-ci-policy skill instead: "
+                            "the exit-code-driven `gh pr checks $PR >/dev/null` "
+                            "(rc 0 = green, 8 = pending, else fail) for "
+                            "exit-on-first-fail behavior, or the column-2 "
+                            "awk-on-tabs poller "
+                            "(`awk -F\"\\t\" \"$2==\\\"pending\\\"\"`) for "
+                            "sharded matrices. Load skill_view("
+                            "name='github/hermes-agent-dev', "
+                            "file_path='references/green-ci-policy.md') for "
+                            "the verbatim snippets. If you must roll a custom "
+                            "loop with rich structured output, write each tick "
+                            "to a known file (`tee -a /tmp/ci.log`) and rely "
+                            "on `process(action='log')` to read THAT file — "
+                            "do not rely on background-process stdout capture "
+                            "for line-buffered shell loops."
+                        )
+                        result_data["hint"] = (
+                            existing + "\n\n" + canonical_hint if existing
+                            else canonical_hint
+                        )
+
                 # Populate routing metadata on the session so that
                 # watch-pattern and completion notifications can be
                 # routed back to the correct chat/thread.
@@ -2135,16 +2221,21 @@ def check_terminal_requirements() -> bool:
                 if modal_state["managed_mode_blocked"]:
                     logger.error(
                         "Modal backend selected with TERMINAL_MODAL_MODE=managed, but "
-                        "a paid Nous subscription is required for the Tool Gateway and no direct "
-                        "Modal credentials/config were found. Log in with `hermes model` "
-                        "or choose TERMINAL_MODAL_MODE=direct/auto."
+                        "Nous Tool Gateway access is not currently available and no direct "
+                        "Modal credentials/config were found. %s Choose "
+                        "TERMINAL_MODAL_MODE=direct/auto to use direct Modal credentials.",
+                        nous_tool_gateway_unavailable_message(
+                            "managed Modal execution",
+                        ),
                     )
                     return False
                 if modal_state["mode"] == "managed":
                     logger.error(
                         "Modal backend selected with TERMINAL_MODAL_MODE=managed, but the managed "
-                        "tool gateway is unavailable. Configure the managed gateway or choose "
-                        "TERMINAL_MODAL_MODE=direct/auto."
+                        "tool gateway is unavailable. %s",
+                        nous_tool_gateway_unavailable_message(
+                            "managed Modal execution",
+                        ),
                     )
                     return False
                 elif modal_state["mode"] == "direct":

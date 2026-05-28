@@ -916,6 +916,15 @@ display:
   # Toggle at runtime with /verbose in the CLI
   tool_progress: all
 
+  # Per-platform defaults can be quieter than the global setting. Telegram
+  # tunes for mobile: tool_progress and busy_ack_detail default off (no
+  # per-tool breadcrumb stream, no "iteration 21/60" debug detail in busy
+  # acks or heartbeats), but interim_assistant_messages and
+  # long_running_notifications STAY ON so the user has real signal between
+  # turn start and final answer (mid-turn assistant commentary + a single
+  # edit-in-place "⏳ Working — N min" heartbeat). Override under
+  # display.platforms.telegram.
+
   # Auto-cleanup of temporary progress bubbles after the final response lands.
   # On platforms that support message deletion (currently Telegram), this
   # removes the tool-progress bubble, "⏳ Still working..." notices, and
@@ -938,6 +947,22 @@ display:
   #   true:  Send mid-turn assistant updates as separate messages (default)
   #   false: Only send the final response
   interim_assistant_messages: true
+
+  # Gateway-only long-running status heartbeats.
+  # When false, the platform does not receive periodic "⏳ Working — N min"
+  # notifications even if agent.gateway_notify_interval is non-zero. The
+  # heartbeat edits a single message in place (where the adapter supports
+  # editing) instead of posting a new bubble each interval.
+  # Default: true everywhere, including Telegram (silent agents are worse
+  # than a single edit-in-place heartbeat).
+  long_running_notifications: true
+
+  # Include detailed iteration/tool/status context in busy acknowledgments
+  # and long-running heartbeats. When true, busy acks show "iteration 21/60,
+  # terminal, 10 min" and the heartbeat shows "⏳ Working — 12 min,
+  # iteration 21/60, terminal". When false (Telegram default), both stay
+  # terse: "Interrupting current task" and "⏳ Working — 12 min, terminal".
+  busy_ack_detail: true
 
   # What Enter does when Hermes is already busy (CLI and gateway platforms).
   #   interrupt: Interrupt the current run and redirect Hermes (default)
@@ -1098,45 +1123,45 @@ display:
 #
 # hooks_auto_accept: false
 
+
 # =============================================================================
-# Local Hardware Tuning (Ollama / LM Studio / vLLM)
+# Web Dashboard
 # =============================================================================
-# Configuration profile for running Hermes with local LLMs on consumer hardware.
-# This example uses Qwen 14B via Ollama, but works with any local inference server.
+# OAuth gate configuration for `hermes dashboard --host <non-loopback>`.
+# The bundled Nous Portal plugin reads these on startup; settings here are
+# the canonical surface. Each can be overridden by an environment variable:
 #
-# IMPORTANT: Some Reddit/forum threads reference non-existent config keys:
-#   - "long_cache" ❌ NOT a Hermes key (use context_length instead)
-#   - "max_context" ❌ NOT a Hermes key (use context_length instead)
-#   - "api_mode" ❌ NOT a Hermes key (use provider: "custom" instead)
-# This config shows the VALID way to set up local models.
+#   dashboard.oauth.client_id   <-  HERMES_DASHBOARD_OAUTH_CLIENT_ID
+#   dashboard.oauth.portal_url  <-  HERMES_DASHBOARD_PORTAL_URL
+#   dashboard.public_url        <-  HERMES_DASHBOARD_PUBLIC_URL
 #
-# Uncomment and adapt the section below for local hardware:
+# Env wins when set to a non-empty value. This is what Fly.io's platform-
+# secret injection uses to push per-deploy client_ids without needing to
+# bake a config.yaml into the image. Empty env values are treated as unset
+# so a provisioned-but-not-populated secret can't shadow a valid entry here.
 #
-# model:
-#   default: "qwen:14b"
-#   provider: "custom"
-#   base_url: "http://localhost:11434/v1"  # Ollama default
-#   # For LM Studio, use: http://localhost:1234/v1
-#   # For vLLM, use: http://localhost:8000/v1
-#   context_length: 32768  # Adjust based on your model and VRAM
+# Local dev / on-prem deploys should typically set these via config.yaml
+# (the ~/.hermes/.env file is reserved for API keys and secrets).
 #
-# agent:
-#   # Enable tool-use guidance for local models (improves JSON tool calling)
-#   tool_use_enforcement: true
-#   # Compression settings for limited VRAM
-#   compression: true
-#   compress_ratio: 0.5  # Keep 50% of history; adjust for your model
-#   compress_token_threshold: 2000  # Trigger compression at 2k tokens
-#   compress_before_each_turn: true  # Compress before every LLM call
+# dashboard:
+#   oauth:
+#     client_id: ""    # agent:{instance_id}; Portal provisions this at deploy
+#     portal_url: ""   # blank → default https://portal.nousresearch.com
 #
-# gateway:
-#   # Disable gateway features that add overhead
-#   default_gateway: ""
-#   enable_gateway: false
-#
-# execution:
-#   # Reduce parallelism on limited hardware
-#   max_concurrent_tools: 2
-#   tool_timeout: 30
-#
-# personality: "concise"  # Shorter responses = faster inference
+#   # Force the absolute base URL the OAuth callback (and any other public
+#   # URL the dashboard hands to external systems) is built from. Set this
+#   # for deploys behind reverse proxies that don't reliably forward
+#   # X-Forwarded-Host / X-Forwarded-Proto / X-Forwarded-Prefix (manual
+#   # nginx setups, on-prem ingresses, custom-domain Fly deploys without
+#   # full proxy header chains).
+#   #
+#   # When set, the value is the complete authority: scheme + host +
+#   # optional path prefix (e.g. "https://example.com/hermes"). The OAuth
+#   # callback URL becomes "<public_url>/auth/callback" — X-Forwarded-Prefix
+#   # is IGNORED on this code path because the operator has explicitly
+#   # declared the public URL and we no longer need to guess.
+#   #
+#   # Leave empty to use the existing proxy-header reconstruction (the
+#   # default — works on Fly.io out of the box).
+#   #
+#   #   public_url: "https://example.com/hermes"
