@@ -5,7 +5,9 @@ joaompfp.hermes-ai-agent VS Code extension picker.
 Sources (in priority order):
   1. ~/.hermes/config.yaml — model.default + custom_providers + fallback_providers
   2. Live model lists from each reachable custom_providers base_url (/v1/models),
-     with a 2s timeout (skipped silently on failure).
+      with a 2s timeout (skipped silently on failure).
+  3. Local `docker model ls` inventory (best-effort), used to keep Docker
+      Model Runner entries visible even when /v1/models only exposes loaded IDs.
 
 The output JSON has shape::
 
@@ -25,6 +27,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
@@ -48,17 +52,30 @@ KNOWN_LABELS = {
     "ai/qwen3-coder-next": "Qwen3 Coder Next  ·  Docker llama.cpp (rollback)",
     "ai/qwen3:8B-Q4_K_M": "Qwen3 8B  ·  Q4_K_M  ·  Docker llama.cpp",
     "ai/qwen3-embedding": "Qwen3 Embedding  ·  Docker llama.cpp",
+    "ai/qwen3-vllm": "Qwen3 vLLM  ·  Docker Model Runner",
+    "qwen3-vllm": "Qwen3 vLLM  ·  Docker Model Runner",
+    "hf.co/Qwen/Qwen3-0.6B": "Qwen3 0.6B  ·  vLLM",
+    "huggingface.co/qwen/qwen3-0.6b": "Qwen3 0.6B  ·  vLLM",
+    "hf.co/Qwen/Qwen2.5-1.5B-Instruct": "Qwen2.5 1.5B Instruct  ·  vLLM",
+    "huggingface.co/qwen/qwen2.5-1.5b-instruct": "Qwen2.5 1.5B Instruct  ·  vLLM",
+    "hf.co/google/gemma-4-26B-A4B": "Gemma 4 26B A4B  ·  vLLM",
+    "huggingface.co/google/gemma-4-26b-a4b": "Gemma 4 26B A4B  ·  vLLM",
+    "hf.co/google/gemma-4-26B-A4B-it": "Gemma 4 26B A4B Instruct  ·  vLLM",
+    "huggingface.co/google/gemma-4-26b-a4b-it": "Gemma 4 26B A4B Instruct  ·  vLLM",
 }
 
 # Provider names (custom_providers[].name) whose endpoint is the Docker
 # model-runner. We always advertise every entry from KNOWN_LABELS for these
 # providers, because Docker's /v1/models only returns models that are
 # currently loaded — not everything available in `docker model ls`.
-DOCKER_RUNNER_PROVIDERS = {"local-docker"}
+DOCKER_RUNNER_PROVIDERS = {"local-docker", "local-dmr-vllm", "docker-model-runner"}
 
 # Friendly group names per provider key.
 GROUP_LABELS = {
     "local-docker": "Local Docker LLM",
+    "local-dmr-vllm": "Local Docker Model Runner (vLLM)",
+    "docker-model-runner": "Local Docker Model Runner",
+    "local-mlx-openai": "Local MLX (OpenAI-compatible)",
     "omniroute-local": "OmniRoute (local)",
     "omniroute-docker": "OmniRoute (Docker host)",
     "ollama-cloud": "Ollama Cloud",
@@ -66,10 +83,50 @@ GROUP_LABELS = {
 
 GROUP_PRIORITY = {
     "local-docker": 0,
-    "omniroute-local": 1,
-    "omniroute-docker": 2,
-    "ollama-cloud": 3,
+    "local-dmr-vllm": 0,
+    "docker-model-runner": 0,
+    "local-mlx-openai": 1,
+    "omniroute-local": 2,
+    "omniroute-docker": 3,
+    "ollama-cloud": 4,
 }
+
+
+def _list_docker_models(timeout: float = 4.0) -> list[str]:
+    """Best-effort model inventory from `docker model ls`."""
+    try:
+        proc = subprocess.run(
+            ["docker", "model", "ls"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return []
+
+    if proc.returncode != 0 or not proc.stdout:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("MODEL") and "PARAMETERS" in line:
+            continue
+        if line.startswith("Docker Model Runner"):
+            continue
+        cols = [c.strip() for c in re.split(r"\s{2,}", line) if c.strip()]
+        if not cols:
+            continue
+        model_id = cols[0]
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        out.append(model_id)
+    return out
 
 
 def _fetch_models(base_url: str, timeout: float = 2.0) -> list[str]:
@@ -121,6 +178,7 @@ def _build_groups(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     ) or ""
 
     groups: list[dict[str, Any]] = []
+    docker_models = _list_docker_models()
 
     # Per custom provider: live-probe; fall back to per-entry model;
     # final fall back to model.default if base_url matches.
@@ -147,6 +205,8 @@ def _build_groups(cfg: dict[str, Any]) -> list[dict[str, Any]]:
         # For Docker model-runner endpoints, always seed with every known
         # local model ID so the picker doesn't shrink when models unload.
         if name in DOCKER_RUNNER_PROVIDERS:
+            for mid in docker_models:
+                _add(mid)
             for mid in KNOWN_LABELS:
                 _add(mid)
 
@@ -194,6 +254,37 @@ def _build_groups(cfg: dict[str, Any]) -> list[dict[str, Any]]:
                 "_provider_name": name,
             }
         )
+
+    # If docker models exist but no explicit Docker provider is configured,
+    # still expose a dedicated group so the picker reflects local runtime state.
+    has_docker_group = any(
+        str(g.get("_provider_name") or "") in DOCKER_RUNNER_PROVIDERS for g in groups
+    )
+    if docker_models and not has_docker_group:
+        items: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+
+        def _add_docker(mid: str) -> None:
+            mid = (mid or "").strip()
+            if not mid or mid in seen_ids:
+                return
+            seen_ids.add(mid)
+            items.append({"id": mid, "label": _label_for(mid)})
+
+        for mid in docker_models:
+            _add_docker(mid)
+        for mid in KNOWN_LABELS:
+            _add_docker(mid)
+
+        if items:
+            groups.append(
+                {
+                    "label": GROUP_LABELS.get("docker-model-runner", "Local Docker Model Runner"),
+                    "prefix": "custom",
+                    "items": items,
+                    "_provider_name": "docker-model-runner",
+                }
+            )
 
     # Ensure model.default appears at least once (top of first group).
     if default_model:
