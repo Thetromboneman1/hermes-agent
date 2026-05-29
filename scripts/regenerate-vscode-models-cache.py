@@ -54,6 +54,8 @@ KNOWN_LABELS = {
     "ai/qwen3-embedding": "Qwen3 Embedding  ·  Docker llama.cpp",
     "ai/qwen3-vllm": "Qwen3 vLLM  ·  Docker Model Runner",
     "qwen3-vllm": "Qwen3 vLLM  ·  Docker Model Runner",
+    "ai/gemma3": "Gemma 3 llama.cpp  ·  Docker Model Runner",
+    "gemma3": "Gemma 3 llama.cpp  ·  Docker Model Runner",
     "hf.co/Qwen/Qwen3-0.6B": "Qwen3 0.6B  ·  vLLM",
     "huggingface.co/qwen/qwen3-0.6b": "Qwen3 0.6B  ·  vLLM",
     "hf.co/Qwen/Qwen2.5-1.5B-Instruct": "Qwen2.5 1.5B Instruct  ·  vLLM",
