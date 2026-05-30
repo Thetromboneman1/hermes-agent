@@ -1243,8 +1243,23 @@ def _read_nous_auth() -> Optional[dict]:
 
 
 def _nous_api_key(provider: dict) -> str:
-    """Extract the Nous runtime credential from the compatibility field."""
-    return provider.get("agent_key") or provider.get("access_token", "")
+    """Extract a usable Nous inference JWT from stored auth state."""
+    from hermes_cli.auth import _nous_invoke_jwt_is_usable
+
+    for token_key, expiry_key in (
+        ("agent_key", "agent_key_expires_at"),
+        ("access_token", "expires_at"),
+    ):
+        token = provider.get(token_key)
+        if not isinstance(token, str) or not token.strip():
+            continue
+        if _nous_invoke_jwt_is_usable(
+            token,
+            scope=provider.get("scope"),
+            expires_at=provider.get(expiry_key),
+        ):
+            return token
+    return ""
 
 
 def _nous_base_url() -> str:
@@ -1256,25 +1271,16 @@ def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[
     """Return fresh Nous runtime credentials when available.
 
     This mirrors the main agent's 401 recovery path and keeps auxiliary
-    clients aligned with the singleton auth store + JWT/mint flow instead of
+    clients aligned with the singleton auth store + JWT refresh flow instead of
     relying only on whatever raw tokens happen to be sitting in auth.json
     or the credential pool.
     """
     try:
-        from hermes_cli.auth import (
-            NOUS_INFERENCE_AUTH_MODE_AUTO,
-            NOUS_INFERENCE_AUTH_MODE_LEGACY,
-            resolve_nous_runtime_credentials,
-        )
+        from hermes_cli.auth import resolve_nous_runtime_credentials
 
         creds = resolve_nous_runtime_credentials(
-            min_key_ttl_seconds=max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))),
             timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
-            inference_auth_mode=(
-                NOUS_INFERENCE_AUTH_MODE_LEGACY
-                if force_refresh
-                else NOUS_INFERENCE_AUTH_MODE_AUTO
-            ),
+            force_refresh=force_refresh,
         )
     except Exception as exc:
         logger.debug("Auxiliary Nous runtime credential resolution failed: %s", exc)
@@ -1558,13 +1564,9 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
         _mark_provider_unhealthy("nous", ttl=60)
         return None, None
     if runtime is None and nous:
-        # Runtime credential mint failed but stored Nous auth is still present.
-        # Falls back to the raw stored token below; surface a debug line so
-        # operators investigating expired/invalid sessions have a breadcrumb,
-        # without blocking the fallback path the rest of this function relies on.
         logger.debug(
-            "Auxiliary Nous: runtime credential mint failed; falling back to "
-            "stored auth.json token."
+            "Auxiliary Nous: runtime JWT refresh failed; checking stored "
+            "auth.json token."
         )
     global auxiliary_is_nous
     auxiliary_is_nous = True
@@ -1602,6 +1604,13 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
         api_key, base_url = runtime
     else:
         api_key = _nous_api_key(nous or {})
+        if not api_key:
+            logger.warning(
+                "Auxiliary Nous client unavailable: no usable inference JWT found "
+                "(run: hermes auth add nous)."
+            )
+            _mark_provider_unhealthy("nous", ttl=60)
+            return None, None
         base_url = str((nous or {}).get("inference_base_url") or _nous_base_url()).rstrip("/")
     return (
         OpenAI(
@@ -2725,15 +2734,11 @@ def _refresh_provider_credentials(provider: str) -> bool:
             _evict_cached_clients(normalized)
             return True
         if normalized == "nous":
-            from hermes_cli.auth import (
-                NOUS_INFERENCE_AUTH_MODE_LEGACY,
-                resolve_nous_runtime_credentials,
-            )
+            from hermes_cli.auth import resolve_nous_runtime_credentials
 
             creds = resolve_nous_runtime_credentials(
-                min_key_ttl_seconds=max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))),
                 timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
-                inference_auth_mode=NOUS_INFERENCE_AUTH_MODE_LEGACY,
+                force_refresh=True,
             )
             if not str(creds.get("api_key", "") or "").strip():
                 return False
@@ -4720,24 +4725,23 @@ def _build_call_kwargs(
         kwargs["temperature"] = temperature
 
     if max_tokens is not None:
-        # Codex adapter handles max_tokens internally; OpenRouter/Nous use max_tokens.
-        # Direct OpenAI api.openai.com with newer models needs max_completion_tokens.
-        # ZAI vision models (glm-4v-flash, glm-4v-plus, etc.) reject max_tokens with
-        # error code 1210 ("API 调用参数有误") on multimodal requests — skip it.
-        _model_lower = (model or "").lower()
-        _skip_max_tokens = (
-            provider == "zai"
-            and ("4v" in _model_lower or "5v" in _model_lower or "-v" in _model_lower)
+        # We do NOT cap output by default. Most chat-completions providers treat
+        # an omitted max_tokens as "use the model's max output", which is what we
+        # want for auxiliary tasks (compression summaries, titles, vision, etc.) —
+        # an explicit cap only risks truncating a summary or 400-ing on providers
+        # that reject the parameter outright (e.g. GitHub Copilot / newer OpenAI
+        # GPT-5 models require max_completion_tokens, not max_tokens; ZAI vision
+        # models reject it entirely with error 1210). Omitting it sidesteps all of
+        # those wire-format quirks at once.
+        #
+        # The one exception is the Anthropic Messages wire (MiniMax and any
+        # ``/anthropic`` endpoint reached through the OpenAI SDK wrapper), where
+        # max_tokens is a MANDATORY field — omitting it is a hard 400. Keep it only
+        # there.
+        _effective_base = base_url or (
+            _current_custom_base_url() if provider == "custom" else ""
         )
-        if _skip_max_tokens:
-            pass  # ZAI vision models do not accept max_tokens
-        elif provider == "custom":
-            custom_base = base_url or _current_custom_base_url()
-            if base_url_hostname(custom_base) == "api.openai.com":
-                kwargs["max_completion_tokens"] = max_tokens
-            else:
-                kwargs["max_tokens"] = max_tokens
-        else:
+        if _is_anthropic_compat_endpoint(provider, _effective_base):
             kwargs["max_tokens"] = max_tokens
 
     if tools:
