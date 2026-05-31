@@ -1283,6 +1283,18 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
                 api_msg.pop(internal_field, None)
+            # Strict OpenAI-compatible gateways (Fireworks-backed OpenCode Go,
+            # Mistral, Moonshot/Kimi) reject any message key outside the Chat
+            # Completions schema. The main loop drops these via
+            # ChatCompletionsTransport.convert_messages(), but the summary path
+            # hand-builds messages and calls chat.completions.create() directly,
+            # bypassing the transport — so mirror that sanitization here:
+            # tool_name (SQLite FTS bookkeeping), the codex_* reasoning carriers,
+            # and every Hermes-internal underscore-prefixed scaffolding key.
+            for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items"):
+                api_msg.pop(schema_foreign, None)
+            for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
+                api_msg.pop(internal_key, None)
             if _needs_sanitize:
                 agent._sanitize_tool_calls_for_strict_api(api_msg)
             api_messages.append(api_msg)
@@ -1738,6 +1750,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # call starting at the same index and redirect it to a fresh slot.
         _last_id_at_idx: dict = {}      # raw_index -> last seen non-empty id
         _active_slot_by_idx: dict = {}  # raw_index -> current slot in tool_calls_acc
+        # Per-slot latch: set once a slot is positively identified as a
+        # cumulative-resend stream (a delta that is a strict superset of the
+        # accumulated buffer).  Until latched, deltas are appended normally;
+        # after latching, the buffer is replaced and exact-duplicate deltas
+        # are dropped.  See the argument-accumulation block below (#35592).
+        _cumulative_args_slot: set = set()
         finish_reason = None
         model_name = None
         role = "assistant"
@@ -1855,7 +1873,44 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # Vercel AI patterns) is immune to this.
                             entry["function"]["name"] = tc_delta.function.name
                         if tc_delta.function.arguments:
-                            entry["function"]["arguments"] += tc_delta.function.arguments
+                            # Argument deltas are normally incremental
+                            # fragments (OpenAI spec), so the default is to
+                            # concatenate.  But some OpenAI-compatible
+                            # providers (DeepSeek / Baidu Qianfan, #35592)
+                            # operate in *cumulative* mode: each chunk
+                            # resends the full arguments-so-far instead of
+                            # the new fragment.  Blind += turns that into
+                            # '{...}{...}{...}', corrupting the tool call.
+                            #
+                            # Detect cumulative mode per-slot: in cumulative
+                            # mode the new delta is a superset that starts
+                            # with everything accumulated so far (monotonic
+                            # growth), and an exact resend equals it.
+                            # Incremental fragments are JSON suffixes that do
+                            # NOT restate the accumulated prefix, so this is
+                            # unambiguous on the full buffer (not a partial
+                            # per-chunk guess).
+                            _new = tc_delta.function.arguments
+                            _prev = entry["function"]["arguments"]
+                            if not _prev:
+                                entry["function"]["arguments"] = _new
+                            elif len(_new) > len(_prev) and _new.startswith(_prev):
+                                # Strict superset of the accumulated buffer —
+                                # the unambiguous cumulative-resend signature.
+                                # Latch the slot and replace (don't append).
+                                _cumulative_args_slot.add(idx)
+                                entry["function"]["arguments"] = _new
+                            elif idx in _cumulative_args_slot and _new == _prev:
+                                # Already a confirmed cumulative slot and this
+                                # is an exact full resend — drop the duplicate.
+                                pass
+                            else:
+                                # Incremental fragment — normal append.  Note
+                                # an exact-equal delta on a NON-latched slot is
+                                # treated as a real fragment, never silently
+                                # dropped, so genuine incremental streams are
+                                # untouched.
+                                entry["function"]["arguments"] = _prev + _new
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
                         extra = (tc_delta.model_extra or {}).get("extra_content")
