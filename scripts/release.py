@@ -45,7 +45,11 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "copii.list@gmail.com": "stremtec",
+    "prostoandrei9@gmail.com": "vladkvlchk",
+    "116314616+ThyFriendlyFox@users.noreply.github.com": "ThyFriendlyFox",
     "liliangjya@gmail.com": "truenorth-lj",
+    "16943149+nepenth@users.noreply.github.com": "nepenth",
     "ben.bartholomew@vectorize.io": "benfrank241",
     "74339271+SaguaroDev@users.noreply.github.com": "SaguaroDev",
     "subw3@mail2.sysu.edu.cn": "Subway2023",
@@ -66,6 +70,7 @@ AUTHOR_MAP = {
     "524706+Twanislas@users.noreply.github.com": "Twanislas",
     "9592417+adam91holt@users.noreply.github.com": "adam91holt",
     "kchuang1015@users.noreply.github.com": "kchuang1015",
+    "maheshthedev@gmail.com": "MaheshtheDev",
     "kyssta-exe@users.noreply.github.com": "kyssta-exe",
     "45688690+fujinice@users.noreply.github.com": "fujinice",
     "276689385+carltonawong@users.noreply.github.com": "carltonawong",
@@ -917,6 +922,7 @@ AUTHOR_MAP = {
     "54813621+xxxigm@users.noreply.github.com": "xxxigm",
     "asurla@nvidia.com": "anniesurla",
     "kchantharuan@nvidia.com": "nv-kasikritc",
+    "bbednarski@nvidia.com": "bbednarski9",
     "limkuan24@gmail.com": "WideLee",
     "aviralarora002@gmail.com": "AviArora02-commits",
     "draixagent@gmail.com": "draix",
