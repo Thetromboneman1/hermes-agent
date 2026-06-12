@@ -489,6 +489,23 @@ PLATFORM_HINTS = {
         "files arrive as downloadable documents. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as photos."
     ),
+    "whatsapp_cloud": (
+        "You are on a text messaging communication platform, WhatsApp "
+        "(via Meta's official Business Cloud API). Standard markdown "
+        "(**bold**, ~~strike~~, # headers, [links](url)) is auto-converted "
+        "to WhatsApp's native syntax (*bold*, ~strike~, etc.) — feel free "
+        "to write in markdown. Tables are NOT supported — prefer bullet "
+        "lists or labeled key:value pairs. "
+        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "in your response. Images (.jpg, .png) become photo attachments, "
+        "videos (.mp4) play inline, audio (.mp3, .ogg) sends as voice/audio "
+        "messages, other files arrive as documents. Image URLs in markdown "
+        "format ![alt](url) also work. "
+        "IMPORTANT: this platform has a 24-hour conversation window — if the "
+        "user hasn't messaged in 24h, free-form replies are refused by Meta "
+        "(error 131047). This rarely matters for live chat, but is worth "
+        "knowing if you're scheduling a delayed message."
+    ),
     "telegram": (
         "You are on a text messaging communication platform, Telegram. "
         "Standard markdown is automatically converted to Telegram format. "
@@ -1101,7 +1118,7 @@ def _skill_should_show(
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
-    hidden_categories: "frozenset[str] | None" = None,
+    compact_categories: "frozenset[str] | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1117,11 +1134,11 @@ def build_skills_system_prompt(
     are read-only — they appear in the index but new skills are always created
     in the local dir.  Local skills take precedence when names collide.
 
-    ``hidden_categories`` (e.g. from the coding posture — see
-    agent/coding_context.py) prunes whole categories from the rendered index.
-    Discovery-only: the snapshot stores everything, ``skills_list`` /
-    ``skill_view`` still reach every skill, and a footer note tells the model
-    the full catalog exists.
+    ``compact_categories`` (e.g. from the coding posture — see
+    agent/coding_context.py) demotes whole categories to a names-only line in
+    the rendered index. Nothing is ever hidden: every skill name stays
+    visible and loadable via ``skill_view`` / ``skills_list``; only the
+    descriptions are dropped, and a footer note explains the demotion.
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
@@ -1146,7 +1163,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
-        tuple(sorted(hidden_categories or ())),
+        tuple(sorted(compact_categories or ())),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1280,38 +1297,44 @@ def build_skills_system_prompt(
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
 
-    # Posture-driven category pruning (e.g. non-coding skills while pairing on
-    # code). Match on the top-level category segment so nested categories
-    # ("social-media/twitter") are pruned with their parent.
+    # Posture-driven category demotion (e.g. non-coding skills while pairing
+    # on code). Demoted categories stay in the index as a single names-only
+    # line — descriptions are dropped to cut noise, but every skill name
+    # remains visible so memory-anchored recall ("load <name>") keeps working.
+    # NEVER remove entries entirely: agent-created skills are the model's
+    # project memory, and models don't reach for skills_list to rediscover
+    # what the index stops showing them. Match on the top-level category
+    # segment so nested categories ("social-media/twitter") are demoted with
+    # their parent.
+    demoted = frozenset(
+        cat for cat in skills_by_category
+        if cat.split("/", 1)[0] in (compact_categories or frozenset())
+    )
+
     hidden_note = ""
-    if hidden_categories:
-        before = sum(len(v) for v in skills_by_category.values())
-        skills_by_category = {
-            cat: entries
-            for cat, entries in skills_by_category.items()
-            if cat.split("/", 1)[0] not in hidden_categories
-        }
-        pruned = before - sum(len(v) for v in skills_by_category.values())
-        if pruned:
-            hidden_note = (
-                f"\n(Note: {pruned} skill(s) in categories unrelated to the "
-                "current coding context are not listed here. The full catalog "
-                "is available via skills_list if the user asks for something "
-                "outside this list.)"
-            )
+    if demoted:
+        hidden_note = (
+            "\n(Categories marked [names only] are outside the current coding "
+            "context, so their descriptions are omitted — the skills work "
+            "normally and load with skill_view(name) as usual.)"
+        )
 
     if not skills_by_category:
         result = ""
     else:
         index_lines = []
         for category in sorted(skills_by_category.keys()):
+            # Deduplicate and sort skills within each category
+            seen = set()
+            if category in demoted:
+                names = sorted({name for name, _ in skills_by_category[category]})
+                index_lines.append(f"  {category} [names only]: {', '.join(names)}")
+                continue
             cat_desc = category_descriptions.get(category, "")
             if cat_desc:
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
-            seen = set()
             for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
                 if name in seen:
                     continue
@@ -1412,13 +1435,13 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 
     lines = [
         "# Nous Subscription",
-        "Nous subscription includes managed web tools (Firecrawl), image generation (FAL), OpenAI TTS, and browser automation (Browser Use) by default. Modal execution is optional.",
+        "Nous subscription includes managed web tools (Firecrawl), image generation (FAL), OpenAI TTS, OpenAI Whisper STT, and browser automation (Browser Use) by default. Modal execution is optional.",
         "Current capability status:",
     ]
     lines.extend(_status_line(feature) for feature in features.items())
     lines.extend(
         [
-            "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, or Browser-Use API keys.",
+            "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys.",
             "If the user is not subscribed and asks for a capability that Nous subscription would unlock or simplify, suggest Nous subscription as one option alongside direct setup or local alternatives.",
             "Do not mention subscription unless the user asks about it or it directly solves the current missing capability.",
             "Useful commands: hermes setup, hermes setup tools, hermes setup terminal, hermes status.",
