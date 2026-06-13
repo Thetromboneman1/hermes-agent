@@ -216,25 +216,21 @@ function assistantTodoMessage(
   } as ThreadMessage
 }
 
-function assistantReasoningTodoMessage(
-  todos: Array<{ content: string; id: string; status: 'cancelled' | 'completed' | 'in_progress' | 'pending' }>
-): ThreadMessage {
+function assistantImageMessage(running = false): ThreadMessage {
   return {
-    id: 'assistant-reasoning-todo-1',
+    id: `assistant-image-${running ? 'running' : 'done'}`,
     role: 'assistant',
     content: [
-      { type: 'reasoning', text: 'Let me make a quick todo list.' },
       {
         type: 'tool-call',
-        toolCallId: 'todo-1',
-        toolName: 'todo',
-        args: { todos },
-        argsText: JSON.stringify({ todos }),
-        result: { todos }
-      },
-      { type: 'text', text: 'Done — fake list created.' }
+        toolCallId: 'image-1',
+        toolName: 'image_generate',
+        args: { prompt: 'draw a cat' },
+        argsText: JSON.stringify({ prompt: 'draw a cat' }),
+        ...(running ? {} : { result: { image: 'https://cdn.example/cat.png', success: true } })
+      }
     ],
-    status: { type: 'complete', reason: 'stop' },
+    status: running ? { type: 'running' } : { type: 'complete', reason: 'stop' },
     createdAt,
     metadata: {
       unstable_state: null,
@@ -670,14 +666,19 @@ describe('assistant-ui streaming renderer', () => {
   it('renders an incomplete streaming reasoning fenced code block as a code card', async () => {
     const { container } = render(<RunningReasoningHarness />)
     const ui = within(container)
+    const thinkingToggle = ui.getByRole('button', { name: /thinking/i })
 
-    fireEvent.click(ui.getByRole('button', { name: /thinking/i }))
+    if (thinkingToggle.getAttribute('aria-expanded') !== 'true') {
+      fireEvent.click(thinkingToggle)
+    }
 
     await waitFor(() => {
       expect(container.querySelector('[data-slot="code-card"]')).toBeTruthy()
     })
 
-    expect(container.querySelector('[data-slot="aui_reasoning-text"]')?.textContent).toContain('const answer = 42')
+    await waitFor(() => {
+      expect(container.querySelector('[data-slot="aui_reasoning-text"]')?.textContent).toContain('const answer = 42')
+    })
     expect(container.textContent).not.toContain('```ts')
   })
 
@@ -718,7 +719,7 @@ describe('assistant-ui streaming renderer', () => {
     expect(container.textContent).toContain('Interim answer.')
   })
 
-  it('renders live todo rows during a running turn', () => {
+  it('does not render an inline todo panel — todos live in the composer status stack', () => {
     const { container } = render(
       <TodoHarness
         message={assistantTodoMessage([
@@ -728,52 +729,18 @@ describe('assistant-ui streaming renderer', () => {
       />
     )
 
-    const ui = within(container)
-
-    expect(container.querySelector('[data-slot="aui_todo-hoisted"]')).toBeTruthy()
-    expect(ui.getAllByText('Boil water').length).toBeGreaterThan(0)
-    expect(ui.getByText('Gather ingredients')).toBeTruthy()
-    expect(ui.queryByText(/pending/i)).toBeNull()
-    expect(ui.queryByRole('button', { name: /todo/i })).toBeNull()
+    expect(container.querySelector('[data-slot="aui_todo-hoisted"]')).toBeNull()
   })
 
-  it('renders archived todos after turn completion regardless of pending state', () => {
-    const first = render(
-      <TodoHarness message={assistantTodoMessage([{ content: 'Boil water', id: 'boil', status: 'pending' }], false)} />
-    )
+  it('renders completed image generation results in the tool slot', async () => {
+    const { container } = render(<MessageHarness message={assistantImageMessage()} />)
 
-    const ui = within(first.container)
-
-    expect(ui.getAllByText('Boil water').length).toBeGreaterThan(0)
-
-    first.unmount()
-
-    const second = render(
-      <TodoHarness
-        message={assistantTodoMessage([{ content: 'Serve latte', id: 'serve', status: 'completed' }], false)}
-      />
-    )
-
-    const archivedUi = within(second.container)
-
-    expect(archivedUi.getAllByText('Serve latte').length).toBeGreaterThan(0)
-  })
-
-  it('hoists todo outside the thinking disclosure when reasoning is present', () => {
-    const { container } = render(
-      <TodoHarness
-        message={assistantReasoningTodoMessage([
-          { content: 'Buy oats', id: 'oats', status: 'completed' },
-          { content: "Reply to Sam's email", id: 'email', status: 'in_progress' }
-        ])}
-      />
-    )
-
-    const todoPanel = container.querySelector('[data-slot="aui_todo-hoisted"]')
-    const thinkingDisclosure = container.querySelector('[data-slot="aui_thinking-disclosure"]')
-
-    expect(todoPanel).toBeTruthy()
-    expect(thinkingDisclosure).toBeTruthy()
-    expect(Boolean(thinkingDisclosure?.contains(todoPanel as Node))).toBe(false)
+    await waitFor(() => {
+      expect(screen.getByRole('img', { name: 'Generated image' }).getAttribute('src')).toBe(
+        'https://cdn.example/cat.png'
+      )
+    })
+    expect(container.querySelector('[data-slot="aui_generated-image"]')).toBeTruthy()
+    expect(screen.queryByRole('status', { name: /rendering image/i })).toBeNull()
   })
 })
