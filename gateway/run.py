@@ -87,6 +87,22 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Surfaces that consume gateway text programmatically (CLI/TUI "local"
+# diagnostics, API JSON, webhook payloads) and therefore must keep RAW
+# status/error text. EVERY other platform is a human-facing chat surface
+# where operational lifecycle/provider-error noise (and any secrets in it)
+# must be suppressed or sanitized. Widens #28533's Telegram-only filter to
+# all chat gateways (#39293). Fail-closed: unknown/empty platform -> chat.
+_GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
+    {"local", "api_server", "webhook", "msgraph_webhook"}
+)
+
+
+def _gateway_surface_passes_raw_text(platform: Any) -> bool:
+    """True only for programmatic/local surfaces that must keep raw text."""
+    return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
+
+
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
     r"api\s+(?:call\s+)?failed"
@@ -370,15 +386,18 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
-    """Sanitize final gateway replies before sending them to high-noise chats.
+    """Sanitize final gateway replies before sending them to chat surfaces.
 
-    Telegram is Bob's mobile inbox, so it should receive concise, safe provider
-    failure categories instead of raw HTTP bodies, request IDs, or policy text.
-    Other platforms keep the existing behaviour for now.
+    Every human-facing chat surface (Telegram, WhatsApp, Discord, Slack,
+    Signal, Matrix, plugin platforms, etc.) should receive concise, safe
+    provider failure categories with secrets redacted instead of raw HTTP
+    bodies, request IDs, leaked credentials, or policy text. Only programmatic
+    surfaces in ``_GATEWAY_RAW_TEXT_PLATFORMS`` (CLI/TUI ``local`` diagnostics,
+    API JSON, webhook payloads) keep the raw text unchanged.
     """
     if not text:
         return text
-    if _gateway_platform_value(platform) != "telegram":
+    if _gateway_surface_passes_raw_text(platform):
         return text
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
@@ -392,7 +411,7 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
+    if _gateway_surface_passes_raw_text(platform):
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
@@ -2533,6 +2552,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _exit_code: Optional[int] = None
     _draining: bool = False
+    _external_drain_active: bool = False
     _restart_requested: bool = False
     _restart_task_started: bool = False
     _restart_detached: bool = False
@@ -2593,6 +2613,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._exit_reason: Optional[str] = None
         self._exit_code: Optional[int] = None
         self._draining = False
+        # External (NAS-driven) drain state — distinct from the shutdown
+        # ``_draining`` flag above. Set by ``_drain_control_watcher`` when the
+        # ``.drain_request.json`` marker is present: the gateway flips
+        # ``gateway_state -> draining`` and refuses NEW turns, but the process
+        # does NOT exit (the whole point — quiesce-without-restart, D4a). It is
+        # fully reversible: removing the marker reverts to ``running`` and
+        # re-accepts turns. ``_draining`` (shutdown) is one-way and ends in
+        # process exit; this one is a steady state NAS polls during its
+        # request -> poll -> proceed loop.
+        self._external_drain_active = False
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -4002,6 +4032,88 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             write_runtime_status(active_agents=self._running_agent_count())
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # External drain control (NAS-driven quiesce-without-restart, Phase 2).
+    # The dashboard's begin/cancel-drain endpoint writes/removes the
+    # ``.drain_request.json`` marker (gateway/drain_control.py); this watcher
+    # observes the marker and flips the gateway between accepting and refusing
+    # NEW turns, WITHOUT exiting the process. Reversible by design (D4a): NAS
+    # POSTs begin-drain, polls /api/status until active_agents hits 0, proceeds
+    # with its lifecycle action, then (on cancel/abort) the marker is removed
+    # and the gateway re-accepts turns.
+    # ------------------------------------------------------------------
+    def _enter_external_drain(self) -> None:
+        """Begin external drain: stop accepting new turns, flip state.
+
+        Idempotent — re-entering while already draining is a no-op beyond a
+        best-effort status re-write. In-flight turns are NOT interrupted (the
+        whole point is to let them finish); only NEW turns are refused.
+        """
+        if self._external_drain_active:
+            return
+        self._external_drain_active = True
+        logger.info(
+            "External drain ENGAGED (.drain_request.json present) — refusing "
+            "new turns; %d in-flight turn(s) will finish. Process stays up.",
+            self._running_agent_count(),
+        )
+        # Flip the persisted lifecycle state so /api/status.gateway_busy /
+        # gateway_drainable track the drain. Preserve active_agents (the
+        # read-merge keeps the live count); only the state changes.
+        self._update_runtime_status("draining")
+
+    def _exit_external_drain(self) -> None:
+        """Cancel external drain: revert state, re-accept new turns.
+
+        Idempotent. Only reverts to ``running`` when we are actually mid-drain
+        AND not also shutting down (a real shutdown ``_draining`` must win —
+        never resurrect a stopping gateway to ``running``).
+        """
+        if not self._external_drain_active:
+            return
+        self._external_drain_active = False
+        if self._draining or not self._running:
+            # A shutdown drain is in progress / the loop has stopped — do not
+            # clobber the terminal state back to running.
+            logger.info(
+                "External drain marker cleared during shutdown — not reverting "
+                "to running (shutdown takes precedence)."
+            )
+            return
+        logger.info(
+            "External drain RELEASED (.drain_request.json removed) — "
+            "re-accepting new turns; gateway_state -> running."
+        )
+        self._update_runtime_status("running")
+
+    async def _drain_control_watcher(self, interval: float = 1.0) -> None:
+        """Background task: reconcile gateway accept-state with the drain marker.
+
+        Polls ``.drain_request.json`` (presence-based contract,
+        gateway/drain_control.py). Marker present -> ``_enter_external_drain``;
+        marker absent -> ``_exit_external_drain``. The 1s cadence bounds the
+        observe-the-marker latency the live-validation gate checks (point a).
+        Reconciles once at startup. A marker stamped with a PRIOR
+        instantiation epoch (one that survived a machine restart on the durable
+        HERMES_HOME volume — NS-570) is treated as absent by ``drain_requested``
+        and is NOT honoured; only a marker from the current instantiation flips
+        the gateway into drain. Best-effort: any tick error is logged and the
+        loop continues (a transient stat() failure must not wedge the gateway).
+        """
+        from gateway.drain_control import drain_requested
+
+        while self._running:
+            try:
+                if drain_requested():
+                    self._enter_external_drain()
+                else:
+                    self._exit_external_drain()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Drain-control watcher tick error: %s", exc, exc_info=True)
+            await asyncio.sleep(interval)
 
     def _update_platform_runtime_status(
         self,
@@ -6249,6 +6361,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._log_scale_to_zero_not_armed_reason()
         except Exception:  # noqa: BLE001 - arming must never block startup
             logger.debug("scale-to-zero: arm check failed at startup", exc_info=True)
+
+        # Start background drain-control watcher — reconciles the gateway's
+        # new-turn accept-state with the external ``.drain_request.json`` marker
+        # the dashboard begin/cancel-drain endpoint writes (Phase 2). A marker
+        # left behind by a prior instantiation (durable-volume restart, NS-570)
+        # is ignored via its instantiation epoch; only a current-epoch marker
+        # engages drain on the first tick.
+        asyncio.create_task(self._drain_control_watcher())
 
         logger.info("Press Ctrl+C to stop")
         
@@ -8859,6 +8979,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._should_send_telegram_lobby_reminder(source):
                 return self._telegram_topic_root_lobby_message()
             return None
+
+        # ── External-drain new-turn gate (Phase 2) ────────────────────
+        # When NAS has engaged an external drain (.drain_request.json present,
+        # observed by _drain_control_watcher), refuse to START a new turn so
+        # the in-flight set can only fall to zero — eliminating the TOCTOU race
+        # (D4a: stop accepting new turns FIRST, then NAS polls until
+        # active_agents==0). In-flight turns are untouched; this only blocks the
+        # claim of a NEW session slot. Internal/system events (restart-recovery
+        # replays, background-process completions) bypass the gate — they are
+        # not user-initiated new work and must still flow during a drain.
+        # Reversible: once the marker is removed the gate opens again.
+        if self._external_drain_active and not is_internal:
+            logger.info(
+                "Refusing new turn for session %s — external drain active.",
+                _quick_key,
+            )
+            return (
+                "⏳ This agent is draining for a maintenance action and isn't "
+                "accepting new turns right now. It'll be back in a moment — "
+                "please resend shortly."
+            )
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
@@ -15742,10 +15883,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # `_resolve_turn_agent_config(message, …)`.
             nonlocal message
 
-            # session_key is now set via contextvars in _set_session_env()
-            # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
-            os.environ["HERMES_SESSION_KEY"] = session_key or ""
-            
+            # session_key is propagated via contextvars in _set_session_env()
+            # (_SESSION_KEY) and via set_current_session_key() (_approval_session_key)
+            # below — both concurrency-safe and inherited by tool worker threads.
+            # We deliberately do NOT write os.environ["HERMES_SESSION_KEY"] here:
+            # os.environ is process-global, so concurrent gateway sessions (e.g.
+            # two Discord threads) would clobber each other's value, and a tool
+            # thread whose contextvar is unset would fall back to os.environ and
+            # read the wrong session key — misrouting command-approval prompts to
+            # the wrong thread (#24100). The non-gateway surfaces don't depend on
+            # this write: CLI and cron bind the session via contextvars
+            # (set_current_session_key / session context), and only the TUI
+            # slash-worker *subprocess* exports HERMES_SESSION_KEY (from its own
+            # --session-key argv, a separate process) — so removing this in-process
+            # gateway write does not affect any of them.
+
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
