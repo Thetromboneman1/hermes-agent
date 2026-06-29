@@ -832,6 +832,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _creation_locks,
         _creation_locks_lock,
         _resolve_container_task_id,
+        _is_unusable_container_cwd,
+        _CONTAINER_BACKENDS,
     )
     import time
 
@@ -893,6 +895,26 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 image = ""
 
             cwd = overrides.get("cwd") or _last_known_cwd.get(task_id) or config["cwd"]
+            # Re-apply the container cwd guard that _get_env_config() already
+            # ran on config["cwd"] (see #50636).  A per-task cwd override
+            # registered by the gateway/TUI/ACP for workspace tracking is a
+            # raw host path (e.g. a Desktop session's /Users/<me>/workspace or
+            # C:\\Users\\<me>). On a container backend that reaches
+            # ``docker run -w <host-path>`` and the container starts in a
+            # directory that doesn't exist inside the sandbox, so search_files
+            # and friends silently return empty results (#54447).  Sanitize it
+            # back to the already-validated config["cwd"] so the override can't
+            # bypass the guard.  Valid in-container override paths (RL/benchmark
+            # sandboxes that set cwd to /workspace, /root, etc.) are absolute
+            # non-host paths and pass through untouched.
+            if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+                if cwd != config["cwd"]:
+                    logger.info(
+                        "Ignoring host/relative cwd override %r for %s backend "
+                        "(won't exist in sandbox). Using %r instead.",
+                        cwd, env_type, config["cwd"],
+                    )
+                cwd = config["cwd"]
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
@@ -1047,7 +1069,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                         "file_size": result_dict["file_size"],
                     }, ensure_ascii=False)
                 if result_dict["content"]:
-                    result_dict["content"] = redact_sensitive_text(result_dict["content"], code_file=True)
+                    result_dict["content"] = redact_sensitive_text(result_dict["content"], file_read=True)
                 return json.dumps(result_dict, ensure_ascii=False)
 
         # ── Binary file guard ─────────────────────────────────────────
@@ -1163,7 +1185,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         # ── Redact secrets (after guard check to skip oversized content) ──
         if result.content:
-            result.content = redact_sensitive_text(result.content, code_file=True)
+            result.content = redact_sensitive_text(result.content, file_read=True)
             result_dict["content"] = result.content
 
         # Large-file hint: if the file is big and the caller didn't ask
@@ -1723,7 +1745,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if hasattr(result, 'matches'):
             for m in result.matches:
                 if hasattr(m, 'content') and m.content:
-                    m.content = redact_sensitive_text(m.content, code_file=True)
+                    m.content = redact_sensitive_text(m.content, file_read=True)
         result_dict = result.to_dict(densify=True)
 
         if count >= 3:

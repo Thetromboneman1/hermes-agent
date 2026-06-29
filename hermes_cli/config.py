@@ -670,7 +670,7 @@ def get_container_exec_info() -> Optional[dict]:
 
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home  # noqa: F811,E402
-from utils import atomic_replace
+from utils import atomic_replace, fast_safe_load
 
 def get_config_path() -> Path:
     """Get the main config file path."""
@@ -916,13 +916,18 @@ DEFAULT_CONFIG = {
         # Graceful drain timeout for gateway stop/restart (seconds).
         # The gateway stops accepting new work, waits for running agents
         # to finish, then interrupts any remaining runs after the timeout.
-        # 0 = no drain, interrupt immediately.
+        # 0 = no drain, interrupt immediately (the default).
         #
-        # 180s is calibrated for realistic in-flight agent turns: a typical
-        # coding conversation mid-reasoning runs 60–150s per call, so a 60s
-        # budget routinely interrupted legitimate work on /restart. Raise
-        # further in config.yaml if you run very-long-reasoning models.
-        "restart_drain_timeout": 180,
+        # Contract: if you restart the gateway, in-flight work stops. We do
+        # not hold the restart open for a grace window — a drain timeout
+        # large enough to "save" a long agent turn would have to outlast an
+        # unbounded task (some runs take days), which is impossible, and a
+        # drain timeout shorter than systemd's TimeoutStopSec invites a
+        # SIGKILL-mid-cleanup race that leaves a stale lock and crash-loops
+        # the service. 0 sidesteps both: interrupt now, clean up, exit fast.
+        # Set a positive value in config.yaml only if you explicitly want a
+        # grace window on /restart (and keep it well under TimeoutStopSec).
+        "restart_drain_timeout": 0,
         # Max app-level retry attempts for API errors (connection drops,
         # provider timeouts, 5xx, etc.) before the agent surfaces the
         # failure.  The OpenAI SDK already does its own low-level retries
@@ -1012,7 +1017,13 @@ DEFAULT_CONFIG = {
         # unblocks with "[user did not respond within Xm]" so it can adapt
         # rather than pinning the running-agent guard forever.  CLI clarify
         # blocks indefinitely (input() is synchronous) and ignores this.
-        "clarify_timeout": 600,
+        # Default 3600 (1h): real users step away (meetings, AFK) and the
+        # old 600s default evicted the entry mid-think, so a later button
+        # tap landed on a dead entry (#32762).  Tradeoff: a higher value
+        # holds the gateway's running-agent guard longer for a genuinely
+        # abandoned prompt — lower it if a single session must free up the
+        # guard sooner.
+        "clarify_timeout": 3600,
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
@@ -3638,6 +3649,83 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
     },
 
+    # ── Hindsight ──
+    "HINDSIGHT_API_KEY": {
+        "description": "Hindsight API key for graph-aware persistent memory",
+        "prompt": "Hindsight API key",
+        "url": "https://hindsight.vectorize.io",
+        "tools": ["hindsight_recall"],
+        "password": True,
+        "category": "tool",
+    },
+    "HINDSIGHT_API_URL": {
+        "description": "Base URL for the Hindsight API (default: https://api.hindsight.vectorize.io)",
+        "prompt": "Hindsight API URL",
+        "category": "tool",
+        "advanced": True,
+    },
+
+    # ── Supermemory ──
+    "SUPERMEMORY_API_KEY": {
+        "description": "Supermemory API key for conversation-scoped persistent memory",
+        "prompt": "Supermemory API key",
+        "url": "https://supermemory.ai",
+        "tools": ["supermemory_search"],
+        "password": True,
+        "category": "tool",
+    },
+
+    # ── Mem0 ──
+    "MEM0_API_KEY": {
+        "description": "Mem0 Platform API key for semantic persistent memory",
+        "prompt": "Mem0 API key",
+        "url": "https://app.mem0.ai",
+        "tools": ["mem0_search"],
+        "password": True,
+        "category": "tool",
+    },
+
+    # ── RetainDB ──
+    "RETAINDB_API_KEY": {
+        "description": "RetainDB API key for persistent memory",
+        "prompt": "RetainDB API key",
+        "url": "https://retaindb.com",
+        "tools": ["retaindb_search"],
+        "password": True,
+        "category": "tool",
+    },
+    "RETAINDB_BASE_URL": {
+        "description": "Base URL for self-hosted RetainDB instances (default: https://api.retaindb.com)",
+        "prompt": "RetainDB base URL",
+        "category": "tool",
+        "advanced": True,
+    },
+
+    # ── ByteRover ──
+    "BRV_API_KEY": {
+        "description": "ByteRover API key (optional, for cloud sync — local-first by default)",
+        "prompt": "ByteRover API key",
+        "url": "https://app.byterover.dev",
+        "tools": ["brv_query"],
+        "password": True,
+        "category": "tool",
+    },
+
+    # ── OpenViking ──
+    "OPENVIKING_API_KEY": {
+        "description": "OpenViking API key (leave blank for local dev mode)",
+        "prompt": "OpenViking API key",
+        "tools": ["viking_search"],
+        "password": True,
+        "category": "tool",
+    },
+    "OPENVIKING_ENDPOINT": {
+        "description": "OpenViking server URL (default: http://127.0.0.1:1933)",
+        "prompt": "OpenViking endpoint",
+        "category": "tool",
+        "advanced": True,
+    },
+
     # ── Langfuse observability ──
     "HERMES_LANGFUSE_PUBLIC_KEY": {
         "description": "Langfuse project public key (pk-lf-...)",
@@ -4583,7 +4671,7 @@ def check_config_version() -> Tuple[int, int]:
 
     try:
         with open(config_path, encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
+            config = fast_safe_load(f) or {}
     except Exception as e:
         # Invalid YAML needs a parse warning, not an automatic schema rewrite
         # that could replace the user's broken file with defaults.
@@ -5158,7 +5246,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                             continue
                         try:
                             with open(manifest_file, encoding="utf-8") as _mf:
-                                manifest = yaml.safe_load(_mf) or {}
+                                manifest = fast_safe_load(_mf) or {}
                         except Exception:
                             manifest = {}
                         name = manifest.get("name") or child.name
@@ -5803,14 +5891,35 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     ``model.base_url``), causing requests to fall back to OpenRouter. We migrate
     the alias to the canonical key (fallback-only — never override an explicit
     ``base_url``) and drop the alias so it can't confuse later loads.
+
+    Finally, canonicalizes the model-id key to ``model.default`` (issue #34500).
+    The runtime resolver and ~14 other readers select the chat model via
+    ``model.default``; ``model.model`` was already aliased inline at some sites
+    but ``model.name`` was not, so a custom-provider config like
+    ``model: {name: <id>, provider: <custom>}`` resolved to an empty model and
+    the API request went out with ``model=`` (HTTP 400 from OpenAI-compatible
+    backends) — while display paths (``hermes status``/``dump``) read ``name``
+    and *showed* the model, making the failure silent. Normalizing here (the
+    single load/save chokepoint) means every reader, present and future, sees a
+    populated ``default`` and the stale alias is migrated out of config.yaml on
+    the next save. Precedence: ``default`` > ``model`` > ``name`` (never
+    overrides an explicit ``default``, so existing configs are unaffected).
     """
-    # Only act if there are root-level keys (or an api_base alias) to migrate
+    # Only act if there's something to migrate: root-level keys, an api_base
+    # alias, or a model dict whose id lives under a non-canonical key.
     model_in = config.get("model")
     model_has_alias = isinstance(model_in, dict) and model_in.get("api_base")
+    # A model dict needs canonicalization if its id lives under a non-canonical
+    # key (``model``/``name``) — either because ``default`` is empty (we must
+    # promote the alias) or because ``default`` is set but a stale alias still
+    # lingers (we must drop it so config.yaml ends up canonical).
+    model_needs_canon = isinstance(model_in, dict) and (
+        model_in.get("model") or model_in.get("name")
+    )
     has_root = any(
         config.get(k) for k in ("provider", "base_url", "context_length", "api_base")
     )
-    if not has_root and not model_has_alias:
+    if not has_root and not model_has_alias and not model_needs_canon:
         return config
 
     config = dict(config)
@@ -5833,6 +5942,18 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
             model["base_url"] = alias_val
     config.pop("api_base", None)
     model.pop("api_base", None)
+
+    # Canonicalize the model id to ``default``. ``model`` and ``name`` are
+    # last-resort aliases (in that order) — only consulted when ``default`` is
+    # empty, then dropped so later loads/saves can't reintroduce the ambiguity.
+    if not (model.get("default") or ""):
+        alias = model.get("model") or model.get("name")
+        if alias:
+            model["default"] = alias
+    if model.get("default"):
+        # Drop the now-redundant aliases so config.yaml ends up canonical.
+        model.pop("model", None)
+        model.pop("name", None)
 
     return config
 
@@ -5942,7 +6063,7 @@ def read_raw_config() -> Dict[str, Any]:
 
         try:
             with open(config_path, encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
+                data = fast_safe_load(f) or {}
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
             return {}
@@ -6157,7 +6278,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
+                    user_config = fast_safe_load(f) or {}
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -6452,6 +6573,11 @@ def load_env() -> Dict[str, str]:
         for line in lines:
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
+                # Strip the bash-compatible ``export `` prefix so lines like
+                # ``export API_KEY=...`` parse as ``API_KEY`` rather than being
+                # stored under the wrong key ``"export API_KEY"`` (#6659).
+                if line.startswith('export '):
+                    line = line[7:]
                 key, _, value = line.partition('=')
                 env_vars[key.strip()] = _parse_env_value(value)
 
@@ -7231,7 +7357,7 @@ def set_config_value(key: str, value: str):
     if config_path.exists():
         try:
             with open(config_path, encoding="utf-8") as f:
-                user_config = yaml.safe_load(f) or {}
+                user_config = fast_safe_load(f) or {}
         except Exception:
             user_config = {}
     
@@ -7519,7 +7645,7 @@ def _inject_platform_plugin_env_vars() -> None:
                 continue
             try:
                 with open(manifest_path, "r", encoding="utf-8") as f:
-                    manifest = yaml.safe_load(f) or {}
+                    manifest = fast_safe_load(f) or {}
             except Exception:
                 continue
             label = manifest.get("label") or manifest.get("name") or child.name
