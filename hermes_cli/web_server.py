@@ -2868,8 +2868,15 @@ async def gateway_drain(request: Request):
             detail=f"Unknown drain action {action!r}; expected 'drain' or 'cancel'",
         )
 
-    payload = write_drain_request(principal=str(principal))
-    _log.info("Gateway drain BEGIN requested by %s", principal)
+    payload = write_drain_request(
+        principal=str(principal),
+        suppress_notification=bool((body or {}).get("suppress_notification", False)),
+    )
+    _log.info(
+        "Gateway drain BEGIN requested by %s (suppress_notification=%s)",
+        principal,
+        payload["suppress_notification"],
+    )
     return {
         "ok": True,
         "action": "drain",
@@ -2877,6 +2884,7 @@ async def gateway_drain(request: Request):
         # Echo so a caller polling /api/status knows the marker is now set;
         # the gateway watcher flips gateway_state -> draining within ~1s.
         "draining": drain_requested(),
+        "suppress_notification": payload["suppress_notification"],
     }
 
 
@@ -3430,7 +3438,7 @@ async def get_sessions(
 
 
 @app.get("/api/profiles/sessions")
-async def get_profiles_sessions(
+def get_profiles_sessions(
     limit: int = 20,
     offset: int = 0,
     min_messages: int = 0,
@@ -4717,7 +4725,7 @@ async def get_env_vars(profile: Optional[str] = None):
     channel_keys = _channel_managed_env_keys()
     catalog_meta = _catalog_provider_env_metadata()
 
-    def _row(var_name: str, info: dict) -> dict:
+    def _row(var_name: str, info: dict, *, custom: bool = False) -> dict:
         value = env_on_disk.get(var_name)
         cat_meta = catalog_meta.get(var_name) or {}
         # Hand OPTIONAL_ENV_VARS prose wins where present; the catalog fills any
@@ -4740,6 +4748,12 @@ async def get_env_vars(profile: Optional[str] = None):
             # CLI `hermes model` picker uses (not desktop-only prefix guesses).
             "provider": cat_meta.get("provider", ""),
             "provider_label": cat_meta.get("provider_label", ""),
+            # True when this key exists in the user's .env but is NOT in any
+            # catalog (OPTIONAL_ENV_VARS or the provider catalog) — an
+            # arbitrary/custom env var the user added directly. Surfaced so the
+            # Keys page can list (and let the user manage) them instead of
+            # hiding everything it doesn't recognise.
+            "custom": custom,
         }
 
     result = {}
@@ -4751,6 +4765,19 @@ async def get_env_vars(profile: Optional[str] = None):
     for var_name in catalog_meta:
         if var_name not in result:
             result[var_name] = _row(var_name, {})
+    # Surface arbitrary/custom keys the user set in .env that aren't in any
+    # catalog. These are always "set" (they're on disk). Treated as secrets by
+    # default (is_password=True → redacted, reveal-gated) since an unrecognised
+    # key could hold anything. Channel-managed credentials are excluded — those
+    # belong to the Channels page. This makes the "add a custom key" surface
+    # round-trip: a key added there reappears here under its own section.
+    for var_name in env_on_disk:
+        if var_name in result or var_name in channel_keys:
+            continue
+        row = _row(var_name, {}, custom=True)
+        row["category"] = "custom"
+        row["is_password"] = True
+        result[var_name] = row
     return result
 
 
@@ -10700,7 +10727,9 @@ def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
 async def list_profiles_endpoint():
     from hermes_cli import profiles as profiles_mod
     try:
-        return {"profiles": [_profile_to_dict(p) for p in profiles_mod.list_profiles()]}
+        loop = asyncio.get_running_loop()
+        profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
+        return {"profiles": [_profile_to_dict(p) for p in profiles]}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
         return {"profiles": _fallback_profile_dicts(profiles_mod)}
