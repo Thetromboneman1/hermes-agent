@@ -261,3 +261,20 @@ scripts/run_tests.sh
 ## License
 
 MIT. See `LICENSE`.
+
+## Spec Kit Development Workflow
+
+This owned fork uses GitHub Spec Kit `v0.12.15` for specification-driven
+changes. Use `.specify/` for shared workflow artifacts,
+`.agents/skills/speckit-*` with Codex, `.opencode/commands/` with OpenCode, and
+`.goose/recipes/` with Goose. Hermes also discovers global `speckit-*` skills
+under `~/.hermes/skills`.
+
+```bash
+specify version
+specify integration status --json
+```
+
+`AGENTS.md` and upstream contribution guidance remain authoritative.
+Fleet-wide policy is maintained in
+[Boneman_Projects](https://github.com/Thetromboneman1/Boneman_Projects).

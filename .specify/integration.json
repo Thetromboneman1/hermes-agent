@@ -1,0 +1,25 @@
+{
+  "version": "0.12.15",
+  "integration_state_schema": 1,
+  "installed_integrations": [
+    "codex",
+    "opencode",
+    "goose"
+  ],
+  "integration_settings": {
+    "codex": {
+      "script": "sh",
+      "invoke_separator": "-"
+    },
+    "opencode": {
+      "script": "sh",
+      "invoke_separator": "."
+    },
+    "goose": {
+      "script": "sh",
+      "invoke_separator": "."
+    }
+  },
+  "integration": "codex",
+  "default_integration": "codex"
+}
