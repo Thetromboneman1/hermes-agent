@@ -52,7 +52,6 @@ jobs:
         run: |
           docker run --rm \
             -v /tmp/hermes-test:/opt/data \
-            --entrypoint /opt/hermes/docker/entrypoint.sh \
             nousresearch/hermes-agent:test --help
 
       - name: Log in to Docker Hub
@@ -127,7 +126,6 @@ jobs:
         run: |
           docker run --rm \
             -v /tmp/hermes-test:/opt/data \
-            --entrypoint /opt/hermes/docker/entrypoint.sh \
             ghcr.io/${{ steps.ns.outputs.owner }}/hermes-agent:test --help
 
       - name: Log in to GHCR
