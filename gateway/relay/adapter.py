@@ -319,16 +319,24 @@ class RelayAdapter(BasePlatformAdapter):
                 meta["user_id"] = author
         return meta
 
-    def _platform_is_fronted(self, platform: str) -> bool:
-        """Whether ``platform`` is one of the platforms this gateway fronts over
-        the relay (Phase 1.5). Reads the transport's advertised identity set; used
-        to decide whether a follow-up's platform-prefixed `kind` names a real
-        fronted platform worth tagging on the frame (vs. leaving egress to the
-        session default). Safe when the transport is absent or single-identity."""
+    def fronts_platform(self, platform: Any) -> bool:
+        """Whether the authenticated relay transport advertises ``platform``.
+
+        This is the restart-safe delivery ownership signal: it comes from the
+        configured identity set sent during handshake, not from an inbound
+        chat cache learned only after a user sends another message.
+        """
+        platform_value = getattr(platform, "value", platform)
+        if not platform_value:
+            return False
         ids = getattr(self._transport, "_identities", None)
         if not ids:
             return False
-        return any(p == platform for p, _ in ids)
+        return any(p == str(platform_value) for p, _ in ids)
+
+    def _platform_is_fronted(self, platform: str) -> bool:
+        """Backward-compatible internal alias for follow-up routing."""
+        return self.fronts_platform(platform)
 
     async def on_interrupt(self, session_key: str, chat_id: str) -> None:
         """Bridge a connector-delivered /stop into the adapter's interrupt path.
@@ -361,12 +369,13 @@ class RelayAdapter(BasePlatformAdapter):
 
         NEVER raises: a malformed forward must not kill the read loop.
 
-        NOTE (open semantic sub-design, flagged for review): the interaction ->
-        MessageEvent mapping below is the v1 default. The exact agent UX for a
-        slash-command / button interaction (vs. a plain message) — command name
-        surfacing, option rendering, deferred-vs-immediate response — is the open
-        piece tracked in the spec; the TRANSPORT + receive mechanism (this whole
-        path) is settled.
+        Interaction -> MessageEvent command mapping (formerly flagged here as an
+        open sub-design, now implemented): an APPLICATION_COMMAND interaction is
+        normalized to a leading-slash COMMAND event ("/name arg…", mirroring the
+        connector's Slack slash-command lane, normalizeSlackCommand), so the
+        dispatcher routes it as a command instead of plain chat. Component
+        interactions (custom_id) still surface as best-effort TEXT; the
+        deferred-vs-immediate response UX remains connector-side.
         """
         try:
             platform = getattr(forward, "platform", "") or ""
@@ -409,8 +418,21 @@ class RelayAdapter(BasePlatformAdapter):
         # 3 = MESSAGE_COMPONENT; 5 = MODAL_SUBMIT. Surface a best-effort text.
         itype = payload.get("type")
         data = payload.get("data") or {}
+        message_type = MessageType.TEXT
         if itype == 2:
-            text = str(data.get("name") or "")
+            # Normalize a real slash-command interaction to a leading-slash
+            # command string — the shape the dispatcher (MessageEvent.is_command:
+            # text.startswith("/")) and the native Discord adapter's
+            # _run_simple_slash lane (f"/model {name}".strip()) both expect.
+            # Options render space-separated: scalar options contribute their
+            # value; SUB_COMMAND/SUB_COMMAND_GROUP (types 1/2) contribute their
+            # name then their nested options. Mirrors the connector's Slack
+            # slash lane (normalizeSlackCommand: `${command} ${args}`.trim()).
+            text = ("/" + str(data.get("name") or "")).rstrip("/") or ""
+            if text:
+                parts = [text] + self._render_interaction_options(data.get("options"))
+                text = " ".join(parts).strip()
+                message_type = MessageType.COMMAND
         elif itype == 3:
             text = str(data.get("custom_id") or "")
         else:
@@ -428,7 +450,36 @@ class RelayAdapter(BasePlatformAdapter):
             scope_id=str(guild_id) if guild_id else None,  # Discord guild → generic scope slot
             message_id=str(payload.get("id")) if payload.get("id") else None,
         )
-        return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+        return MessageEvent(text=text, message_type=message_type, source=source)
+
+    @staticmethod
+    def _render_interaction_options(options) -> list:
+        """Render Discord interaction options to space-separated text parts.
+
+        Discord's `data.options` is a list of {name, value, type}. Scalar
+        options (STRING/INTEGER/BOOLEAN/…) contribute just their value —
+        matching the native adapter's `f"/model {name}".strip()` shape, where
+        only the value follows the command. SUB_COMMAND (1) and
+        SUB_COMMAND_GROUP (2) contribute their *name* then recurse into their
+        nested `options` list (one level of nesting per Discord's schema:
+        group -> subcommand -> scalars).
+        """
+        parts: list = []
+        if not isinstance(options, list):
+            return parts
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            if opt.get("type") in (1, 2):  # SUB_COMMAND / SUB_COMMAND_GROUP
+                sub_name = str(opt.get("name") or "").strip()
+                if sub_name:
+                    parts.append(sub_name)
+                parts.extend(RelayAdapter._render_interaction_options(opt.get("options")))
+            else:
+                value = opt.get("value")
+                if value is not None and str(value).strip():
+                    parts.append(str(value).strip())
+        return parts
 
     async def disconnect(self) -> None:
         # Phase 7 Unit 7d-B: stop the revocation monitor first so it can't fire a
@@ -488,13 +539,27 @@ class RelayAdapter(BasePlatformAdapter):
             logger.debug("relay go_dormant failed", exc_info=True)
             return False
 
-    async def send(
+    async def send_for_platform(
         self,
+        logical_platform: Any,
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        """Send to an explicitly advertised logical platform over Relay.
+
+        Scheduled and persisted-home deliveries have no fresh inbound event to
+        populate ``_platform_by_chat``. The shared delivery resolver calls this
+        method only after ``fronts_platform`` succeeds, and this method repeats
+        that check fail-closed before stamping the outbound frame.
+        """
+        platform_value = getattr(logical_platform, "value", logical_platform)
+        if not self.fronts_platform(platform_value):
+            return SendResult(
+                success=False,
+                error=f"relay does not front platform {platform_value}",
+            )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         result = await self._transport.send_outbound(
@@ -504,6 +569,42 @@ class RelayAdapter(BasePlatformAdapter):
                 "content": content,
                 "reply_to": reply_to,
                 "metadata": self._with_scope(chat_id, metadata),
+            },
+            platform=str(platform_value),
+        )
+        return SendResult(
+            success=bool(result.get("success")),
+            message_id=result.get("message_id"),
+            error=result.get("error"),
+            raw_response=result,
+        )
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        send_metadata = dict(metadata or {})
+        explicit_platform = send_metadata.pop("_relay_logical_platform", None)
+        if explicit_platform:
+            return await self.send_for_platform(
+                explicit_platform,
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=send_metadata or None,
+            )
+        if self._transport is None:
+            return SendResult(success=False, error="no transport")
+        result = await self._transport.send_outbound(
+            {
+                "op": "send",
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": self._with_scope(chat_id, send_metadata),
             },
             platform=self._platform_by_chat.get(str(chat_id)),
         )
