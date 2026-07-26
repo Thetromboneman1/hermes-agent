@@ -46,12 +46,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: ./.github/actions/nix-setup
-      - name: Check flake
+      - name: Evaluate flake checks
         if: runner.os == 'Linux'
-        run: nix flake check --print-build-logs
-      - name: Build package
+        run: nix flake check --no-build
+      - name: Build minimal package
         if: runner.os == 'Linux'
-        run: nix build --print-build-logs
+        # The default package intentionally contains every optional integration.
+        # Building that cold exceeded an hour and 64 MiB of runner logs. The
+        # regular Tests workflow covers those integrations; this lane verifies
+        # the complete flake graph and builds the supported minimal package.
+        run: nix build .#minimal --print-build-logs
       - name: Evaluate flake (macOS)
         if: runner.os == 'macOS'
         run: nix flake show --json > /dev/null
