@@ -5556,18 +5556,149 @@ _PE_MACHINE_NAMES = {
     _PE_MACHINE_ARM64: "ARM64",
 }
 
+_PE_MACHINE_TO_NAME = {
+    _PE_MACHINE_ARM64: "ARM64",
+    _PE_MACHINE_AMD64: "AMD64",
+    _PE_MACHINE_I386: "X86",
+}
+
+# MACHINE_ATTRIBUTES bits (processthreadsapi.h). UserEnabled means the host
+# can run user-mode code of that machine type — natively or under emulation.
+_MACHINE_ATTRIBUTE_USER_ENABLED = 0x00000001
+
+
+def _windows_native_machine_from_iswow64() -> Optional[str]:
+    """Ask IsWow64Process2 for the OS-native machine (None if unavailable/fail).
+
+    ctypes defaults ``GetCurrentProcess``'s restype to ``c_int``, so the
+    current-process pseudo-handle ``(HANDLE)-1`` is truncated to
+    ``0xFFFFFFFF`` and zero-extended into a 64-bit invalid handle. On Win64
+    that makes ``IsWow64Process2`` fail with ``ERROR_INVALID_HANDLE`` (6),
+    which is exactly the residual Windows-on-ARM failure after #71218: the
+    gate fell through to ``PROCESSOR_ARCHITECTURE=AMD64`` (the emulated
+    process arch) and rejected a correctly-built ARM64 ``Hermes.exe``.
+    Binding ``restype``/``argtypes`` to ``wintypes.HANDLE`` keeps the full
+    ``0xFFFFFFFFFFFFFFFF`` pseudo-handle.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.IsWow64Process2.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.USHORT),
+        ctypes.POINTER(wintypes.USHORT),
+    ]
+    kernel32.IsWow64Process2.restype = wintypes.BOOL
+
+    process_machine = wintypes.USHORT(0)
+    native_machine = wintypes.USHORT(0)
+    if not kernel32.IsWow64Process2(
+        kernel32.GetCurrentProcess(),
+        ctypes.byref(process_machine),
+        ctypes.byref(native_machine),
+    ):
+        return None
+    return _PE_MACHINE_TO_NAME.get(native_machine.value)
+
+
+def _windows_user_runnable_pe_machines() -> Optional[set]:
+    """PE machines this host can run in user mode, via GetMachineTypeAttributes.
+
+    This asks the question the integrity gate actually cares about — "can this
+    Windows host load a PE of machine X?" — instead of inferring it from a
+    host-architecture name. It is also the only documented API that reports
+    AMD64-on-ARM64 emulation support; ``IsWow64GuestMachineSupported`` only
+    answers for 32-bit guests.
+
+    Returns None when the API is unavailable (pre-Windows-11 build 22000) or
+    reports nothing runnable, so callers fall back to name-based detection.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetMachineTypeAttributes.argtypes = [
+        wintypes.USHORT,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    kernel32.GetMachineTypeAttributes.restype = ctypes.c_long
+
+    runnable = set()
+    for machine in (_PE_MACHINE_ARM64, _PE_MACHINE_AMD64, _PE_MACHINE_I386):
+        attributes = ctypes.c_int(0)
+        # HRESULT: zero is success, any nonzero value is a failure.
+        if kernel32.GetMachineTypeAttributes(machine, ctypes.byref(attributes)):
+            continue
+        if attributes.value & _MACHINE_ATTRIBUTE_USER_ENABLED:
+            runnable.add(machine)
+    return runnable or None
+
+
+def _windows_native_machine() -> str:
+    """The Windows host OS's NATIVE machine architecture, normalized upper.
+
+    ``platform.machine()`` reports the PROCESS architecture, which lies under
+    emulation: the desktop update chain runs an x64 hermes-setup.exe (and thus
+    x64 Python) on Windows-on-ARM devices, where ``platform.machine()``
+    returns ``AMD64`` even though the OS is ARM64. The #71119 integrity gate
+    then rejected the CORRECT ARM64 rebuild as an "architecture mismatch"
+    (#69179 follow-up report). Probe order:
+
+    1. ``IsWow64Process2`` with a correctly-typed current-process HANDLE
+       (#71218 + HANDLE-truncation fix). This is the only API that tells the
+       truth from an x64 process emulated on ARM64.
+    2. ``PROCESSOR_ARCHITEW6432`` / ``PROCESSOR_ARCHITECTURE`` — WOW64
+       (32-bit) hosts and pre-1511 Windows 10 without the newer API.
+    3. ``platform.machine()``.
+
+    Note ``GetNativeSystemInfo`` is deliberately NOT used: Microsoft documents
+    that it "also returns emulated processor details when run from an app
+    under emulation", so on the very WoA hosts this function exists to serve
+    it reports AMD64 — no better than the env-var rung below it.
+    """
+    if sys.platform == "win32":
+        try:
+            name = _windows_native_machine_from_iswow64()
+        except (OSError, AttributeError, TypeError, ValueError):
+            # API missing (pre-1511), DLL load failure in tests, or a
+            # mistyped ctypes binding — fall through to the env vars.
+            name = None
+        if name:
+            return name
+        env_arch = os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get(
+            "PROCESSOR_ARCHITECTURE"
+        )
+        if env_arch:
+            return env_arch.upper()
+    import platform as _platform
+
+    return (_platform.machine() or "").upper()
+
 
 def _expected_windows_pe_machines() -> set:
     """PE machine values the current Windows host can natively load.
 
-    AMD64 hosts run x64 and (via WOW64) x86. ARM64 hosts run ARM64 and
-    (Windows 11 emulation) x64. 32-bit x86 hosts run only x86. Unknown
-    machines return the permissive full set so the integrity gate can never
-    brick launch on exotic hosts.
-    """
-    import platform as _platform
+    Preferred source is ``GetMachineTypeAttributes``, which answers this
+    question directly (including AMD64-on-ARM64 emulation) instead of
+    inferring it from an architecture name.
 
-    machine = (_platform.machine() or "").upper()
+    Fallback is name-based: AMD64 hosts run x64 and (via WOW64) x86. ARM64
+    hosts run ARM64 and (Windows 11 emulation) x64. 32-bit x86 hosts run only
+    x86. Unknown machines return the permissive full set so the integrity gate
+    can never brick launch on exotic hosts. Host detection uses the OS-native
+    machine (see ``_windows_native_machine``), not the process architecture.
+    """
+    if sys.platform == "win32":
+        try:
+            runnable = _windows_user_runnable_pe_machines()
+        except (OSError, AttributeError, TypeError, ValueError):
+            runnable = None
+        if runnable:
+            return runnable
+    machine = _windows_native_machine().upper()
     if machine in ("AMD64", "X86_64", "X64"):
         return {_PE_MACHINE_AMD64, _PE_MACHINE_I386}
     if machine in ("ARM64", "AARCH64"):
@@ -5645,12 +5776,10 @@ def _desktop_exe_integrity_error(path: Path) -> Optional[str]:
         return str(exc)
     expected = _expected_windows_pe_machines()
     if machine not in expected:
-        import platform as _platform
-
         got = _PE_MACHINE_NAMES.get(machine, f"unknown machine 0x{machine:04X}")
         return (
             f"architecture mismatch: built a {got} executable but this is a "
-            f"{_platform.machine()} Windows host"
+            f"{_windows_native_machine()} Windows host"
         )
     return None
 
@@ -7251,6 +7380,11 @@ def _update_via_zip(args):
             )
         if result.get("cleaned"):
             print(f"  − {len(result['cleaned'])} removed from manifest")
+        if result.get("relocated"):
+            print(
+                f"  → {len(result['relocated'])} moved to new upstream paths: "
+                f"{', '.join(result['relocated'])}"
+            )
         if not result["copied"] and not result.get("updated"):
             print("  ✓ Skills are up to date")
     except Exception:
@@ -10228,6 +10362,19 @@ def _ensure_fhs_path_guard() -> None:
         print("    (reload your shell or run 'source ~/.bashrc' to pick it up)")
 
 
+def _size_delta_label(saved_mb: float) -> str:
+    """Human label for a before/after database size delta, in MB.
+
+    A negative delta means the file GREW — concurrent session writes during a
+    long optimize can outweigh what the rebuild freed. Printing
+    "reclaimed -163.0 MB" for that reads as data loss, so say "grew by"
+    instead.
+    """
+    if saved_mb >= 0:
+        return f"reclaimed {saved_mb:.1f} MB"
+    return f"grew by {-saved_mb:.1f} MB"
+
+
 _PRE_UPDATE_SNAPSHOT_KEEP = 1
 
 # Per-file size cap for the pre-update quick snapshot. Anything larger is
@@ -11836,6 +11983,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
             if result.get("cleaned"):
                 print(f"  − {len(result['cleaned'])} removed from manifest")
+            if result.get("relocated"):
+                print(
+                    f"  → {len(result['relocated'])} moved to new upstream paths: "
+                    f"{', '.join(result['relocated'])}"
+                )
             if not result["copied"] and not result.get("updated"):
                 print("  ✓ Skills are up to date")
         except Exception as e:
@@ -15860,6 +16012,50 @@ def main():
         help="Skip the timestamped backup copy (not recommended)",
     )
 
+    sessions_recover = sessions_subparsers.add_parser(
+        "recover",
+        help="Rebuild canonical session data into a separate clean database",
+        description=(
+            "Offline, non-destructive recovery for a damaged state.db. The "
+            "source database and its WAL/SHM/rollback-journal sidecars are "
+            "copied before SQLite opens anything. Canonical rows are rebuilt "
+            "into a new output database; derived search indexes are recreated "
+            "and the active database is never replaced automatically."
+        ),
+    )
+    sessions_recover.add_argument(
+        "--source",
+        type=Path,
+        required=True,
+        help="Source state.db or preserved backup to inspect/recover",
+    )
+    sessions_recover.add_argument(
+        "--output",
+        type=Path,
+        help="New recovery database path (required unless --inspect-only)",
+    )
+    sessions_recover.add_argument(
+        "--inspect-only",
+        action="store_true",
+        help="Only report canonical table readability; do not create an output database",
+    )
+    sessions_recover.add_argument(
+        "--work-dir",
+        type=Path,
+        help="Existing directory for the disposable source copy (defaults beside the output)",
+    )
+    sessions_recover.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1000,
+        help="Rows committed per recovery batch (default: 1000)",
+    )
+    sessions_recover.add_argument(
+        "--report",
+        type=Path,
+        help="JSON report path (defaults to <output>.recovery.json)",
+    )
+
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
     sessions_rename = sessions_subparsers.add_parser(
@@ -15891,9 +16087,10 @@ def main():
 
         action = args.sessions_action
 
-        # 'repair' must run BEFORE opening SessionDB(): a malformed schema is
-        # exactly the case where SessionDB() can't open, so it operates on the
-        # raw file path instead.
+        # 'repair' and 'recover' must run BEFORE opening SessionDB(): a
+        # malformed schema is exactly the case where SessionDB() can't open.
+        # Recovery additionally promises never to open the supplied source
+        # directly, so it operates through its own disposable source copy.
         if action == "repair":
             from hermes_state import (
                 DEFAULT_DB_PATH,
@@ -15934,7 +16131,106 @@ def main():
                 if report.get("backup_path"):
                     print(f"  A backup is preserved at: {report['backup_path']}")
                 print("  Keep state.db and the backup; do not delete them.")
+                # Without this pointer the user is at a dead end: in-place
+                # repair has failed and nothing tells them the non-destructive
+                # offline recovery path exists. Lead with --inspect-only so
+                # they confirm the data is readable before writing anything.
+                print("")
+                print("  Next step — offline recovery (never modifies the source):")
+                source_hint = report.get("backup_path") or db_path
+                print(f"    hermes sessions recover --source {source_hint} \\")
+                print("        --inspect-only")
+                print("  If that reports the data is recoverable, rebuild it into")
+                print("  a NEW database (the active one is left untouched):")
+                print(f"    hermes sessions recover --source {source_hint} \\")
+                print("        --output recovered-state.db")
             return
+
+        if action == "recover":
+            import sqlite3 as _sqlite3
+
+            from hermes_cli.session_recovery import (
+                SessionRecoveryError,
+                inspect_session_database,
+                recover_session_database,
+                write_recovery_report,
+            )
+
+            source = args.source
+            output = getattr(args, "output", None)
+            inspect_only = bool(getattr(args, "inspect_only", False))
+            report_path = getattr(args, "report", None)
+            if inspect_only and output is not None:
+                print("Error: --output cannot be used with --inspect-only.")
+                return 2
+            if not inspect_only and output is None:
+                print("Error: --output is required unless --inspect-only is used.")
+                return 2
+            if not inspect_only and report_path is None:
+                report_path = output.with_name(output.name + ".recovery.json")
+            if (
+                report_path is not None
+                and os.path.lexists(report_path.expanduser())
+            ):
+                print(f"Error: refusing to overwrite existing report: {report_path}")
+                return 2
+
+            try:
+                if inspect_only:
+                    report = inspect_session_database(
+                        source,
+                        work_dir=getattr(args, "work_dir", None),
+                    )
+                else:
+                    last_progress = {"table": None}
+
+                    def _recovery_progress(info):
+                        table = info.get("table")
+                        copied = int(info.get("copied_rows") or 0)
+                        total = info.get("source_rows")
+                        if table != last_progress["table"]:
+                            if last_progress["table"] is not None:
+                                print()
+                            print(f"  {table}: ", end="", flush=True)
+                            last_progress["table"] = table
+                        suffix = f"/{int(total):,}" if total is not None else ""
+                        print(f"\r  {table}: {copied:,}{suffix}", end="", flush=True)
+
+                    print("Recovering canonical session data into a new database…")
+                    report = recover_session_database(
+                        source,
+                        output,
+                        work_dir=getattr(args, "work_dir", None),
+                        chunk_size=getattr(args, "chunk_size", 1000),
+                        progress_cb=_recovery_progress,
+                    )
+                    if last_progress["table"] is not None:
+                        print()
+            except (SessionRecoveryError, OSError, _sqlite3.DatabaseError) as exc:
+                print(f"Error: session recovery failed: {exc}")
+                print("The supplied source database was not replaced or deleted.")
+                return 1
+
+            if report_path is not None:
+                try:
+                    written_report = write_recovery_report(report_path, report)
+                except (FileExistsError, OSError) as exc:
+                    print(f"Error: could not write recovery report: {exc}")
+                    return 1
+                print(f"Recovery report: {written_report}")
+            else:
+                print(_json.dumps(report, indent=2, sort_keys=True))
+
+            if inspect_only:
+                return 0 if report.get("recoverable") else 1
+            if report.get("complete"):
+                print(f"✓ Recovered database verified at: {output}")
+                print("  The active session database was not changed.")
+                print("  Review the JSON report before installing this database.")
+                return 0
+            print("✗ Recovery output did not pass every verification check.")
+            print("  Do not install it. Review the JSON report for partial data or errors.")
+            return 1
 
         try:
             from hermes_state import SessionDB
@@ -16674,11 +16970,18 @@ def main():
                 if db_path.exists()
                 else 0.0
             )
+            # Same WAL caveat as optimize-storage: after a VACUUM the main file
+            # on disk lags until the WAL is checkpointed back (refused while a
+            # live gateway holds a read-mark), so stat() understates the win and
+            # can go negative. SQLite's page accounting is correct immediately.
+            logical_after = db.logical_size_bytes()
+            if logical_after is not None:
+                after_mb = logical_after / (1024 * 1024)
             saved = before_mb - after_mb
             print(f"Optimized {n} FTS index(es).")
             print(
                 f"Database size: {before_mb:.1f} MB -> {after_mb:.1f} MB "
-                f"(reclaimed {saved:.1f} MB)"
+                f"({_size_delta_label(saved)})"
             )
 
         elif action == "optimize-storage":
@@ -16761,11 +17064,21 @@ def main():
             after_mb = (
                 os.path.getsize(db_path) / (1024 * 1024) if db_path.exists() else 0.0
             )
+            # Prefer SQLite's own page accounting over stat(). In WAL mode a
+            # VACUUM's rewrite sits in the -wal file until a checkpoint folds it
+            # back, and that checkpoint is refused while another connection (a
+            # live gateway) holds a read-mark — so the main file on disk still
+            # reads at its pre-VACUUM size and keeps growing. stat()ing it here
+            # reported "reclaimed -3820.1 MB" on a DB that had actually shrunk
+            # 60%. page_count * page_size is correct immediately.
+            logical_after = db.logical_size_bytes()
+            if logical_after is not None:
+                after_mb = logical_after / (1024 * 1024)
             saved = before_mb - after_mb
             print(f"\n✓ Search index optimized.")
             print(
                 f"  Database size: {before_mb:.1f} MB -> {after_mb:.1f} MB "
-                f"(reclaimed {saved:.1f} MB)"
+                f"({_size_delta_label(saved)})"
             )
             if result.get("vacuumed") is False:
                 print("  (VACUUM was skipped or failed — run "

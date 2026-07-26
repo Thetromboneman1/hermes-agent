@@ -1469,6 +1469,13 @@ DEFAULT_CONFIG = {
                                       # tool iteration. 0 = commit any non-zero prune.
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
         "hygiene_timeout_seconds": 30,  # max seconds gateway waits for pre-agent hygiene compression
+                                      # WITHOUT forward progress. The summary call streams, so
+                                      # this is an inactivity budget: a slow model still
+                                      # producing tokens keeps extending the wait; only a
+                                      # silent/hung call is cut off.
+        "hygiene_total_ceiling_seconds": 600,  # absolute cap on the hygiene compression wait even
+                                      # while tokens are still moving — bounds a degenerate
+                                      # trickle stream. Clamped to >= hygiene_timeout_seconds.
         "hygiene_failure_cooldown_seconds": 300,  # skip repeated failed hygiene attempts for this session
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
@@ -1651,6 +1658,13 @@ DEFAULT_CONFIG = {
         # not a meaningful recovery, so an unretried blip silently loses the
         # call.
         "transient_retries": 2,
+        # Endpoints that reject NON-streaming chat requests outright (e.g.
+        # Tencent Copilot returns HTTP 400 "Non-stream chat request is
+        # currently not supported"). Auxiliary calls to a matching endpoint
+        # are sent with stream=True and aggregated client-side. Entries are
+        # case-insensitive substrings matched against the endpoint URL;
+        # copilot.tencent.com is always treated as stream-only.
+        "stream_only_base_urls": [],
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"

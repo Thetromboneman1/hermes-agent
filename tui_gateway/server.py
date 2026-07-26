@@ -2573,13 +2573,27 @@ def _set_session_context(
         # it instead of falling back to the gateway launch dir.
         resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
         source = _resolve_session_platform()
+        # Derive the live conversation id so terminal/execute_code subprocesses
+        # can read HERMES_SESSION_ID. Without this, set_session_vars leaves the
+        # session-id contextvar as "" (explicitly empty), and the subprocess-env
+        # bridge treats that as authoritative — NOT falling back to os.environ —
+        # so every command in a dashboard/TUI/web session saw an empty
+        # HERMES_SESSION_ID even though agent_init set it via
+        # set_current_session_id(). Prefer the agent's durable session_id, then
+        # fall back to the session_key (matching the id derivation used at
+        # session-finalize), so an identified session is never left blank.
+        session_id = session_key
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
                     source = _session_source(sess)
+                    session_id = (
+                        getattr(sess.get("agent"), "session_id", None) or session_key
+                    )
                     break
         return set_session_vars(
             session_key=session_key,
+            session_id=session_id,
             source=source,
             cwd=resolved,
             ui_session_id=ui_session_id,
@@ -15792,6 +15806,14 @@ def _(rid, params: dict) -> dict:
             skill_bundles_provider=lambda: get_skill_bundles(),
         )
         doc = Document(text, len(text))
+        # Skill commands and bundles are the only completions offered for an
+        # inline `/skill` reference typed mid-message, so the class has to
+        # reach the TUI as data. Derived from the same providers the completer
+        # uses — no sniffing the ⚡/▣ meta glyphs, which are display text.
+        skill_names = {
+            key.lstrip("/").lower()
+            for key in (*get_skill_commands(), *get_skill_bundles())
+        }
         items = [
             {
                 "text": c.text,
@@ -15802,6 +15824,11 @@ def _(rid, params: dict) -> dict:
                 # layout into 1-char truncation of the next column.
                 "display": to_plain_text(c.display) if c.display else c.text,
                 "meta": to_plain_text(c.display_meta) if c.display_meta else "",
+                "kind": (
+                    "skill"
+                    if c.text.strip().lstrip("/").lower() in skill_names
+                    else "command"
+                ),
             }
             for c in completer.get_completions(doc, None)
         ][:30]
@@ -15811,21 +15838,25 @@ def _(rid, params: dict) -> dict:
                 "text": "/density",
                 "display": "/density",
                 "meta": "Toggle compact display mode",
+                "kind": "command",
             },
             {
                 "text": "/details",
                 "display": "/details",
                 "meta": "Control agent detail visibility",
+                "kind": "command",
             },
             {
                 "text": "/logs",
                 "display": "/logs",
                 "meta": "Show recent gateway log lines",
+                "kind": "command",
             },
             {
                 "text": "/mouse",
                 "display": "/mouse",
                 "meta": "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]",
+                "kind": "command",
             },
         ]
         for extra in extras:
