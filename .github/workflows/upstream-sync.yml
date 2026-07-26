@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Checkout fork (full history)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -116,7 +116,7 @@ jobs:
 
     steps:
       - name: Checkout fork (full history)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -137,8 +137,10 @@ jobs:
             exit 0
           fi
           git checkout "$BRANCH"
-          git rebase main && \
-            git push origin "$BRANCH" --force-with-lease && \
-            echo "✅ $BRANCH rebased and pushed" || \
-            (git rebase --abort && \
-             echo "::warning::Rebase conflict on $BRANCH — manual intervention needed")
+          if git rebase main && git push origin "$BRANCH" --force-with-lease; then
+            echo "✅ $BRANCH rebased and pushed"
+          else
+            git rebase --abort || true
+            echo "::warning::Rebase conflict on $BRANCH — manual intervention needed"
+            exit 1
+          fi
