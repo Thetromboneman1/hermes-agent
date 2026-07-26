@@ -46,9 +46,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: ./.github/actions/nix-setup
-      - name: Evaluate flake checks
+      - name: Evaluate flake outputs
         if: runner.os == 'Linux'
-        run: nix flake check --no-build
+        # `flake check --no-build` cannot evaluate checks whose derivations
+        # reference source paths that have not been materialized yet.
+        run: nix flake show --json > /dev/null
       - name: Build minimal package
         if: runner.os == 'Linux'
         # The default package intentionally contains every optional integration.
