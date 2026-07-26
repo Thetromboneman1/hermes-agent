@@ -780,6 +780,7 @@ class HermesACPAgent(acp.Agent):
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
 
         try:
+            from hermes_cli.config import load_config
             from hermes_cli.inventory import build_models_payload, load_picker_context
             from hermes_cli.models import normalize_provider, provider_label
 
