@@ -40,9 +40,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # A cold Linux flake check can exceed 30 minutes while dependencies build.
-    # Keep a bounded timeout, but allow enough headroom for an uncached runner.
-    timeout-minutes: 60
+    # A first-run Linux closure can exceed an hour while dependencies build.
+    # Keep the job bounded while allowing an uncached runner to complete.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: ./.github/actions/nix-setup
@@ -57,7 +57,7 @@ jobs:
         # Building that cold exceeded an hour and 64 MiB of runner logs. The
         # regular Tests workflow covers those integrations; this lane verifies
         # the complete flake graph and builds the supported minimal package.
-        run: nix build .#minimal --print-build-logs
+        run: nix build .#minimal
       - name: Evaluate flake (macOS)
         if: runner.os == 'macOS'
         run: nix flake show --json > /dev/null
