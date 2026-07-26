@@ -780,10 +780,14 @@ class HermesACPAgent(acp.Agent):
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
 
         try:
-            from hermes_cli.config import load_config
+            import hermes_cli.config as hermes_config
             from hermes_cli.inventory import build_models_payload, load_picker_context
             from hermes_cli.models import normalize_provider, provider_label
 
+            # Snapshot configuration before inventory construction performs any
+            # catalog loading so caller-provided configuration overrides remain
+            # authoritative for this model-state build.
+            cfg = hermes_config.load_config() or {}
             normalized_provider = normalize_provider(provider)
             context = load_picker_context().with_overrides(
                 current_provider=normalized_provider,
@@ -844,29 +848,6 @@ class HermesACPAgent(acp.Agent):
                     )
                     seen_ids.add(choice_id)
 
-            # Named user-defined endpoints (providers: / custom_providers:)
-            # are invisible to canonical provider enumeration — append them
-            # so editor clients can select them like the TUI /model picker.
-            for named_slug, named_label, named_catalog in _named_custom_provider_catalogs():
-                for named_model, named_desc in named_catalog:
-                    named_choice = self._encode_model_choice(named_slug, named_model)
-                    if not named_choice or named_choice in seen_ids:
-                        continue
-                    named_parts = [f"Provider: {named_label}"]
-                    if named_desc:
-                        named_parts.append(str(named_desc).strip())
-                    if named_slug == normalized_provider and named_model == model:
-                        named_parts.append("current")
-                    available_models.append(
-                        ModelInfo(
-                            model_id=named_choice,
-                            name=named_model,
-                            description=" • ".join(part for part in named_parts if part),
-                        )
-                    )
-                    seen_ids.add(named_choice)
-
-            cfg = load_config() or {}
             for entry in self._iter_configured_custom_endpoints(cfg):
                 entry_name = str(entry.get("name") or "Local").strip()
                 entry_model = str(entry.get("model") or "").strip()
@@ -882,7 +863,16 @@ class HermesACPAgent(acp.Agent):
                 custom_provider = f"custom:{provider_suffix}" if provider_suffix else "custom"
                 choice_id = self._encode_model_choice(custom_provider, entry_model)
                 if choice_id in seen_ids:
-                    continue
+                    # Inventory construction may already have emitted the same
+                    # configured endpoint as a generic provider row. Replace
+                    # that row so local endpoints retain their priority and
+                    # endpoint-specific description.
+                    available_models[:] = [
+                        item for item in available_models if item.model_id != choice_id
+                    ]
+                    prioritized_models[:] = [
+                        item for item in prioritized_models if item.model_id != choice_id
+                    ]
 
                 parsed = urlparse(entry_base if "://" in entry_base else f"http://{entry_base}")
                 host = (parsed.hostname or "").strip().lower()
@@ -906,6 +896,29 @@ class HermesACPAgent(acp.Agent):
                 else:
                     available_models.append(info)
                 seen_ids.add(choice_id)
+
+            # Named user-defined endpoints (providers: / custom_providers:)
+            # are invisible to canonical provider enumeration. Add their wider
+            # model catalogs after configured defaults so local endpoints keep
+            # the intended top priority and duplicate default rows are skipped.
+            for named_slug, named_label, named_catalog in _named_custom_provider_catalogs():
+                for named_model, named_desc in named_catalog:
+                    named_choice = self._encode_model_choice(named_slug, named_model)
+                    if not named_choice or named_choice in seen_ids:
+                        continue
+                    named_parts = [f"Provider: {named_label}"]
+                    if named_desc:
+                        named_parts.append(str(named_desc).strip())
+                    if named_slug == normalized_provider and named_model == model:
+                        named_parts.append("current")
+                    available_models.append(
+                        ModelInfo(
+                            model_id=named_choice,
+                            name=named_model,
+                            description=" • ".join(part for part in named_parts if part),
+                        )
+                    )
+                    seen_ids.add(named_choice)
 
             current_model_id = self._encode_model_choice(normalized_provider, model)
             if current_model_id and current_model_id not in seen_ids:
