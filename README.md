@@ -279,3 +279,11 @@ specify integration status --json
 `AGENTS.md` and upstream contribution guidance remain authoritative.
 Fleet-wide policy is maintained in
 [Boneman_Projects](https://github.com/Thetromboneman1/Boneman_Projects).
+
+<!-- repository-maintenance -->
+
+## Repository maintenance
+
+The repository role, upstream relationship, workflow inventory, build and
+recovery procedure, secret names, notification status, and maintenance policy
+are documented in [docs/repository-maintenance.md](docs/repository-maintenance.md).
