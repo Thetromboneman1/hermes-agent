@@ -3,7 +3,29 @@ name: Nix
 on:
   push:
     branches: [main]
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'nix/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'hermes_cli/**'
+      - 'run_agent.py'
+      - 'acp_adapter/**'
+      - '.github/actions/nix-setup/**'
+      - '.github/workflows/nix.yml'
   pull_request:
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'nix/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'hermes_cli/**'
+      - 'run_agent.py'
+      - 'acp_adapter/**'
+      - '.github/actions/nix-setup/**'
+      - '.github/workflows/nix.yml'
 
 permissions:
   contents: read
