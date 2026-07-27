@@ -18,13 +18,13 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { setComposerDraft } from '@/store/composer'
 import { enqueueQueuedPrompt } from '@/store/composer-queue'
+import { applyGoalStatusText } from '@/store/goals'
 import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { setPetScale } from '@/store/pet-gallery'
 import { $petGenInput, openPetGenerate } from '@/store/pet-generate'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   $connection,
-  $selectedStoredSessionId,
   $sessions,
   $yoloActive,
   resolveComposerSessionKey,
@@ -48,6 +48,7 @@ import { resolveTargetSessionId } from './resolve-target-session'
 import {
   type GatewayRequest,
   isSessionIdCandidate,
+  isTargetSessionBusy,
   renderCommandsCatalog,
   renderRpcResult,
   slashStatusText,
@@ -166,9 +167,15 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           return null
         }
 
-        // A long-running command can finish after a session switch. Keep its
-        // output bound to the stored session selected at invocation time.
-        const storedSessionId = selectedStoredSessionIdRef.current
+        // Bind output to the TARGET session's own stored id, snapshotted now so
+        // a command that outlives a session switch still lands on the right
+        // chat. NOT the foreground selection: a tile (⌘T tab, split) runs its
+        // slash commands through this hook with an explicit runtime id while
+        // the selection names a different conversation, and passing that down
+        // to updateSessionState re-keyed the tile's cache entry onto the
+        // primary's stored session. Fall back to the selection only for a
+        // session with no published state yet (a draft this call just created).
+        const storedSessionId = $sessionStates.get()[sessionId]?.storedSessionId ?? selectedStoredSessionIdRef.current
 
         // Header carries the command token only. The full invocation would
         // duplicate long args — `/goal <prose>` echoed the whole goal in the
@@ -226,6 +233,15 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // `/goal <text>` looked like it did nothing.
           if ((dispatch.type === 'send' || dispatch.type === 'prefill') && dispatch.notice?.trim()) {
             renderSlashOutput(dispatch.notice.trim())
+
+            // `/goal <text>` returns its "⊙ Goal set …" notice here and kicks
+            // off the first turn immediately; the backend only emits a
+            // `status.update kind:"goal"` after that turn's post-turn judge
+            // runs. Seed the goal store from the notice so the indicator shows
+            // the active goal right away instead of after the first turn.
+            if (name === 'goal') {
+              applyGoalStatusText(sessionId, dispatch.notice.trim())
+            }
           }
 
           const message = ('message' in dispatch ? dispatch.message : '')?.trim() ?? ''
@@ -252,7 +268,11 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             renderSlashOutput(`⚡ loading skill: ${dispatch.name}`)
           }
 
-          if (busyRef.current) {
+          // Gate on the TARGET session's own busy state, not the foreground
+          // view's — see isTargetSessionBusy. `busyRef` mirrors whatever chat
+          // is on screen, while this command runs against the session
+          // resolveTargetSessionId picked, routinely a different one.
+          if (isTargetSessionBusy($sessionStates.get(), sessionId, busyRef.current)) {
             // The backend already executed the command — for `/goal <text>`
             // the goal is set and `message` is its kickoff prompt. Dropping
             // it here loses the kickoff silently (the goal exists but the
@@ -260,16 +280,11 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             // queue instead: it fires when the running turn settles, and the
             // queue panel above the composer shows it in the meantime.
             //
-            // Key off the storedSessionId resolved at invocation time (same
-            // value the output writer is bound to) rather than re-reading the
-            // globals here — a session switch between dispatch and this branch
-            // would otherwise park the kickoff on whichever chat is now in
-            // front. Fall back through the live selection for a session whose
-            // cache entry hasn't landed yet.
-            const storedId =
-              storedSessionId || $sessionStates.get()[sessionId]?.storedSessionId || $selectedStoredSessionId.get()
-
-            const queueKey = resolveComposerSessionKey(storedId, $sessions.get()) || storedId || sessionId
+            // Park it on the same stored session the output writer is bound to
+            // rather than re-reading the globals here — a session switch between
+            // dispatch and this branch would otherwise queue the kickoff on
+            // whichever chat is now in front.
+            const queueKey = resolveComposerSessionKey(storedSessionId, $sessions.get()) || storedSessionId || sessionId
 
             if (enqueueQueuedPrompt(queueKey, { attachments: [], text: message })) {
               renderSlashOutput('session busy — message queued to send when the current turn finishes')
@@ -280,7 +295,16 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             return
           }
 
-          await submitPromptText(message)
+          // Submit into the session this command was resolved against — the
+          // same pair the output writer and the busy gate above already use.
+          // Bare `submitPromptText(message)` let submit re-resolve from
+          // `activeSessionIdRef`, which names the FOREGROUND chat: a `/work`
+          // typed into a fresh ⌘T tab loaded the skill in that tab, printed
+          // "⚡ loading skill" there, then fired its kickoff as a user message
+          // into whatever conversation was on screen. Every other target the
+          // dispatcher serves (tile, background queue drain, a session created
+          // by this very call) had the same leak.
+          await submitPromptText(message, { sessionId, storedSessionId })
         }
 
         try {
@@ -299,6 +323,15 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
           const output = result && typeof result === 'object' ? (result as SlashExecResponse) : null
           const body = output?.output || `/${name}: no output`
+
+          // `/goal status|pause|resume|clear` come back as plain exec output
+          // ("⊙ Goal (active, 3/20 turns): …", "⏸ Goal paused: …", "✓ Goal
+          // cleared." …). Mirror it into the goal store so the composer
+          // indicator tracks pause/resume/clear immediately.
+          if (name === 'goal' && output?.output) {
+            applyGoalStatusText(sessionId, output.output)
+          }
+
           renderSlashOutput(output?.warning ? `warning: ${output.warning}\n${body}` : body)
 
           return

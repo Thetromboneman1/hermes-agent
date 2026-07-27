@@ -445,6 +445,7 @@ from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.security import build_security_parser
+from hermes_cli.subcommands.approvals import build_approvals_parser
 from hermes_cli.subcommands.dump import build_dump_parser
 from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.backup import build_backup_parser
@@ -3626,13 +3627,16 @@ def _aux_config_menu() -> None:
 def _aux_select_for_task(task: str) -> None:
     """Pick a provider + model for a single auxiliary task and persist it.
 
-    Uses ``list_authenticated_providers()`` to only show providers the user
-    has already configured. This avoids re-running OAuth/credential flows
-    inside the aux picker — users set up new providers through the normal
-    ``hermes model`` flow, then route aux tasks to them here.
+    Provider rows come from ``build_aux_picker_rows()`` — the shared aux-picker
+    substrate — so this surface shows exactly what every other aux picker
+    shows: authenticated built-ins, the user's own ``providers:`` /
+    ``custom_providers:`` endpoints, and providers whose credential pool is
+    temporarily exhausted. Only already-configured providers appear; users set
+    up new ones through the normal ``hermes model`` flow, then route aux tasks
+    to them here.
     """
     from hermes_cli.config import load_config
-    from hermes_cli.model_switch import list_authenticated_providers
+    from hermes_cli.inventory import build_aux_picker_rows, format_aux_picker_entries
 
     cfg = load_config()
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
@@ -3645,7 +3649,7 @@ def _aux_select_for_task(task: str) -> None:
 
     # Gather authenticated providers (has credentials + curated model list)
     try:
-        providers = list_authenticated_providers(
+        providers = build_aux_picker_rows(
             current_provider=current_provider,
             current_model=current_model,
             current_base_url=current_base_url,
@@ -3661,16 +3665,13 @@ def _aux_select_for_task(task: str) -> None:
     )
     entries.append(("__auto__", f"auto (recommended){auto_marker}", []))
 
-    for p in providers:
-        slug = p.get("slug", "")
-        name = p.get("name") or slug
-        total = p.get("total_models", 0)
-        models = p.get("models") or []
-        model_hint = f" — {total} models" if total else ""
-        marker = (
-            "  ← current" if slug == current_provider and not current_base_url else ""
+    entries.extend(
+        format_aux_picker_entries(
+            providers,
+            current_provider=current_provider,
+            current_base_url=current_base_url,
         )
-        entries.append((slug, f"{name}{model_hint}{marker}", list(models)))
+    )
 
     # Custom endpoint (raw base_url)
     custom_marker = "  ← current" if current_base_url else ""
@@ -4556,6 +4557,16 @@ def cmd_security(args):
         sys.exit(int(code or 0))
     print(f"unknown security subcommand: {sub}", file=sys.stderr)
     sys.exit(2)
+
+
+def cmd_approvals(args):
+    """Dispatch `hermes approvals <subcmd>`."""
+    from hermes_cli.approvals_suggest import approvals_command
+
+    status = approvals_command(args)
+    if status:
+        sys.exit(status)
+    return status
 
 
 def cmd_dump(args):
@@ -6571,11 +6582,11 @@ def cmd_gui(args: argparse.Namespace):
     sys.exit(launch_result.returncode)
 
 
-def _find_stale_dashboard_pids(
+def _scan_dashboard_processes(
     *,
     exclude_pids: set[int] | None = None,
-) -> list[int]:
-    """Return PIDs of ``hermes dashboard`` processes other than ourselves.
+) -> list[tuple[int, str]]:
+    """Return matching ``dashboard``/``serve`` processes with their cmdlines.
 
     ``hermes dashboard`` is a long-lived server process commonly started and
     forgotten.  When ``hermes update`` replaces files on disk, the running
@@ -6611,7 +6622,7 @@ def _find_stale_dashboard_pids(
         "hermes_cli/main.py serve",
     ]
     self_pid = os.getpid()
-    dashboard_pids: list[int] = []
+    dashboard_processes: list[tuple[int, str]] = []
 
     try:
         if sys.platform == "win32":
@@ -6650,7 +6661,7 @@ def _find_stale_dashboard_pids(
                         and int(pid_str) != self_pid
                     ):
                         try:
-                            dashboard_pids.append(int(pid_str))
+                            dashboard_processes.append((int(pid_str), current_cmd))
                         except ValueError:
                             pass
         else:
@@ -6680,13 +6691,72 @@ def _find_stale_dashboard_pids(
                         continue
                     command = parts[1]
                     if any(p in command for p in patterns) and pid != self_pid:
-                        dashboard_pids.append(pid)
+                        dashboard_processes.append((pid, command))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
 
     if exclude_pids:
-        dashboard_pids = [p for p in dashboard_pids if p not in exclude_pids]
-    return dashboard_pids
+        dashboard_processes = [
+            proc for proc in dashboard_processes if proc[0] not in exclude_pids
+        ]
+    return dashboard_processes
+
+
+def _find_stale_dashboard_pids(
+    *,
+    exclude_pids: set[int] | None = None,
+) -> list[int]:
+    """Return PIDs of stale ``dashboard``/``serve`` processes for update cleanup."""
+    return [pid for pid, _cmd in _scan_dashboard_processes(exclude_pids=exclude_pids)]
+
+
+def _parse_dashboard_runtime(command: str) -> tuple[str, str, int] | None:
+    """Best-effort parse of a dashboard/server cmdline into mode, host, and port."""
+    mode = None
+    if any(
+        pattern in command
+        for pattern in (
+            "hermes dashboard",
+            "hermes_cli.main dashboard",
+            "hermes_cli/main.py dashboard",
+        )
+    ):
+        mode = "dashboard"
+    elif any(
+        pattern in command
+        for pattern in (
+            "hermes serve",
+            "hermes_cli.main serve",
+            "hermes_cli/main.py serve",
+        )
+    ):
+        mode = "serve"
+    if mode is None:
+        return None
+
+    port = 9119
+    host = "127.0.0.1"
+
+    port_match = re.search(r"(?:^|\s)--port(?:=|\s+)(\d+)", command)
+    if port_match:
+        try:
+            port = int(port_match.group(1))
+        except ValueError:
+            return None
+
+    host_match = re.search(r"(?:^|\s)--host(?:=|\s+)(\"[^\"]+\"|'[^']+'|\S+)", command)
+    if host_match:
+        host = host_match.group(1).strip("\"'") or "127.0.0.1"
+
+    return mode, host, port
+
+
+def _dashboard_probe_host(host: str | None) -> str:
+    """Map wildcard binds to a loopback address suitable for local probing."""
+    normalized = (host or "127.0.0.1").strip().strip("[]")
+    if normalized in {"", "0.0.0.0", "::"}:
+        return "127.0.0.1"
+    return normalized
 
 
 def _print_curator_first_run_notice() -> None:
@@ -7041,12 +7111,205 @@ def _restart_managed_dashboard_service(
     return True
 
 
+def _get_systemd_service_for_pid(pid: int) -> str | None:
+    """If *pid* belongs to a systemd service unit, return the unit name.
+
+    Reads ``/proc/<pid>/cgroup`` and extracts the service name (e.g.
+    ``hermes-serve.service``).  Returns ``None`` when the PID is not
+    part of a systemd service, when the file is unreadable, or on
+    non-Linux platforms.
+    """
+    try:
+        cgroup_path = Path(f"/proc/{pid}/cgroup")
+        if not cgroup_path.is_file():
+            return None
+        text = cgroup_path.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            # Format: 0::/system.slice/hermes-serve.service
+            #         0::/user.slice/user-1000.slice/session-42.scope
+            parts = line.split("::", 1)
+            if len(parts) != 2:
+                continue
+            cg_path = parts[1]
+            if cg_path.endswith(".service"):
+                svc_name = cg_path.rsplit("/", 1)[-1]
+                if svc_name:
+                    return svc_name
+    except (OSError, PermissionError):
+        pass
+    return None
+
+
+def _extract_scope_from_cgroup(cgroup_entry: str) -> str | None:
+    """Extract the systemd scope (``user`` or ``system``) from a cgroup path.
+
+    The cgroup path format is ``/system.slice/<name>.service`` for system
+    services and ``/user.slice/user-<uid>.slice/<name>.service`` for user
+    services.  Returns ``None`` when the scope cannot be determined.
+    """
+    if "/system.slice/" in cgroup_entry:
+        return "system"
+    if "/user.slice/" in cgroup_entry:
+        return "user"
+    return None
+
+
+def _get_pid_cgroup_path(pid: int) -> str | None:
+    """Return the cgroup path from ``/proc/<pid>/cgroup``, or ``None``.
+
+    Only the unified (``0::``) hierarchy cgroup entry is examined.
+    """
+    try:
+        cgroup_path = Path(f"/proc/{pid}/cgroup")
+        if not cgroup_path.is_file():
+            return None
+        text = cgroup_path.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            parts = line.split("::", 1)
+            if len(parts) == 2:
+                return parts[1]
+    except (OSError, PermissionError):
+        pass
+    return None
+
+
+def _try_restart_systemd_service(svc_name: str, cgroup_path: str | None = None) -> bool:
+    """Attempt to restart *svc_name* via systemctl.
+
+    Uses ``systemctl --user`` for user-scope services and ``systemctl``
+    for system-scope services.  Returns ``True`` on success.
+    """
+    scope = _extract_scope_from_cgroup(cgroup_path) if cgroup_path else None
+    if scope == "user":
+        cmd = ["systemctl", "--user", "restart", svc_name]
+    elif scope == "system":
+        cmd = ["systemctl", "restart", svc_name]
+    else:
+        # Unknown scope — try system first, then user
+        cmd = None
+        for candidate in (
+            ["systemctl", "restart", svc_name],
+            ["systemctl", "--user", "restart", svc_name],
+        ):
+            try:
+                r = subprocess.run(
+                    candidate,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    timeout=15,
+                )
+                if r.returncode == 0:
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                continue
+        return False
+
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=15,
+        )
+        return r.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
+    """Return the exact argv of a running process, when recoverable.
+
+    Linux: reads ``/proc/<pid>/cmdline`` (NUL-separated, lossless).
+    macOS: falls back to ``ps -o command=`` + shlex (best effort — quoting
+    is reconstructed, but hermes launch commands don't embed exotic args).
+    Windows: returns ``None``; taskkill /F gives no graceful window and the
+    desktop app manages its own backend there.
+    """
+    if sys.platform == "win32":
+        return None
+    try:
+        cmdline_path = f"/proc/{pid}/cmdline"
+        if os.path.exists(cmdline_path):
+            with open(cmdline_path, "rb") as f:
+                raw = f.read()
+            argv = [
+                part.decode("utf-8", errors="replace")
+                for part in raw.split(b"\x00")
+                if part
+            ]
+            return argv or None
+        # macOS (no /proc): best-effort via ps.
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        command = (result.stdout or "").strip()
+        if not command:
+            return None
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = command.split()
+        return argv or None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
+    """Best-effort respawn of manually-started dashboards after ``hermes update``.
+
+    Spawns each recovered argv detached (new session, output to the profile's
+    ``logs/dashboard-restart.log``).  Returns the commands that failed to
+    spawn; the caller prints the manual hint for those.
+    """
+    from hermes_constants import get_hermes_home
+
+    respawned: list[list[str]] = []
+    failed: list[tuple[list[str], str]] = []
+    log_path = get_hermes_home() / "logs" / "dashboard-restart.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    for command in commands:
+        try:
+            # Keep restarted dashboards headless; reopening a browser after a
+            # background update is noisy and fails in SSH/headless sessions.
+            if "dashboard" in command and "--no-open" not in command:
+                command = [*command, "--no-open"]
+            with open(log_path, "ab") as log_f:
+                subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_f,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            respawned.append(command)
+        except (OSError, ValueError) as exc:
+            failed.append((command, str(exc)))
+
+    for command in respawned:
+        print(f"    ✓ restarted: {shlex.join(command)}")
+    for command, err_msg in failed:
+        print(f"    ✗ failed to restart ({shlex.join(command)}): {err_msg}")
+    return [command for command, _ in failed]
+
+
 def _kill_stale_dashboard_processes(
     reason: str = "the running backend no longer matches the updated frontend",
     *,
     restart_managed: bool = False,
-) -> None:
-    """Kill running ``hermes dashboard`` processes.
+) -> dict[str, list]:
+    """Kill running ``hermes dashboard`` / ``hermes serve`` processes.
 
     Called at the end of ``hermes update`` (default ``reason``) and also
     from ``hermes dashboard --stop`` (which overrides ``reason``).  The
@@ -7063,11 +7326,14 @@ def _kill_stale_dashboard_processes(
     Manually-started dashboards are not auto-restarted because we don't know
     the original launch args (--host, --port, --insecure, --tui, --no-open).
     When ``restart_managed`` is true (the ``hermes update`` path), a detected
-    ``hermes-dashboard.service`` is restarted through systemd instead of
-    raw-killing its main PID.
+    ``hermes-dashboard.service`` is restarted through systemd; any OTHER
+    killed PID that was supervised by a systemd unit (custom unit names —
+    e.g. a remote backend's ``hermes-serve.service``) has its owning unit
+    restarted after the kill, because systemd treats our SIGTERM as a clean
+    stop and ``Restart=on-failure`` would never fire (#68934).
     """
     if restart_managed and _restart_managed_dashboard_service(reason):
-        return
+        return {"matched": [], "killed": [], "failed": []}
 
     # When the Hermes Desktop Electron app spawns this dashboard as a
     # backend child, it sets HERMES_DESKTOP_CHILD_PID so that the update
@@ -7091,10 +7357,30 @@ def _kill_stale_dashboard_processes(
 
     pids = _find_stale_dashboard_pids(exclude_pids=exclude)
     if not pids:
-        return
+        return {"matched": [], "killed": [], "failed": []}
 
     print()
     print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
+
+    # Before killing, snapshot systemd cgroup info for each PID so we can
+    # restart supervised services after the kill (the cgroup disappears
+    # along with the process).  Only meaningful on Linux, and only when the
+    # caller asked for restarts (the `hermes update` path) — `--stop` must
+    # stay a stop, not a restart.
+    pid_cgroup: dict[int, str | None] = {}
+    pid_service: dict[int, str | None] = {}
+    pid_cmdline: dict[int, list[str]] = {}
+    if restart_managed and sys.platform != "win32":
+        for pid in pids:
+            cg_path = _get_pid_cgroup_path(pid)
+            pid_cgroup[pid] = cg_path
+            pid_service[pid] = _get_systemd_service_for_pid(pid)
+            if not pid_service[pid]:
+                # Manually-started process: preserve its exact argv so we
+                # can respawn it after the update (#40449, #68934).
+                cmdline = _dashboard_cmdline_for_pid(pid)
+                if cmdline:
+                    pid_cmdline[pid] = cmdline
 
     killed: list[int] = []
     failed: list[tuple[int, str]] = []
@@ -7162,9 +7448,79 @@ def _kill_stale_dashboard_processes(
     for pid, err_msg in failed:
         print(f"    ✗ failed to stop PID {pid}: {err_msg}")
 
-    if killed:
+    # Restart what we just killed (update path only).  Two categories:
+    #  - systemd-supervised PIDs: restart the owning unit.  Without this, a
+    #    remote backend (hermes serve) under Restart=on-failure never comes
+    #    back after our clean SIGTERM, and the Desktop can't reconnect (#68934).
+    #  - manually-started PIDs: respawn the argv captured before the kill
+    #    (#40449) — detached, headless, logged to logs/dashboard-restart.log.
+    restarted_services: list[str] = []
+    unrecovered: list[int] = []
+    if killed and restart_managed:
+        failed_restarts: list[tuple[str, str]] = []
+        seen_services: set[str] = set()
+        respawn_cmds: list[list[str]] = []
+        for pid in killed:
+            svc_name = pid_service.get(pid)
+            if svc_name:
+                if svc_name in seen_services:
+                    continue
+                seen_services.add(svc_name)
+                if _try_restart_systemd_service(svc_name, pid_cgroup.get(pid)):
+                    restarted_services.append(svc_name)
+                else:
+                    failed_restarts.append((svc_name, "systemctl restart returned non-zero"))
+                    unrecovered.append(pid)
+            elif pid in pid_cmdline:
+                respawn_cmds.append(pid_cmdline[pid])
+            else:
+                unrecovered.append(pid)
+
+        for svc in restarted_services:
+            print(f"    ✓ restarted systemd service {svc}")
+        for svc, err in failed_restarts:
+            print(f"    ⚠ {svc}: {err}")
+
+        if respawn_cmds:
+            failed_cmds = _respawn_dashboard_processes(respawn_cmds)
+            if failed_cmds:
+                unrecovered.extend(p for p in killed if pid_cmdline.get(p) in failed_cmds)
+
+        if failed_restarts or unrecovered:
+            print("  Restart anything not auto-restarted when you're ready:")
+            print("    hermes dashboard --port <port>")
+    elif killed:
+        unrecovered = list(killed)
         print("  Restart the dashboard when you're ready:")
         print("    hermes dashboard --port <port>")
+
+    return {
+        "matched": list(pids),
+        "killed": list(killed),
+        "failed": list(failed),
+        "unrecovered": list(unrecovered),
+    }
+
+
+def _finish_dashboard_update_cleanup(node_failures: list[str]) -> None:
+    """Refresh managed dashboards or stop stale manual ones after an update."""
+    if node_failures:
+        print()
+        print("  ℹ Leaving running dashboard process(es) untouched because the")
+        print("    Node.js dependency refresh did not complete.")
+        return
+
+    stop_result = _kill_stale_dashboard_processes(restart_managed=True)
+    if not stop_result.get("unrecovered"):
+        return
+
+    print()
+    print(
+        "⚠ A web dashboard/serve process was stopped during update and could "
+        "not be auto-restarted."
+    )
+    print("  Re-launch it when you want the web UI back:")
+    print("    hermes dashboard --port <port>")
 
 
 # Back-compat alias: some tests and any external callers may import the old
@@ -7357,6 +7713,11 @@ def _update_via_zip(args):
             )
         _install_python_dependencies_with_optional_fallback(pip_cmd)
 
+    # ZIP path parity: heal the active memory provider's bridge packages
+    # after the dependency reinstall, same as the git-pull path (#53272,
+    # #70636).
+    _refresh_active_memory_provider_dependencies()
+
     node_failures = _update_node_dependencies()
     _build_web_ui(PROJECT_ROOT / "web")
 
@@ -7480,12 +7841,7 @@ def _update_via_zip(args):
         logger.debug("Curator recent-run notice failed: %s", e)
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
-    if node_failures:
-        print()
-        print("  ℹ Leaving running dashboard process(es) untouched because the")
-        print("    Node.js dependency refresh did not complete.")
-    else:
-        _kill_stale_dashboard_processes(restart_managed=True)
+    _finish_dashboard_update_cleanup(node_failures)
 
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
@@ -9188,6 +9544,55 @@ def _refresh_active_lazy_features(
             "  ⚠ Leaving `.lazy-refresh-incomplete` until import probes can confirm health."
         )
     return False
+
+
+def _refresh_active_memory_provider_dependencies() -> None:
+    """Refresh pip dependencies for the configured external memory provider.
+
+    Memory-provider bridge packages are declared in each provider's
+    ``plugin.yaml`` (plus mode-dependent extras like Hindsight's
+    ``hindsight-all``), NOT in Hermes' editable-install extras or
+    ``LAZY_DEPS`` alone — so the core dependency reinstall above can strip
+    or downgrade them (#53272 mem0ai, #70636 hindsight-embed). Re-run the
+    provider's declared install for the ACTIVE provider only, after the
+    core install and lazy refresh, so the last write to any shared package
+    is the one the active provider needs.
+
+    Never raises. A failure here must not block the rest of the update.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception as exc:
+        logger.debug("Memory provider refresh skipped (config load failed): %s", exc)
+        return
+
+    provider = ""
+    if isinstance(cfg, dict):
+        memory_cfg = cfg.get("memory")
+        if isinstance(memory_cfg, dict):
+            if memory_cfg.get("enabled") is False:
+                return
+            provider = str(memory_cfg.get("provider") or "").strip()
+
+    # "default" / empty is the built-in file-backed store — no pip deps.
+    if not provider or provider in {"default", "builtin", "none"}:
+        return
+
+    try:
+        from hermes_cli.memory_setup import _install_dependencies
+    except Exception as exc:
+        logger.debug("Memory provider refresh skipped (import failed): %s", exc)
+        return
+
+    print()
+    print(f"→ Refreshing active memory provider dependencies ({provider})...")
+
+    try:
+        _install_dependencies(provider, force=True)
+    except Exception as exc:
+        print(f"  ⚠ {provider} dependencies failed to refresh: {exc}")
 
 
 def _install_python_dependencies_with_optional_fallback(
@@ -11074,6 +11479,36 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
     print("    sudo systemctl restart <unit>     # system-scope")
 
 
+def _refresh_windows_gateway_launchers() -> None:
+    """Regenerate installed Windows gateway launcher scripts after update.
+
+    The Scheduled Task / Startup-folder launchers (``gateway.cmd`` +
+    ``gateway.vbs``) are persistence artifacts written once at install time —
+    ``hermes update`` never touched them, so installs created before the
+    hidden-console rework (aa2ae36c3f) kept launching the gateway through
+    ``pythonw.exe`` forever: every descendant spawn flashed a conhost
+    (#54220/#56747) and, since #70344, the console-less gateway died at
+    startup with ``RuntimeError: sys.stderr is None`` (#71671).
+
+    The task's /TR points at a stable script path, so rewriting the files in
+    place retargets the task without any schtasks call (no UAC needed).
+    ``_write_task_script`` is idempotent and renders from current code, so
+    this is a no-op for modern installs. Best-effort: a failed refresh must
+    never fail the update.
+    """
+    if not _is_windows():
+        return
+    try:
+        from hermes_cli import gateway_windows
+
+        if not gateway_windows.is_installed():
+            return
+        gateway_windows._write_task_script()
+        print("  ✓ Refreshed Windows gateway launcher scripts")
+    except Exception as exc:
+        logger.debug("Could not refresh Windows gateway launchers after update: %s", exc)
+
+
 def _resume_windows_gateways_after_update(token: dict | None) -> None:
     """Restart Windows profile gateways previously paused for update."""
     if not token or not token.get("resume_needed"):
@@ -11081,6 +11516,11 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
     token["resume_needed"] = False
     if not _is_windows():
         return
+
+    # Regenerate the persisted launcher scripts before respawning anything,
+    # so a legacy pythonw-era Scheduled Task / Startup entry comes back on
+    # the current hidden-console design at the next login too.
+    _refresh_windows_gateway_launchers()
 
     profiles = token.get("profiles") or {}
     unmapped = token.get("unmapped") or []
@@ -11813,6 +12253,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 "to finish import-based venv repair."
             )
 
+        # Heal the active memory provider's bridge packages last — the core
+        # reinstall + lazy refresh above may have stripped or downgraded
+        # plugin.yaml-declared deps that aren't in extras (#53272, #70636).
+        _refresh_active_memory_provider_dependencies()
+
         node_failures = _update_node_dependencies()
         _build_web_ui(PROJECT_ROOT / "web")
 
@@ -12277,7 +12722,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
                 print()
                 print("→ Refreshing cua-driver (Computer Use)...")
-                install_cua_driver(upgrade=True)
+                # require_confirmed_update: only run the (multi-minute,
+                # silent) upstream installer when the driver's native
+                # check-update verb positively reports a newer release.
+                # An indeterminate check (offline, rate-limited, old
+                # driver) keeps the installed version — `hermes update`
+                # must stay fast; `hermes computer-use install --upgrade`
+                # remains the force path.
+                install_cua_driver(upgrade=True, require_confirmed_update=True)
         except Exception as e:
             logger.debug("cua-driver refresh failed: %s", e)
 
@@ -13016,16 +13468,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             logger.debug("Legacy unit check during update failed: %s", e)
 
         # Restart a managed dashboard through systemd, or stop stale manual
-        # dashboard processes.  Raw-killing a systemd-owned dashboard PID makes
+        # dashboard processes. Raw-killing a systemd-owned dashboard PID makes
         # systemd treat it as a clean stop, leaving the Cloudflare origin dead.
         # Preserve the safety rule above: a failed Node refresh leaves the
         # currently running dashboard untouched.
-        if node_failures:
-            print()
-            print("  ℹ Leaving running dashboard process(es) untouched because the")
-            print("    Node.js dependency refresh did not complete.")
-        else:
-            _kill_stale_dashboard_processes(restart_managed=True)
+        _finish_dashboard_update_cleanup(node_failures)
 
         print()
         print("Tip: You can now select a provider and model:")
@@ -13782,40 +14229,31 @@ def _render_distribution_plan(plan) -> None:
 
 
 def _report_dashboard_status() -> int:
-    """Print ``hermes dashboard`` PIDs and return the count.
+    """Print live listening dashboard processes and return the count."""
+    from gateway.status import _pid_exists
 
-    Uses the same detection logic as ``_find_stale_dashboard_pids`` (the
-    current process is excluded, but since ``hermes dashboard --status``
-    runs in a short-lived CLI process that never matches the pattern,
-    the exclusion is irrelevant here).
-    """
-    pids = _find_stale_dashboard_pids()
-    if not pids:
+    live: list[tuple[int, str]] = []
+    for pid, command in _scan_dashboard_processes():
+        runtime = _parse_dashboard_runtime(command)
+        if runtime is None:
+            continue
+        mode, host, port = runtime
+        if mode != "dashboard":
+            continue
+        if port <= 0 or not _pid_exists(pid):
+            continue
+        if not _dashboard_listening(host, port):
+            continue
+        live.append((pid, command))
+
+    if not live:
         print("No hermes dashboard processes running.")
         return 0
 
-    print(f"{len(pids)} hermes dashboard process(es) running:")
-    for pid in pids:
-        # Best-effort: show the full cmdline so users can tell profiles apart.
-        cmdline = ""
-        try:
-            if sys.platform != "win32":
-                cmdline_path = f"/proc/{pid}/cmdline"
-                if os.path.exists(cmdline_path):
-                    with open(cmdline_path, "rb") as f:
-                        cmdline = (
-                            f.read()
-                            .replace(b"\x00", b" ")
-                            .decode("utf-8", errors="replace")
-                            .strip()
-                        )
-        except (OSError, ValueError):
-            pass
-        if cmdline:
-            print(f"    PID {pid}: {cmdline}")
-        else:
-            print(f"    PID {pid}")
-    return len(pids)
+    print(f"{len(live)} hermes dashboard process(es) running:")
+    for pid, command in live:
+        print(f"    PID {pid}: {command}")
+    return len(live)
 
 
 def _dashboard_listening(host: str, port: int) -> bool:
@@ -13827,7 +14265,7 @@ def _dashboard_listening(host: str, port: int) -> bool:
     import socket
 
     try:
-        with socket.create_connection((host or "127.0.0.1", port), timeout=1.5):
+        with socket.create_connection((_dashboard_probe_host(host), port), timeout=1.5):
             return True
     except OSError:
         return False
@@ -14483,7 +14921,7 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
@@ -15325,6 +15763,11 @@ def main():
     build_security_parser(subparsers, cmd_security=cmd_security)
 
     # =========================================================================
+    # approvals command  (parser built in hermes_cli/subcommands/approvals.py)
+    # =========================================================================
+    build_approvals_parser(subparsers, cmd_approvals=cmd_approvals)
+
+    # =========================================================================
     # dump command  (parser built in hermes_cli/subcommands/dump.py)
     # =========================================================================
     build_dump_parser(subparsers, cmd_dump=cmd_dump)
@@ -15758,7 +16201,7 @@ def main():
         p.add_argument(
             "--newer-than",
             metavar="AGE",
-            help="Only match sessions started within the last AGE "
+            help="Only match sessions active within the last AGE "
             "(e.g. '5h', '2d') or after an ISO timestamp",
         )
         p.add_argument(
@@ -16051,6 +16494,14 @@ def main():
         help="Rows committed per recovery batch (default: 1000)",
     )
     sessions_recover.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help=(
+            "Best-effort salvage across damaged row ranges; the output remains "
+            "separate and every skipped range is recorded"
+        ),
+    )
+    sessions_recover.add_argument(
         "--report",
         type=Path,
         help="JSON report path (defaults to <output>.recovery.json)",
@@ -16063,6 +16514,29 @@ def main():
     )
     sessions_rename.add_argument("session_id", help="Session ID to rename")
     sessions_rename.add_argument("title", nargs="+", help="New title for the session")
+
+    sessions_retitle = sessions_subparsers.add_parser(
+        "retitle-skills",
+        help="Re-title sessions whose auto-title came from a /skill's own text",
+        description=(
+            "Sessions opened with a /skill were auto-titled from the expanded "
+            "message, which embeds the whole skill body — so the title "
+            "describes the SKILL, not the request. This regenerates those "
+            "titles from what the user actually typed. Lists what it would "
+            "change unless --apply is passed."
+        ),
+    )
+    sessions_retitle.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the new titles (default: dry run)",
+    )
+    sessions_retitle.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum sessions to examine (default: 200)",
+    )
 
     sessions_browse = sessions_subparsers.add_parser(
         "browse",
@@ -16159,9 +16633,13 @@ def main():
             source = args.source
             output = getattr(args, "output", None)
             inspect_only = bool(getattr(args, "inspect_only", False))
+            allow_partial = bool(getattr(args, "allow_partial", False))
             report_path = getattr(args, "report", None)
             if inspect_only and output is not None:
                 print("Error: --output cannot be used with --inspect-only.")
+                return 2
+            if inspect_only and allow_partial:
+                print("Error: --allow-partial cannot be used with --inspect-only.")
                 return 2
             if not inspect_only and output is None:
                 print("Error: --output is required unless --inspect-only is used.")
@@ -16203,6 +16681,7 @@ def main():
                         work_dir=getattr(args, "work_dir", None),
                         chunk_size=getattr(args, "chunk_size", 1000),
                         progress_cb=_recovery_progress,
+                        allow_partial=allow_partial,
                     )
                     if last_progress["table"] is not None:
                         print()
@@ -16227,6 +16706,20 @@ def main():
                 print(f"✓ Recovered database verified at: {output}")
                 print("  The active session database was not changed.")
                 print("  Review the JSON report before installing this database.")
+                return 0
+            if allow_partial and report.get("verified"):
+                counts = report.get("verification", {}).get("table_counts", {})
+                print(f"✓ Partial recovery output verified at: {output}")
+                print(
+                    "  Recovered "
+                    f"{int(counts.get('sessions') or 0):,} sessions and "
+                    f"{int(counts.get('messages') or 0):,} messages."
+                )
+                print("  The active session database was not changed.")
+                print(
+                    "  This output is incomplete. Review every skipped range "
+                    "and orphan count in the JSON report before installing it."
+                )
                 return 0
             print("✗ Recovery output did not pass every verification check.")
             print("  Do not install it. Review the JSON report for partial data or errors.")
@@ -16865,12 +17358,14 @@ def main():
                 print(f"No sessions match ({describe_filters(filters)}).")
                 return
 
-            # Candidates are ordered oldest-first — surface the age span so
-            # the confirmation makes the blast radius obvious.
-            _oldest = candidates[0].get("started_at")
-            _newest = candidates[-1].get("started_at")
+            # Candidates are ordered by activity oldest-first. Surface that
+            # span so a long-lived but recently used conversation cannot look
+            # old merely because of its creation date.
+            _oldest = candidates[0].get("last_active")
+            _newest = candidates[-1].get("last_active")
             _span = (
-                f"oldest {format_epoch(_oldest)}, newest {format_epoch(_newest)}"
+                f"oldest activity {format_epoch(_oldest)}, "
+                f"newest activity {format_epoch(_newest)}"
             )
 
             if args.dry_run or not args.yes:
@@ -16883,7 +17378,7 @@ def main():
                     title = (s.get("title") or "")[:36]
                     model = (s.get("model") or "-").split("/")[-1][:24]
                     print(
-                        f"  {s['id']}  {format_epoch(s['started_at']):<17} "
+                        f"  {s['id']}  {format_epoch(s.get('last_active')):<17} "
                         f"{s['source']:<10} {model:<24} "
                         f"{s['message_count']:>4} msgs  {title}"
                     )
@@ -16924,6 +17419,67 @@ def main():
                     print(f"Session '{args.session_id}' not found.")
             except ValueError as e:
                 print(f"Error: {e}")
+
+        elif action == "retitle-skills":
+            from agent.skill_commands import describe_skill_invocation
+            from agent.title_generator import generate_title
+
+            limit = max(1, int(getattr(args, "limit", 200) or 200))
+            apply_changes = bool(getattr(args, "apply", False))
+
+            def _is_titlelike(candidate: str) -> bool:
+                """Reject a candidate that isn't a title at all.
+
+                An auxiliary model occasionally answers the prompt instead of
+                titling it and echoes the assistant's output ('$ df -h /'). The
+                live path has no alternative and takes what it gets, but this is
+                a REPAIR — replacing a serviceable title with command output
+                would make things worse, so keep the old one.
+                """
+                return bool(candidate) and candidate[0].isalnum()
+
+            candidates = db.list_skill_scaffolded_sessions(limit=limit)
+            if not candidates:
+                print("No sessions were titled from a /skill invocation.")
+                return
+
+            print(
+                f"{len(candidates)} session(s) opened with a /skill"
+                f"{'' if apply_changes else ' (dry run — pass --apply to write)'}:"
+            )
+            changed = 0
+            for row in candidates:
+                session_id = row["id"]
+                typed = describe_skill_invocation(row["content"]) or ""
+                first_reply = db.get_first_assistant_text(session_id) or ""
+                new_title = generate_title(typed, first_reply)
+                if not new_title or new_title == row["title"]:
+                    continue
+                if not _is_titlelike(new_title):
+                    print(f"  {session_id}\n    kept {row['title']!r} — got {new_title!r}")
+                    continue
+                print(f"  {session_id}\n    {row['title']!r}\n    → {new_title!r}")
+                changed += 1
+                if not apply_changes:
+                    continue
+                try:
+                    db.set_session_title(session_id, new_title)
+                except ValueError:
+                    # Unique-title collision. Dedupe the same way the live
+                    # auto-titler does (base #2, base #3, ...) rather than
+                    # leaving the leaked title in place.
+                    deduped = db.get_next_title_in_lineage(new_title)
+                    try:
+                        db.set_session_title(session_id, deduped)
+                        print(f"    (renamed to {deduped!r} — title was taken)")
+                    except ValueError as e:
+                        print(f"    skipped: {e}")
+                        changed -= 1
+
+            if not changed:
+                print("  every title already reflects the user's request.")
+            elif apply_changes:
+                print(f"✓ Re-titled {changed} session(s).")
 
         elif action == "browse":
             limit = getattr(args, "limit", 500) or 500

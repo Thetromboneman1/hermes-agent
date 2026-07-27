@@ -30,6 +30,7 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
 
@@ -296,6 +297,131 @@ def _stringify_tool_content(content: Any) -> str:
     if isinstance(content, dict):
         return json.dumps(content, ensure_ascii=False, default=str)
     return str(content)
+
+
+_TOOL_INPUT_TARGET_KEYS = frozenset({
+    "cwd",
+    "destination_path",
+    "directory",
+    "dst",
+    "endpoint",
+    "file_path",
+    "new_path",
+    "old_path",
+    "path",
+    "source_path",
+    "src",
+    "target_path",
+    "url",
+    "urls",
+})
+_TOOL_INPUT_URL_KEYS = frozenset({"endpoint", "url", "urls"})
+
+
+def _sanitize_tool_target(key: str, value: Any) -> Any:
+    """Keep bounded side-effect targets while dropping URL secrets."""
+    if isinstance(value, list):
+        cleaned = [
+            item for item in (_sanitize_tool_target(key, item) for item in value[:16])
+            if item is not None
+        ]
+        return cleaned or None
+    if not isinstance(value, str) or not value:
+        return None
+    bounded = value[:1024]
+    if key in _TOOL_INPUT_URL_KEYS:
+        try:
+            parsed = urlsplit(bounded)
+            if parsed.scheme and parsed.netloc:
+                hostname = parsed.hostname
+                if not hostname:
+                    return None
+                # ``SplitResult.netloc`` includes ``user:password@``. Rebuild
+                # the authority from parsed host/port so hook-visible history
+                # cannot carry URL credentials. Bracket IPv6 literals before
+                # appending a validated port.
+                host = f"[{hostname}]" if ":" in hostname else hostname
+                port = parsed.port
+                netloc = f"{host}:{port}" if port is not None else host
+                return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+        except ValueError:
+            return None
+    return bounded
+
+
+def _summarize_tool_arguments(arguments: Any) -> Dict[str, Any]:
+    """Summarize argument names and side-effect targets without raw payloads."""
+    if not isinstance(arguments, str):
+        return {"argument_keys": [], "targets": {}}
+    try:
+        parsed = json.loads(arguments)
+    except (TypeError, ValueError):
+        return {"argument_keys": [], "targets": {}}
+    if not isinstance(parsed, dict):
+        return {"argument_keys": [], "targets": {}}
+
+    keys = sorted(str(key)[:128] for key in parsed)[:64]
+    targets: Dict[str, Any] = {}
+    for raw_key, value in parsed.items():
+        key = str(raw_key).lower()
+        if key not in _TOOL_INPUT_TARGET_KEYS:
+            continue
+        cleaned = _sanitize_tool_target(key, value)
+        if cleaned is not None:
+            targets[key] = cleaned
+    return {"argument_keys": keys, "targets": targets}
+
+
+def _sanitize_tool_input_summary(summary: Any) -> Dict[str, Any]:
+    if not isinstance(summary, dict):
+        return {"argument_keys": [], "targets": {}}
+    keys = summary.get("argument_keys")
+    safe_keys = (
+        [str(key)[:128] for key in keys[:64]]
+        if isinstance(keys, list)
+        else []
+    )
+    targets = summary.get("targets")
+    safe_targets: Dict[str, Any] = {}
+    if isinstance(targets, dict):
+        for raw_key, value in targets.items():
+            key = str(raw_key).lower()
+            if key not in _TOOL_INPUT_TARGET_KEYS:
+                continue
+            cleaned = _sanitize_tool_target(key, value)
+            if cleaned is not None:
+                safe_targets[key] = cleaned
+    return {"argument_keys": safe_keys, "targets": safe_targets}
+
+
+def _subagent_stop_tool_call_history(tool_trace: Any) -> List[Dict[str, Any]]:
+    """Build a detached, metadata-only tool history for lifecycle hooks."""
+    if not isinstance(tool_trace, list):
+        return []
+
+    history: List[Dict[str, Any]] = []
+    for item in tool_trace:
+        if not isinstance(item, dict):
+            continue
+        tool_name = str(item.get("tool") or "unknown")[:256]
+        status = str(item.get("status") or "unknown").lower()
+        if status not in {"ok", "error"}:
+            status = "unknown"
+
+        def _byte_count(key: str) -> int:
+            value = item.get(key, 0)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return 0
+            return max(0, int(value))
+
+        history.append({
+            "tool_name": tool_name,
+            "tool_input": _sanitize_tool_input_summary(item.get("input_summary")),
+            "input_bytes": _byte_count("args_bytes"),
+            "output_bytes": _byte_count("result_bytes"),
+            "status": status,
+        })
+    return history
 
 
 def _looks_like_error_output(content: Any) -> bool:
@@ -1497,6 +1623,7 @@ def _dump_subagent_timeout_diagnostic(
         import datetime as _dt
         import sys as _sys
         import traceback as _traceback
+        import threading as _threading
 
         hermes_home = get_hermes_home()
         logs_dir = hermes_home / "logs"
@@ -1601,6 +1728,37 @@ def _dump_subagent_timeout_diagnostic(
             _w("  <no worker thread handle>")
         else:
             _w("  <worker thread already exited>")
+        _w("")
+
+        # All other live threads. The conversation worker's own stack often
+        # shows it parked waiting on a nested helper thread (interrupt worker,
+        # daemon-pool sibling) — without the full picture, a pre-HTTP wedge
+        # (#60203/#62151) is indistinguishable from a slow provider. Best
+        # effort and bounded: names + stacks for up to 40 threads.
+        _w("## All thread stacks at timeout")
+        try:
+            frames = _sys._current_frames()
+            by_ident = {
+                th.ident: th for th in _threading.enumerate() if th.ident
+            }
+            worker_ident = worker_thread.ident if worker_thread else None
+            dumped = 0
+            for ident, frame in frames.items():
+                if ident == worker_ident:
+                    continue  # already dumped above
+                if dumped >= 40:
+                    _w(f"  <{len(frames) - dumped - 1} more threads omitted>")
+                    break
+                th = by_ident.get(ident)
+                name = th.name if th else f"ident={ident}"
+                daemon = " daemon" if (th and th.daemon) else ""
+                _w(f"  --- {name}{daemon} ---")
+                for frame_line in _traceback.format_stack(frame):
+                    for sub in frame_line.rstrip().split("\n"):
+                        _w(f"    {sub}")
+                dumped += 1
+        except Exception as exc:
+            _w(f"  <all-thread dump failed: {exc}>")
         _w("")
 
         _w("## Notes")
@@ -2094,8 +2252,11 @@ def _run_single_child(
                     _err = (
                         f"Subagent timed out after {child_timeout}s with "
                         f"{child_api_calls} API call(s) completed — likely "
-                        f"stuck on a slow API call or unresponsive network request."
+                        f"stuck on a slow API call, tool call, or unresponsive "
+                        f"network request."
                     )
+                    if diagnostic_path:
+                        _err += f" Diagnostic: {diagnostic_path}"
             else:
                 _err = str(_timeout_exc)
 
@@ -2107,6 +2268,13 @@ def _run_single_child(
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
+                "timeout_seconds": child_timeout if is_timeout else None,
+                "timed_out_after_seconds": duration if is_timeout else None,
+                "timeout_phase": (
+                    "before_first_llm_call" if is_timeout and child_api_calls == 0
+                    else "after_llm_calls" if is_timeout
+                    else None
+                ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
@@ -2158,9 +2326,11 @@ def _run_single_child(
                 if msg.get("role") == "assistant":
                     for tc in msg.get("tool_calls") or []:
                         fn = tc.get("function", {})
+                        arguments = fn.get("arguments", "")
                         entry_t = {
                             "tool": fn.get("name", "unknown"),
-                            "args_bytes": len(fn.get("arguments", "")),
+                            "args_bytes": len(arguments),
+                            "input_summary": _summarize_tool_arguments(arguments),
                         }
                         tool_trace.append(entry_t)
                         tc_id = tc.get("id")
@@ -2854,6 +3024,9 @@ def delegate_task(
                     child_role=child_role,
                     child_summary=entry.get("summary"),
                     child_status=entry.get("status"),
+                    tool_call_history=_subagent_stop_tool_call_history(
+                        entry.get("tool_trace")
+                    ),
                     duration_ms=int((entry.get("duration_seconds") or 0) * 1000),
                 )
             except Exception:
@@ -3038,6 +3211,38 @@ def delegate_task(
                 except Exception:
                     pass
 
+        def _batch_progress():
+            # Progress token for the async registry's stale monitor: the
+            # combined (api_call_count, current_tool, last_activity_ts) of
+            # every child. last_activity_ts is ticked by _touch_activity on
+            # every streamed chunk ("receiving stream response"), every tool
+            # transition, and every API-call start/completion — so a child
+            # streaming a long response is alive even though api_call_count
+            # only advances when the call completes (same liveness signal as
+            # the compaction inactivity budget, PR #71508). A fully frozen
+            # token past the stale threshold means the detached batch is
+            # wedged (e.g. stuck inside the first model API call — #60203).
+            # in_tool=True while ANY child is inside a tool so legitimately
+            # slow tools get the higher staleness ceiling, mirroring the
+            # sync-path heartbeat monitor.
+            parts = []
+            in_tool = False
+            for _c in _child_agents:
+                try:
+                    _summary = _c.get_activity_summary()
+                    _tool = _summary.get("current_tool")
+                    parts.append(
+                        (
+                            _summary.get("api_call_count", 0),
+                            _tool,
+                            _summary.get("last_activity_ts"),
+                        )
+                    )
+                    in_tool = in_tool or bool(_tool)
+                except Exception:
+                    parts.append(None)
+            return tuple(parts), in_tool
+
         _goals = [t["goal"] for t in task_list]
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
@@ -3057,6 +3262,7 @@ def delegate_task(
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
+            progress_fn=_batch_progress,
         )
 
         if dispatch.get("status") == "dispatched":
