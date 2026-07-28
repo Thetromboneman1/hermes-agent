@@ -2322,15 +2322,31 @@ DEFAULT_CONFIG = {
         # Set false to keep STT for the agent while suppressing that user-facing echo.
         "echo_transcripts": True,
         "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe) | "deepinfra"
+        # Global language hint applied to EVERY provider unless a per-provider
+        # language overrides it. Defaults to "en" — Whisper auto-detection
+        # frequently misidentifies short/accented clips, which reads as
+        # "STT transcribed the wrong language". Set to "" to restore
+        # auto-detect, or to your language code ("es", "zh", "uk", ...).
+        "language": "en",
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+            "initial_prompt": "",
+        },
+        "groq": {
+            "model": "whisper-large-v3-turbo",  # whisper-large-v3, whisper-large-v3-turbo, distil-whisper-large-v3-en
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "openai": {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+        },
+        "xai": {
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "elevenlabs": {
             "model_id": "scribe_v2",  # scribe_v2, scribe_v1
@@ -2352,6 +2368,10 @@ DEFAULT_CONFIG = {
         "silence_threshold": 200,     # RMS below this = silence (0-32767)
         "silence_duration": 3.0,      # Seconds of silence before auto-stop
         "barge_in": True,             # Stop TTS playback when the user starts talking
+        # Saying EXACTLY one of these phrases (and nothing else) ends the
+        # voice chat instead of being sent to the agent. Case-insensitive,
+        # surrounding punctuation ignored. Set [] to disable.
+        "stop_phrases": ["stop"],
     },
     
     "human_delay": {

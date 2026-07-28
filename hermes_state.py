@@ -135,6 +135,24 @@ def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
 
 
+def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
+    """Match sessions whose ``workspace_key(row)`` equals ``key``.
+
+    Mirrors :func:`workspace_key`: a session belongs to workspace ``key``
+    when its recorded ``git_repo_root`` equals ``key``, or — for rows that
+    predate per-session git metadata — when its ``cwd`` is at or under
+    ``key`` (so a session started in ``repo/src`` still groups with ``repo``).
+    Used by ``hermes -c``/``--resume`` to continue the most recent session in
+    the *current* workspace rather than the global MRU.
+    """
+    prefix = key.rstrip("/\\") or key
+    cwd_clause, cwd_params = _cwd_prefix_clause(prefix)
+    return (
+        f"(s.git_repo_root = ? OR (COALESCE(s.git_repo_root, '') = '' AND {cwd_clause}))",
+        [prefix, *cwd_params],
+    )
+
+
 # Session preview = the head of the first user message, shown wherever a
 # session has no title (sidebar rows, pickers, exports, the desktop's
 # `sessionTitle` fallback).
@@ -826,6 +844,96 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
         return None
+
+
+def preflight_db_writability(
+    db_path: Path,
+    *,
+    db_label: str = "state.db",
+) -> None:
+    """Refuse-or-repair read-only DB files BEFORE the first connection opens.
+
+    Port of Kilo-Org/kilocode#12508's startup preflight. A stray read-only
+    ``state.db`` / ``-wal`` / ``-shm`` (sudo run, restored backup, copied
+    dotfiles) previously surfaced as an opaque
+    ``sqlite3.OperationalError: attempt to write a readonly database`` raised
+    from deep inside ``_init_schema`` — naming no file and no fix — and the
+    obvious wrong "fix" (deleting the ``-wal``) silently loses committed
+    transactions. This preflight:
+
+    - **Repairs** permissions with ``chmod u+rw`` when the file lives inside
+      the Hermes home tree (``get_hermes_home()``) — the safe repair scope:
+      Hermes owns those files, and the OS makes ``chmod`` fail on files the
+      user doesn't own, which bounds the repair exactly.
+    - **Fails fast with an actionable error** naming the exact file and the
+      exact ``chmod`` command for anything else (root-owned files, read-only
+      mounts, custom paths outside the home tree).
+    - Never deletes or truncates a WAL sidecar — once writable, the normal
+      open path checkpoints its committed frames into the DB as intended.
+
+    ``:memory:`` and ``file:`` URI paths are skipped (no plain on-disk files
+    to check). Shared by :class:`SessionDB` and ``hermes_cli.kanban_db``.
+    """
+    raw = str(db_path)
+    if raw == ":memory:" or raw.startswith("file:"):
+        return
+
+    try:
+        home: Optional[Path] = Path(get_hermes_home()).resolve()
+    except Exception:  # pragma: no cover - defensive
+        home = None
+
+    def _in_repair_scope(p: Path) -> bool:
+        if home is None:
+            return False
+        try:
+            return p.resolve().is_relative_to(home)
+        except (OSError, ValueError):
+            return False
+
+    def _ensure_writable(p: Path, *, is_dir: bool = False) -> None:
+        import stat as _stat
+
+        if os.access(p, os.R_OK | os.W_OK):
+            return
+        if _in_repair_scope(p):
+            try:
+                add = _stat.S_IRUSR | _stat.S_IWUSR | (_stat.S_IXUSR if is_dir else 0)
+                os.chmod(p, p.stat().st_mode | add)
+            except OSError:
+                pass
+            if os.access(p, os.R_OK | os.W_OK):
+                logger.info(
+                    "%s preflight: repaired read-only %s (chmod u+rw%s)",
+                    db_label,
+                    p,
+                    "x" if is_dir else "",
+                )
+                return
+        kind = "directory" if is_dir else "file"
+        wal_note = (
+            " Do NOT delete the -wal file — it contains committed data that "
+            "will be merged into the database once it is writable."
+            if p.name.endswith("-wal")
+            else ""
+        )
+        raise sqlite3.OperationalError(
+            f"{db_label} is not writable: {kind} {p} is read-only for this "
+            f"user. Hermes needs read-write access to open the database. "
+            f"Fix with: chmod u+rw{'x' if is_dir else ''} '{p}'"
+            f" (files owned by another user may need sudo/chown).{wal_note}"
+        )
+
+    parent = db_path.parent
+    if parent.is_dir():
+        # SQLite needs a writable directory in every journal mode (WAL and
+        # SHM sidecars in WAL mode; the rollback journal in DELETE mode).
+        _ensure_writable(parent, is_dir=True)
+
+    for suffix in ("", "-wal", "-shm"):
+        p = db_path.with_name(db_path.name + suffix) if suffix else db_path
+        if p.is_file():
+            _ensure_writable(p)
 
 
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
@@ -1929,6 +2037,13 @@ class SessionDB:
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Read-only file/sidecar preflight (port of kilocode#12508):
+            # repair-or-refuse BEFORE the first connection so users get an
+            # actionable message instead of an opaque "attempt to write a
+            # readonly database" from deep inside _init_schema.
+            if not read_only:
+                preflight_db_writability(self.db_path, db_label="state.db")
 
             # #68474: zeroed state.db (size>0, all-NUL header) used to fail as a
             # generic "file is not a database" with no recovery path. Quarantine
@@ -8656,12 +8771,18 @@ class SessionDB:
         source: str = None,
         limit: int = 20,
         offset: int = 0,
+        workspace_key: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions, optionally filtered by source.
 
         Returns rows enriched with a computed ``last_active`` column (latest
         message timestamp for the session, falling back to ``started_at``),
         ordered by most-recently-used first.
+
+        Pass ``workspace_key`` to scope rows to one workspace — matching
+        :func:`workspace_key` semantics (git repo root, else cwd). Used by
+        ``hermes -c``/``--resume`` so the "last" session is the last one in
+        the *current* workspace, not the global MRU.
         """
         select_with_last_active = (
             "SELECT s.*, COALESCE(m.last_active, s.started_at) AS last_active "
@@ -8671,20 +8792,24 @@ class SessionDB:
             "FROM messages GROUP BY session_id"
             ") m ON m.session_id = s.id "
         )
+        where_clauses = []
+        params: list = []
+        if source:
+            where_clauses.append("s.source = ?")
+            params.append(source)
+        if workspace_key:
+            ws_clause, ws_params = _workspace_key_clause(workspace_key)
+            where_clauses.append(ws_clause)
+            params.extend(ws_params)
+        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        params.extend([limit, offset])
         with self._lock:
-            if source:
-                cursor = self._conn.execute(
-                    f"{select_with_last_active}"
-                    "WHERE s.source = ? "
-                    "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
-                    (source, limit, offset),
-                )
-            else:
-                cursor = self._conn.execute(
-                    f"{select_with_last_active}"
-                    "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                )
+            cursor = self._conn.execute(
+                f"{select_with_last_active}"
+                f"{where_sql} "
+                "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
+                params,
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     # =========================================================================

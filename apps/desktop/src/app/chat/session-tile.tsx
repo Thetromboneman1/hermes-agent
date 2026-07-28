@@ -126,9 +126,9 @@ function TileChat({
   const scope = useMemo<ComposerScope>(
     () => ({
       $awaitingInput: sessionAwaitingInput(runtimeId),
+      $messages: view.$messages,
       attachments,
       popoutAllowed: false,
-      readMessages: () => view.$messages.get(),
       target: `tile:${storedSessionId}`
     }),
     [attachments, runtimeId, storedSessionId, view.$messages]
@@ -170,7 +170,6 @@ function TileChat({
           onAddUrl={url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url)}
           onAttachDroppedItems={composer.attachDroppedItems}
           onAttachImageBlob={composer.attachImageBlob}
-          onBranchInNewChat={() => undefined}
           onCancel={actions.cancelRun}
           onDeleteSelectedSession={() => undefined}
           onDismissError={actions.dismissError}
