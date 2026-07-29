@@ -78,12 +78,113 @@ _DEFAULT_SIDECAR_BIND = "127.0.0.1"
 # size to ~16 KB.  Keep a conservative cap that matches BlueBubbles.
 _MAX_MESSAGE_LENGTH = 8000
 
+# ---------------------------------------------------------------------------
+# Sidecar runtime record
+#
+# Out-of-process senders (cron subprocesses, `hermes send`, the dashboard)
+# go through ``_standalone_send`` and need the live sidecar's port + token —
+# but the token is generated at spawn time and otherwise exists only in the
+# gateway process memory and the sidecar child env (issue #69960). The
+# gateway persists this record once the sidecar passes its /healthz
+# readiness check, and removes it on every stop / failed-start path so a
+# stale record never outlives a dead sidecar.
+
+_RUNTIME_RECORD_NAME = "photon-sidecar.json"
+
+
+def _runtime_record_path() -> Path:
+    # get_hermes_home() honors profile overrides — never hardcode ~/.hermes.
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "runtime" / _RUNTIME_RECORD_NAME
+
+
+def _write_runtime_record(port: int, token: str, pid: int) -> None:
+    """Atomically persist ``{port, token, pid}`` with owner-only perms."""
+    import tempfile
+
+    try:
+        path = _runtime_record_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".photon-sidecar.", suffix=".tmp"
+        )
+        try:
+            # Restrict perms BEFORE the token hits disk (mkstemp is already
+            # 0600 on POSIX; the explicit chmod is a belt-and-braces guard,
+            # wrapped so Windows/exotic filesystems can't crash the write).
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:  # pragma: no cover - Windows / odd fs
+                pass
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"port": port, "token": token, "pid": pid}, fh)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:  # best-effort: gateway sends still work without it
+        logger.warning("[photon] failed to write sidecar runtime record: %s", e)
+
+
+def _read_runtime_record() -> Optional[Dict[str, Any]]:
+    try:
+        raw = json.loads(_runtime_record_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _delete_runtime_record() -> None:
+    try:
+        _runtime_record_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _sidecar_pid_alive(pid: Any) -> bool:
+    """Best-effort liveness check for the recorded sidecar pid."""
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0:
+        return False
+    try:
+        # Cross-platform (psutil-backed, Windows-safe — see its docstring).
+        from gateway.status import _pid_exists
+
+        return bool(_pid_exists(pid_int))
+    except Exception:
+        pass
+    if os.name == "posix":
+        try:
+            os.kill(pid_int, 0)  # windows-footgun: ok — inside os.name == "posix" guard
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+    # Windows without gateway.status/psutil: can't probe safely
+    # (os.kill(pid, 0) is destructive there) — assume alive and let the
+    # HTTP send itself be the arbiter.
+    return True
+
 # Dedup parameters — the gRPC stream is at-least-once, and a sidecar
 # reconnect can replay, so keep at least 1k ids for ~48h.
 _DEDUP_MAX_SIZE = 4000
 _DEDUP_WINDOW_SECONDS = 48 * 3600
 
+_FFFC_WAIT_SECONDS = 15.0  # Timeout for waiting on an attachment after a U+FFFC placeholder.
+
 _SIDECAR_DIR = Path(__file__).parent / "sidecar"
+_NPM_ERROR_LOG = _SIDECAR_DIR / ".photon-npm-error.log"
+_NPM_ERROR_LOG_MAX_CHARS = 300
 
 # Cap on a self-heal `npm ci`/`npm install` of the sidecar deps. A cold
 # install of the pinned spectrum-ts tree normally takes well under a minute;
@@ -122,6 +223,66 @@ _DEFAULT_MENTION_PATTERNS = [
 # ---------------------------------------------------------------------------
 # Module-level helpers — also used by check_fn / standalone send
 
+class PhotonSidecarError(RuntimeError):
+    """Structured failure returned by the supervised Photon sidecar."""
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        status_code: int,
+        error: str,
+        error_class: str = "sidecar_error",
+        retryable: bool = False,
+    ) -> None:
+        self.path = path
+        self.status_code = status_code
+        self.error = error
+        self.error_class = error_class
+        self.retryable = retryable
+        super().__init__(
+            f"Photon sidecar {path} returned {status_code} "
+            f"({error_class}, retryable={retryable}): {error}"
+        )
+
+
+def _sidecar_error_from_response(
+    path: str,
+    status_code: int,
+    text: str,
+    data: Optional[Dict[str, Any]] = None,
+) -> PhotonSidecarError:
+    if data is None:
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = {}
+        data = parsed if isinstance(parsed, dict) else {}
+
+    error = str(data.get("error") or text[:200] or "sidecar error")
+    error_class = str(data.get("error_class") or "sidecar_error")
+    retryable = bool(data.get("retryable"))
+    if error_class == "target_not_allowed":
+        # Structured code path: replace whatever the sidecar echoed with the
+        # canonical user-facing explanation — never raw upstream error text.
+        error = _TARGET_NOT_ALLOWED_MESSAGE
+        retryable = False
+    return PhotonSidecarError(
+        path=path,
+        status_code=status_code,
+        error=error,
+        error_class=error_class,
+        retryable=retryable,
+    )
+
+# User-facing explanation for the Spectrum "Target not allowed for this
+# project" AuthenticationError. Shared/free-tier lines can only reply to
+# conversations the target initiated; they cannot open new outbound threads.
+_TARGET_NOT_ALLOWED_MESSAGE = (
+    "shared/free-tier Photon lines cannot initiate outbound sends to new "
+    "targets — upgrade to a dedicated line or use another delivery channel"
+)
+
 def _coerce_port(value: Any, default: int) -> int:
     try:
         return int(value)
@@ -129,16 +290,59 @@ def _coerce_port(value: Any, default: int) -> int:
         return default
 
 
+def sidecar_deps_installed() -> bool:
+    """True when spectrum-ts is present under node_modules/.
+
+    Checks the dependency's own directory, not just node_modules/'s
+    existence: npm creates node_modules/ before aborting on ENOSPC, a
+    network timeout, or EACCES, so an empty/partial node_modules/ would
+    otherwise read as "installed". Shared by check_requirements(),
+    _start_sidecar(), and `hermes photon status` so all three agree on
+    what "installed" means.
+    """
+    return (_SIDECAR_DIR / "node_modules" / "spectrum-ts").exists()
+
+
 def check_requirements() -> bool:
     """Return True when both Python deps and the Node sidecar are available."""
     if not HTTPX_AVAILABLE:
+        logger.warning("photon: httpx not installed — pip install httpx")
         return False
     if not shutil.which(os.getenv("PHOTON_NODE_BIN") or "node"):
+        logger.warning(
+            "photon: node binary '%s' not found on PATH",
+            os.getenv("PHOTON_NODE_BIN") or "node",
+        )
         return False
-    if not (_SIDECAR_DIR / "node_modules").exists():
-        # spectrum-ts not installed yet — `hermes photon setup` will
-        # install it.  check_fn still returns False so the gateway
-        # surfaces the missing-deps state in `hermes setup` / status.
+    if not sidecar_deps_installed():
+        # spectrum-ts not installed yet, or node_modules/ was partially created
+        # by an aborted npm install (ENOSPC, network timeout, EACCES).
+        # Checking spectrum-ts presence — not just node_modules/ existence —
+        # prevents a false positive where an empty/broken node_modules/ dir
+        # causes check_requirements() to return True while the sidecar crashes
+        # at runtime with an unrelated-looking missing-module error.
+        # DEBUG (not WARNING): this is the normal pre-setup state.
+        # check_fn() is called from multiple hot paths in the core
+        # (load_gateway_config, hermes status, GET /api/status polling) —
+        # WARNING here would spam logs on every probe for unconfigured photon.
+        npm_error = ""
+        try:
+            if _NPM_ERROR_LOG.exists():
+                npm_error = _NPM_ERROR_LOG.read_text(encoding="utf-8").strip()[:_NPM_ERROR_LOG_MAX_CHARS]
+        except OSError:
+            pass
+        if npm_error:
+            logger.debug(
+                "photon: spectrum-ts not installed at %s "
+                "(last npm error: %s) — run: hermes photon setup",
+                _SIDECAR_DIR,
+                npm_error,
+            )
+        else:
+            logger.debug(
+                "photon: spectrum-ts not installed at %s — run: hermes photon setup",
+                _SIDECAR_DIR,
+            )
         return False
     return True
 
@@ -278,6 +482,10 @@ class PhotonAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = _MAX_MESSAGE_LENGTH
+    # Photon (iMessage) has no real edit API for already-sent messages.
+    # Mark it explicitly so streaming suppresses the visible cursor instead
+    # of leaving a stale tofu square (▉) behind when edit attempts fail.
+    SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("photon"))
@@ -339,6 +547,8 @@ class PhotonAdapter(BasePlatformAdapter):
         self._last_inbound_by_chat: Dict[str, str] = {}
         # Last time we sent a typing indicator per chat, for cooldown gating.
         self._typing_last_sent: Dict[str, float] = {}
+
+        self._pending_fffc: Dict[str, tuple[float, Any]] = {}  # chat_key → (timestamp, asyncio.Task)
 
         # Group-chat mention gating (parity with BlueBubbles). When enabled,
         # group messages are ignored unless they match a wake word; DMs are
@@ -432,7 +642,7 @@ class PhotonAdapter(BasePlatformAdapter):
             )
             return False
 
-        client = httpx.AsyncClient(timeout=30.0)
+        client = httpx.AsyncClient(timeout=30.0, trust_env=False)
         self._http_client = client
 
         # The sidecar holds the gRPC stream for BOTH directions, so it is
@@ -446,6 +656,9 @@ class PhotonAdapter(BasePlatformAdapter):
                     f"failed to start Photon sidecar: {e}",
                     retryable=True,
                 )
+                # No live sidecar — make sure no stale runtime record
+                # survives to mislead standalone senders.
+                _delete_runtime_record()
                 await client.aclose()
                 self._http_client = None
                 return False
@@ -484,14 +697,21 @@ class PhotonAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
         if self._inbound_task is not None:
-            self._inbound_task.cancel()
-            try:
-                await self._inbound_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
+            task = self._inbound_task
             self._inbound_task = None
+            task.cancel()
+            if task is not asyncio.current_task():
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+        # Cancel any pending U+FFFC placeholder tasks.
+        for chat_key, (_, fffc_task) in list(self._pending_fffc.items()):
+            if fffc_task and not fffc_task.done():
+                fffc_task.cancel()
+        self._pending_fffc.clear()
         await self._stop_sidecar()
         if self._http_client is not None:
             try:
@@ -500,6 +720,47 @@ class PhotonAdapter(BasePlatformAdapter):
                 pass
             self._http_client = None
         self._mark_disconnected()
+
+    def _dispatch_fatal_notification(self) -> None:
+        """Notify the gateway of a fatal error from a detached task.
+
+        ``_monitor_sidecar_health`` and ``_supervise_sidecar`` run as
+        ``self._sidecar_health_task`` / ``self._sidecar_supervisor_task`` and
+        used to call ``await self._notify_fatal_error()`` directly, on their
+        own call stack. That routes straight into
+        ``GatewayRunner._handle_adapter_fatal_error_impl``, which tears the
+        adapter down via ``_safe_adapter_disconnect`` -> ``disconnect()``.
+        ``disconnect()`` cancels ``self._sidecar_health_task`` and awaits it
+        to make sure it's really gone -- but when the *health task itself* is
+        what's driving this whole notification (the common case: the health
+        poll is what detected the fatal condition), that task IS the one
+        awaiting several frames up the stack, so ``disconnect()`` cancels and
+        awaits its own caller. ``disconnect()``'s
+        ``task is not asyncio.current_task()`` guard doesn't catch this,
+        because the wrapper task ``_await_adapter_cleanup_with_timeout``
+        creates around ``disconnect()`` (via ``asyncio.ensure_future``) is
+        the current task there, not the health/supervisor task further up
+        the plain-await chain. The self-cancellation throws an unhandled
+        ``CancelledError`` through the health/supervisor task with nothing
+        to catch it -- ``CancelledError`` stopped subclassing ``Exception``
+        in Python 3.8, so the ``except Exception`` around the notify call
+        never saw it -- and the task dies silently mid-handoff: no log line,
+        no retry, the platform stranded with no automated way back.
+
+        Dispatching the notification onto a brand-new task instead -- the
+        same pattern ``DiscordAdapter._handle_bot_task_done`` already uses --
+        means ``disconnect()`` can cancel the health/supervisor task freely
+        without that cancellation ever reaching back into the code that's
+        still running the handoff, so the handoff always reaches the
+        reconnect queue.
+        """
+        asyncio.create_task(self._notify_fatal_error_logged())
+
+    async def _notify_fatal_error_logged(self) -> None:
+        try:
+            await self._notify_fatal_error()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("[photon] fatal-error notification failed: %s", exc)
 
     # -- Inbound stream consumer ------------------------------------------
 
@@ -580,10 +841,7 @@ class PhotonAdapter(BasePlatformAdapter):
                 message,
                 retryable=True,
             )
-            try:
-                await self._notify_fatal_error()
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("[photon] fatal-error notification failed: %s", exc)
+            self._dispatch_fatal_notification()
             break
 
     async def _on_inbound_line(self, line: str) -> None:
@@ -616,6 +874,14 @@ class PhotonAdapter(BasePlatformAdapter):
             for old in list(seen.keys())[: len(seen) - _DEDUP_MAX_SIZE]:
                 del seen[old]
         return False
+
+    async def _fffc_timeout_handler(self, chat_key: str, message_id: str) -> None:
+        await asyncio.sleep(_FFFC_WAIT_SECONDS)
+        if self._pending_fffc.pop(chat_key, None):
+            logger.warning(
+                "[photon] wait for attachment was too long, can't retrieve attachment data "
+                "(message %s, chat %s)", message_id, chat_key,
+            )
 
     async def _dispatch_inbound(self, event: Dict[str, Any]) -> None:
         """Normalize a sidecar inbound event and dispatch it to the gateway.
@@ -677,6 +943,11 @@ class PhotonAdapter(BasePlatformAdapter):
             is_voice = payload.get("type") == "voice"
             name = payload.get("name") or ("voice" if is_voice else "(unnamed)")
             mime = payload.get("mimeType") or ""
+            # Promote CAF attachments to VOICE (iMessage voice notes use CAF).
+            # Check both filename and MIME: the sidecar may send "(unnamed)"
+            # when no name is supplied, so the MIME type is the reliable signal.
+            if not is_voice and (name.lower().endswith(".caf") or mime == "audio/x-caf"):
+                is_voice = True
             mtype = MessageType.VOICE if is_voice else _attachment_message_type(mime)
             cached = _cache_inbound_attachment(
                 payload, name, mime, force_audio=is_voice
@@ -747,6 +1018,28 @@ class PhotonAdapter(BasePlatformAdapter):
                 )
             )
             return
+        # U+FFFC placeholder — wait for the real attachment instead of
+        # dispatching. Detected before _record_last_inbound so the placeholder
+        # is not recorded as the reaction target — the real attachment will be.
+        if ctype == "text" and (content.get("text") or "").strip() == "\ufffc":
+            chat_key = space_id
+            prev = self._pending_fffc.pop(chat_key, None)
+            if prev and prev[1] and not prev[1].done():
+                prev[1].cancel()
+            task = asyncio.create_task(
+                self._fffc_timeout_handler(chat_key, event.get("messageId") or "")
+            )
+            self._pending_fffc[chat_key] = (time.monotonic(), task)
+            logger.debug("[photon] U+FFFC placeholder received — waiting for attachment")
+            return
+
+        # Cancel any pending U+FFFC timeout — the real message arrived.
+        if ctype in {"attachment", "voice"}:
+            prev = self._pending_fffc.pop(space_id, None)
+            if prev and prev[1] and not prev[1].done():
+                prev[1].cancel()
+                logger.debug("[photon] attachment arrived — cancelling U+FFFC timeout")
+
         # Anything past here is a real (reactable) message — remember it as
         # the chat's latest inbound so `add_reaction` can target it when the
         # caller doesn't pass an explicit message id. Recorded before the
@@ -875,16 +1168,27 @@ class PhotonAdapter(BasePlatformAdapter):
         if sys.platform == "win32":  # lsof/ps; orphaning is a POSIX-only path
             return
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
+            async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
                 await client.post(
                     f"http://{self._sidecar_bind}:{self._sidecar_port}/healthz",
                     headers={"X-Hermes-Sidecar-Token": self._sidecar_token},
                 )
         except httpx.RequestError:
             return  # nothing listening — the normal case
-        pids = self._find_listener_pids(self._sidecar_port)
-        stale = [pid for pid in pids if self._pid_is_sidecar(pid)]
-        foreign = [pid for pid in pids if pid not in stale]
+        # Off the event loop: _find_listener_pids shells out to `lsof`
+        # (timeout=5s) and _pid_is_sidecar runs a `ps` per candidate pid
+        # (timeout=5s each), so this inspection can hold the loop for
+        # 5 + 5·N seconds. _reap_stale_sidecar is awaited from
+        # _start_sidecar, which runs on every reconnect — exactly when a
+        # crashed gateway left an orphan behind — so the stall lands on a
+        # live gateway that is still serving every other platform. One hop
+        # covers the whole inspection instead of N+1 round trips.
+        def _inspect():
+            found = self._find_listener_pids(self._sidecar_port)
+            mine = [pid for pid in found if self._pid_is_sidecar(pid)]
+            return mine, [pid for pid in found if pid not in mine]
+
+        stale, foreign = await asyncio.to_thread(_inspect)
         if not stale:
             raise RuntimeError(
                 f"port {self._sidecar_port} is in use by another process "
@@ -919,7 +1223,7 @@ class PhotonAdapter(BasePlatformAdapter):
             )
 
     async def _start_sidecar(self) -> None:
-        if not (_SIDECAR_DIR / "node_modules").exists():
+        if not sidecar_deps_installed():
             raise RuntimeError(
                 f"Photon sidecar deps not installed. Run: "
                 f"cd {_SIDECAR_DIR} && npm install   (or `hermes photon setup`)"
@@ -955,7 +1259,14 @@ class PhotonAdapter(BasePlatformAdapter):
         from hermes_cli._subprocess_compat import windows_hide_flags
 
         try:
-            patch = subprocess.run(  # noqa: S603
+            # Off the event loop, for the same reason the dep reinstall above
+            # hops to a thread: this spawns node and *waits* for it (up to 10s).
+            # Run inline it holds the shared gateway loop for that whole window,
+            # so every other platform's traffic stalls — and _start_sidecar runs
+            # on every reconnect (connect(is_reconnect=True)), not just startup,
+            # so the stall recurs on a live gateway.
+            patch = await asyncio.to_thread(
+                subprocess.run,  # noqa: S603
                 [
                     self._node_bin,
                     str(_SIDECAR_DIR / "patch-spectrum-mixed-attachments.mjs"),
@@ -1001,9 +1312,10 @@ class PhotonAdapter(BasePlatformAdapter):
         # Wait for /healthz to come up — give it up to 15s on cold start.
         deadline = time.time() + 15.0
         last_err: Optional[Exception] = None
-        async with httpx.AsyncClient(timeout=2.0) as client:
+        async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
             while time.time() < deadline:
                 if self._sidecar_proc.poll() is not None:
+                    _delete_runtime_record()
                     raise RuntimeError(
                         f"Photon sidecar exited with code "
                         f"{self._sidecar_proc.returncode} before becoming ready"
@@ -1014,10 +1326,19 @@ class PhotonAdapter(BasePlatformAdapter):
                         headers={"X-Hermes-Sidecar-Token": self._sidecar_token},
                     )
                     if resp.status_code == 200:
+                        # Persist port/token/pid so out-of-process senders
+                        # (cron, `hermes send`) can reach this sidecar
+                        # (see _standalone_send / issue #69960).
+                        _write_runtime_record(
+                            self._sidecar_port,
+                            self._sidecar_token,
+                            self._sidecar_proc.pid,
+                        )
                         return
                 except httpx.RequestError as e:
                     last_err = e
                 await asyncio.sleep(0.2)
+        _delete_runtime_record()
         raise RuntimeError(
             f"Photon sidecar did not become ready within 15s: {last_err}"
         )
@@ -1047,14 +1368,14 @@ class PhotonAdapter(BasePlatformAdapter):
                 f"Photon sidecar exited unexpectedly (code {exit_code})",
                 retryable=True,
             )
-            try:
-                await self._notify_fatal_error()
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("[photon] fatal-error notification failed: %s", exc)
+            self._dispatch_fatal_notification()
 
     async def _stop_sidecar(self) -> None:
         proc = self._sidecar_proc
         if proc is None:
+            # Nothing to stop, but never leave a record behind on disconnect
+            # (e.g. autostart was disabled or startup failed earlier).
+            _delete_runtime_record()
             return
         try:
             # Closing our end of the stdin pipe is itself a shutdown signal
@@ -1091,8 +1412,35 @@ class PhotonAdapter(BasePlatformAdapter):
                     proc.kill()
         finally:
             self._sidecar_proc = None
+            # The sidecar is gone (or going) — remove the runtime record so
+            # standalone senders don't chase a dead port/token.
+            _delete_runtime_record()
             if self._sidecar_supervisor_task is not None:
-                self._sidecar_supervisor_task.cancel()
+                # _stop_sidecar() is called both from external cleanup
+                # (Gateway shutdown, explicit disconnect) AND, indirectly,
+                # from WITHIN the supervisor task's own crash-handling
+                # chain: _supervise_sidecar() detects the sidecar exit,
+                # calls _set_fatal_error() + self._notify_fatal_error(),
+                # which the Gateway's fatal-error handler answers by
+                # calling adapter.disconnect() -> this same _stop_sidecar().
+                # In that second case, self._sidecar_supervisor_task IS the
+                # currently-running task. Cancelling it raises
+                # CancelledError into its own call stack (at the next
+                # await point in _notify_fatal_error() or here), which
+                # aborts the fatal-error handler before the Gateway ever
+                # reaches the "queue for background reconnection" step --
+                # Photon then stays permanently dead until a manual
+                # restart, since asyncio.CancelledError inherits from
+                # BaseException (not Exception) and isn't caught by the
+                # handler's `except Exception` guards (issue #73159).
+                # A task cannot legally cancel itself anyway (the
+                # cancellation would only take effect at its own next
+                # await, which is exactly the corruption described above),
+                # so skip it here and let the task finish exiting on its
+                # own instead.
+                current_task = asyncio.current_task()
+                if self._sidecar_supervisor_task is not current_task:
+                    self._sidecar_supervisor_task.cancel()
                 self._sidecar_supervisor_task = None
 
     # -- Outbound ----------------------------------------------------------
@@ -1413,7 +1761,24 @@ class PhotonAdapter(BasePlatformAdapter):
         if not error:
             return False
         lowered = error.lower()
+        if "retryable=false" in lowered or "auth_or_config" in lowered:
+            return False
         return any(pat in lowered for pat in _PHOTON_RETRYABLE_PATTERNS)
+
+    @staticmethod
+    def _is_permanent_sidecar_failure(result: SendResult) -> bool:
+        """True when the sidecar classified the failure as permanent.
+
+        ``auth_or_config`` and ``target_not_allowed`` cannot be fixed by
+        retrying or by the plain-text fallback resend — attempting either
+        just double-sends a doomed request (issue #50971).
+        """
+        raw = result.raw_response
+        return (
+            isinstance(raw, dict)
+            and raw.get("retryable") is False
+            and raw.get("error_class") in ("auth_or_config", "target_not_allowed")
+        )
 
     async def _send_with_retry(
         self,
@@ -1440,6 +1805,14 @@ class PhotonAdapter(BasePlatformAdapter):
         if result.success:
             return result
 
+        if self._is_permanent_sidecar_failure(result):
+            # Permanent failure classes: retrying cannot succeed and the
+            # unconditional plain-text fallback below would double-send the
+            # same doomed request. Return the structured failure as-is
+            # (with the user-facing explanation already attached for
+            # target_not_allowed in _sidecar_send).
+            return result
+
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
         if not is_network and self._is_timeout_error(error_str):
@@ -1462,6 +1835,10 @@ class PhotonAdapter(BasePlatformAdapter):
                 if result.success:
                     return result
                 error_str = result.error or ""
+                if self._is_permanent_sidecar_failure(result):
+                    # A retry surfaced a permanent class — don't fall through
+                    # to the plain-text resend either.
+                    return result
                 if not (result.retryable or self._is_retryable_error(error_str)):
                     break
             else:
@@ -1499,6 +1876,16 @@ class PhotonAdapter(BasePlatformAdapter):
             body["format"] = "markdown"
         try:
             data = await self._sidecar_call("/send", body)
+        except PhotonSidecarError as e:
+            return SendResult(
+                success=False,
+                error=str(e),
+                raw_response={
+                    "error_class": e.error_class,
+                    "retryable": e.retryable,
+                },
+                retryable=e.retryable,
+            )
         except Exception as e:
             return SendResult(success=False, error=str(e))
         self._record_sent_message(data.get("messageId"))
@@ -1548,6 +1935,16 @@ class PhotonAdapter(BasePlatformAdapter):
             body["caption"] = caption
         try:
             data = await self._sidecar_call("/send-attachment", body)
+        except PhotonSidecarError as e:
+            return SendResult(
+                success=False,
+                error=str(e),
+                raw_response={
+                    "error_class": e.error_class,
+                    "retryable": e.retryable,
+                },
+                retryable=e.retryable,
+            )
         except Exception as e:
             return SendResult(success=False, error=str(e))
         self._record_sent_message(data.get("messageId"))
@@ -1564,17 +1961,13 @@ class PhotonAdapter(BasePlatformAdapter):
         # _http_client directly — it always runs on the gateway's loop.
         url = f"http://{self._sidecar_bind}:{self._sidecar_port}{path}"
         headers = {"X-Hermes-Sidecar-Token": self._sidecar_token}
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
             resp = await client.post(url, json=body, headers=headers)
         if resp.status_code != 200:
-            raise RuntimeError(
-                f"Photon sidecar {path} returned {resp.status_code}: {resp.text[:200]}"
-            )
+            raise _sidecar_error_from_response(path, resp.status_code, resp.text)
         data = resp.json() or {}
         if not data.get("ok"):
-            raise RuntimeError(
-                f"Photon sidecar {path} reported error: {data.get('error')}"
-            )
+            raise _sidecar_error_from_response(path, resp.status_code, resp.text, data)
         return data
 
 
@@ -1610,7 +2003,7 @@ _AUDIO_EXT_BY_MIME = {
     "audio/mpeg": ".mp3",
     "audio/ogg": ".ogg",
     "audio/wav": ".wav",
-    "audio/x-caf": ".mp3",
+    "audio/x-caf": ".caf",
     "audio/mp4": ".m4a",
     "audio/aac": ".m4a",
 }
@@ -1676,6 +2069,32 @@ def _cache_inbound_attachment(
 # is not co-resident.  Reuses a live sidecar already listening on the
 # configured port (cron processes cannot spawn the sidecar themselves).
 
+def _standalone_error(resp: Any) -> Dict[str, Any]:
+    """Build the structured error dict for a failed standalone sidecar call.
+
+    Mirrors ``_sidecar_error_from_response``: parse the sidecar body
+    independently, carry the error class + retryability, and swap in the
+    canonical user-facing message for ``target_not_allowed`` (never the raw
+    upstream text).
+    """
+    try:
+        data = resp.json() or {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    error_class = str(data.get("error_class") or "sidecar_error")
+    retryable = bool(data.get("retryable"))
+    if error_class == "target_not_allowed":
+        error = _TARGET_NOT_ALLOWED_MESSAGE
+        retryable = False
+    elif resp.status_code != 200:
+        error = f"sidecar returned {resp.status_code}: {resp.text[:200]}"
+    else:
+        error = str(data.get("error") or "sidecar reported failure")
+    return {"error": error, "error_class": error_class, "retryable": retryable}
+
+
 async def _standalone_send(
     pconfig: PlatformConfig,
     chat_id: str,
@@ -1693,18 +2112,37 @@ async def _standalone_send(
     )
     token = os.getenv("PHOTON_SIDECAR_TOKEN")
     if not token:
-        return {
-            "error": (
-                "Photon standalone send requires a running sidecar with "
-                "PHOTON_SIDECAR_TOKEN set in the environment. Cron processes "
-                "cannot spawn the sidecar themselves."
-            )
-        }
+        # Fall back to the runtime record the gateway persists once its
+        # sidecar passes /healthz (issue #69960) — the token only exists in
+        # the gateway process env otherwise, so cron/`hermes send` would be
+        # structurally unable to authenticate.
+        record = _read_runtime_record()
+        stale_hint = ""
+        if record and record.get("token"):
+            if _sidecar_pid_alive(record.get("pid")):
+                token = str(record["token"])
+                port = _coerce_port(record.get("port"), port)
+            else:
+                stale_hint = (
+                    " A stale sidecar runtime record was found (pid "
+                    f"{record.get('pid')} is not running) — the gateway "
+                    "appears to be down."
+                )
+        if not token:
+            return {
+                "error": (
+                    "Photon standalone send requires a running sidecar. "
+                    "Start the Hermes gateway (which spawns the sidecar and "
+                    "records its address under <hermes-home>/runtime/"
+                    f"{_RUNTIME_RECORD_NAME}), or set PHOTON_SIDECAR_TOKEN "
+                    "in this process's environment." + stale_hint
+                )
+            }
     base = f"http://{_DEFAULT_SIDECAR_BIND}:{port}"
     headers = {"X-Hermes-Sidecar-Token": token}
     last_message_id: Optional[str] = None
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
             # 1. Text body first (if any), so it leads the conversation.
             if message:
                 send_body: Dict[str, Any] = {
@@ -1717,10 +2155,10 @@ async def _standalone_send(
                     f"{base}/send", json=send_body, headers=headers,
                 )
                 if resp.status_code != 200:
-                    return {"error": f"sidecar returned {resp.status_code}: {resp.text[:200]}"}
+                    return _standalone_error(resp)
                 data = resp.json() or {}
                 if not data.get("ok"):
-                    return {"error": data.get("error") or "sidecar reported failure"}
+                    return _standalone_error(resp)
                 last_message_id = data.get("messageId")
 
             # 2. Each attachment as a separate /send-attachment call.
@@ -1745,10 +2183,10 @@ async def _standalone_send(
                     f"{base}/send-attachment", json=att_body, headers=headers,
                 )
                 if resp.status_code != 200:
-                    return {"error": f"sidecar returned {resp.status_code}: {resp.text[:200]}"}
+                    return _standalone_error(resp)
                 data = resp.json() or {}
                 if not data.get("ok"):
-                    return {"error": data.get("error") or "sidecar reported failure"}
+                    return _standalone_error(resp)
                 last_message_id = data.get("messageId") or last_message_id
 
         return {"success": True, "message_id": last_message_id}

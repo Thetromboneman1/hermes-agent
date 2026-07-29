@@ -12,6 +12,7 @@ import { $notifications, clearNotifications } from '@/store/notifications'
 import {
   $busy,
   $connection,
+  $currentCwd,
   $currentUsage,
   $messages,
   $sessions,
@@ -1215,9 +1216,9 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
   it("sends a skill's kickoff into the TAB that invoked it, not the foreground chat", async () => {
     // `/work` in a fresh ⌘T tab: slash.exec returns a skill dispatch whose
     // `message` is the kickoff prompt. The dispatcher resolved the tab as its
-    // target, printed "⚡ loading skill" there — then submitted the kickoff
-    // with no target at all, so submit re-resolved from activeSessionIdRef and
-    // fired it as a user message into whatever conversation was on screen.
+    // target, then submitted the kickoff with no target at all, so submit
+    // re-resolved from activeSessionIdRef and fired it as a user message into
+    // whatever conversation was on screen.
     const tabRuntimeId = 'tab-runtime'
     const tabStoredId = 'tab-stored'
 
@@ -1260,6 +1261,56 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
 
     dropSessionState(tabRuntimeId)
     $queuedPromptsBySession.set({})
+  })
+
+  it('renders a skill turn as its invocation — the expanded body never reaches a bubble', async () => {
+    // A `/skill` dispatch's `message` is the whole skill body (model-facing
+    // scaffolding). The agent must receive it verbatim; every UI surface —
+    // the user bubble and any system line — must show only `/work fix it`.
+    const skillBody =
+      '[IMPORTANT: The user has invoked the "work" skill, indicating they want you to follow its instructions.\n' +
+      'The full skill content is loaded below.]\n\nSPIN UP A WORKTREE, never the primary checkout.\n\n' +
+      'The user has provided the following instruction alongside the skill invocation: fix it'
+
+    const states: Record<string, unknown>[] = []
+    const submitted: (Record<string, unknown> | undefined)[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'prompt.submit') {
+        submitted.push(params)
+      }
+
+      return (
+        method === 'slash.exec' ? { type: 'skill', name: 'work', message: skillBody, display: '/work fix it' } : {}
+      ) as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => states.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/work fix it')
+
+    // The agent still gets the full skill.
+    expect(submitted).toEqual([expect.objectContaining({ text: skillBody })])
+
+    const rendered = states.flatMap(state => {
+      const messages = Array.isArray(state.messages)
+        ? (state.messages as Array<{ parts?: Array<{ text?: string }> }>)
+        : []
+
+      return messages.flatMap(message => (message.parts ?? []).map(part => part.text ?? ''))
+    })
+
+    expect(rendered).toContain('/work fix it')
+    expect(rendered.join('\n')).not.toContain('SPIN UP A WORKTREE')
+    expect(rendered.join('\n')).not.toContain('IMPORTANT: The user has invoked')
   })
 
   it('slash status header carries the command token, not the full invocation', async () => {
@@ -1555,6 +1606,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        queued: true,
         session_id: RUNTIME_SESSION_ID,
         text: 'queued message'
       },
@@ -1590,6 +1642,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        queued: true,
         session_id: 'rt-session-a',
         text: 'queued for background session'
       },
@@ -1646,6 +1699,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        queued: true,
         session_id: 'rt-session-a-rebound',
         text: 'queued for background session'
       },
@@ -1696,6 +1750,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        queued: true,
         session_id: RUNTIME_SESSION_ID,
         text: 'please send me'
       },
@@ -2074,6 +2129,7 @@ describe('usePromptActions file attachment sync', () => {
   afterEach(() => {
     cleanup()
     $connection.set(null)
+    $currentCwd.set('')
     vi.restoreAllMocks()
   })
 
@@ -2136,6 +2192,100 @@ describe('usePromptActions file attachment sync', () => {
     })
   })
 
+  it('uploads Windows file bytes when local mode fronts a POSIX WSL/Docker backend', async () => {
+    $connection.set({ mode: 'local' } as never)
+    $currentCwd.set('/root')
+    const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,aGVsbG8=')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl }
+    })
+
+    const attachment: ComposerAttachment = {
+      ...fileAttachment(),
+      path: 'C:\\Users\\alice\\Downloads\\report.txt',
+      refText: '@file:`C:\\Users\\alice\\Downloads\\report.txt`'
+    }
+
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'file.attach') {
+        return {
+          attached: true,
+          path: '/root/.hermes/desktop-attachments/report.txt',
+          ref_text: '@file:.hermes/desktop-attachments/report.txt',
+          uploaded: true
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    expect(await handle!.submitText('summarize', { attachments: [attachment] })).toBe(true)
+    expect(readFileDataUrl).toHaveBeenCalledWith('C:\\Users\\alice\\Downloads\\report.txt')
+    expect(calls[0]).toEqual({
+      method: 'file.attach',
+      params: {
+        data_url: 'data:text/plain;base64,aGVsbG8=',
+        name: 'report.txt',
+        path: 'C:\\Users\\alice\\Downloads\\report.txt',
+        session_id: RUNTIME_SESSION_ID
+      }
+    })
+    expect(calls[1]).toEqual({
+      method: 'prompt.submit',
+      params: { session_id: RUNTIME_SESSION_ID, text: '@file:.hermes/desktop-attachments/report.txt\n\nsummarize' }
+    })
+  })
+
+  it('uses image.attach_bytes for a Windows image when the local backend cwd is POSIX', async () => {
+    const readFileDataUrl = vi.fn(async () => 'data:image/jpeg;base64,aGVsbG8=')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl }
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'image.attach_bytes') {
+        return { attached: true, path: '/root/tmp/photo.jpg' } as never
+      }
+
+      return {} as never
+    })
+
+    const uploaded = await uploadComposerAttachment(
+      {
+        id: 'image:photo.jpg',
+        kind: 'image',
+        label: 'photo.jpg',
+        path: 'C:\\Users\\alice\\Pictures\\photo.jpg'
+      },
+      {
+        backendCwd: '/root',
+        remote: false,
+        requestGateway,
+        sessionId: RUNTIME_SESSION_ID
+      }
+    )
+
+    expect(readFileDataUrl).toHaveBeenCalledWith('C:\\Users\\alice\\Pictures\\photo.jpg')
+    expect(requestGateway).toHaveBeenCalledWith('image.attach_bytes', {
+      content_base64: 'aGVsbG8=',
+      filename: 'photo.jpg',
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('image.attach', expect.anything())
+    expect(uploaded.path).toBe('/root/tmp/photo.jpg')
+  })
+
   it('passes a path-less @file: ref straight through (no path = nothing to upload)', async () => {
     // Submit-layer contract: only attachments that carry a `path` are upload
     // candidates. A path-less ref (an @-mention/context ref or pasted text)
@@ -2183,8 +2333,20 @@ describe('usePromptActions file attachment sync', () => {
     expect(calls[0]?.params?.text).toContain('@file:`/Users/mahmoud/Downloads/DEVIS_signed.pdf`')
   })
 
-  it('passes the path directly via file.attach in local mode (no byte upload)', async () => {
+  it('passes a Windows path directly for a native Windows local backend', async () => {
     $connection.set({ mode: 'local' } as never)
+    $currentCwd.set('C:\\Users\\alice\\project')
+    const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,c2hvdWxkLW5vdC1iZS1yZWFk')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl }
+    })
+
+    const attachment: ComposerAttachment = {
+      ...fileAttachment(),
+      path: 'C:\\Users\\alice\\Downloads\\report.txt',
+      refText: '@file:`C:\\Users\\alice\\Downloads\\report.txt`'
+    }
 
     const calls: { method: string; params?: Record<string, unknown> }[] = []
 
@@ -2203,11 +2365,12 @@ describe('usePromptActions file attachment sync', () => {
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    const ok = await handle!.submitText('summarize', { attachments: [fileAttachment()] })
+    const ok = await handle!.submitText('summarize', { attachments: [attachment] })
 
     expect(ok).toBe(true)
     expect(calls[0]?.method).toBe('file.attach')
-    // Local mode sends no data_url — the gateway shares this disk.
+    expect(readFileDataUrl).not.toHaveBeenCalled()
+    // Native Windows local mode shares the same path namespace.
     expect(calls[0]?.params).not.toHaveProperty('data_url')
     expect(calls[1]).toEqual({
       method: 'prompt.submit',
@@ -2473,11 +2636,13 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(ok).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
     expect(calls[0]?.params).toEqual({
+      queued: true,
       session_id: 'rt-background-stale',
       text: 'queued background message after wake'
     })
     expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[2]?.params).toEqual({
+      queued: true,
       session_id: RECOVERED_SESSION_ID,
       text: 'queued background message after wake'
     })
@@ -3788,7 +3953,7 @@ describe('uploadComposerAttachment remote read failures', () => {
 
   it('turns the raw 16MB IPC cap error into a friendly remote-gateway message', async () => {
     // electron/hardening.ts rejects the readFileDataUrl IPC with this exact
-    // shape when a file exceeds DATA_URL_READ_MAX_BYTES.
+    // shape when a file exceeds the configured data-URL read cap.
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
       value: {

@@ -230,7 +230,6 @@ try {
       "Original error: " +
       (e && e.stack ? e.stack : String(e))
   );
-  process.exit(3);
 }
 let Spectrum,
   imessage,
@@ -597,13 +596,65 @@ function badRequest(res, msg) {
   res.end(JSON.stringify({ ok: false, error: msg }));
 }
 
-function serverError(res) {
+function classifySidecarError(err) {
+  const message = String(err && err.message ? err.message : err || "");
+  const lowered = message.toLowerCase();
+
+  // Spectrum raises AuthenticationError("Target not allowed for this
+  // project") from space.send when a shared/free-tier line tries to
+  // initiate an outbound conversation with a new target. That is a plan
+  // limitation, not a transient fault — surface a dedicated class so the
+  // adapter can explain it instead of retrying (issues #50971/#51897).
+  if (lowered.includes("target not allowed")) {
+    return { errorClass: "target_not_allowed", retryable: false };
+  }
+
+  if (
+    lowered.includes("unauthorized") ||
+    lowered.includes("forbidden") ||
+    lowered.includes("permission") ||
+    lowered.includes("401") ||
+    lowered.includes("403") ||
+    lowered.includes("invalid token") ||
+    lowered.includes("project secret") ||
+    lowered.includes("unable to resolve space id")
+  ) {
+    return { errorClass: "auth_or_config", retryable: false };
+  }
+
+  if (
+    lowered.includes("timeout") ||
+    lowered.includes("timed out") ||
+    lowered.includes("econnreset") ||
+    lowered.includes("econnrefused") ||
+    lowered.includes("socket hang up") ||
+    lowered.includes("fetch failed") ||
+    lowered.includes("unavailable") ||
+    lowered.includes("upstream connect") ||
+    lowered.includes("reset reason") ||
+    lowered.includes("overflow") ||
+    lowered.includes("temporarily") ||
+    lowered.includes("429")
+  ) {
+    return { errorClass: "upstream_transient", retryable: true };
+  }
+
+  return { errorClass: "sidecar_internal", retryable: false };
+}
+
+function serverError(res, err) {
   res.statusCode = 500;
   res.setHeader("Content-Type", "application/json");
+  const classified = classifySidecarError(err);
   // Don't leak stack traces or raw exception text to the caller — even
-  // though we listen on loopback, the supervisor logs the real error
-  // and the client only needs a generic failure signal.
-  res.end(JSON.stringify({ ok: false, error: "internal sidecar error" }));
+  // though we listen on loopback, the supervisor logs the real error. The
+  // Python adapter only needs a safe class plus retryability.
+  res.end(JSON.stringify({
+    ok: false,
+    error: "internal sidecar error",
+    error_class: classified.errorClass,
+    retryable: classified.retryable,
+  }));
 }
 
 function ok(res, data) {
@@ -848,7 +899,7 @@ const server = http.createServer(async (req, res) => {
     );
     // serverError() intentionally returns a generic message — see its
     // body for the rationale.
-    return serverError(res);
+    return serverError(res, e);
   }
 });
 

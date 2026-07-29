@@ -41,7 +41,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_cli.config import load_config, _expand_env_vars
+from hermes_cli.config import (
+    _expand_env_vars,
+    cron_model_drift_guard_enabled,
+    load_config,
+)
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 
@@ -3146,12 +3150,20 @@ def run_job(
                 else str(delivery_target["thread_id"])
             )
 
-        # Model resolution precedence: per-job override > HERMES_MODEL env >
-        # config.yaml ``model:`` (string or ``{default: ...}``). The per-job
-        # value is intentionally re-read from storage every tick so a
-        # ``cronjob action=update model=...`` after a failed run takes effect
-        # on the next tick — there is no in-memory cache.
+        # Model resolution precedence: per-job override > cron.model (the
+        # cron-fleet default) > HERMES_MODEL env > config.yaml ``model:``
+        # (string or ``{default: ...}``). The per-job value is intentionally
+        # re-read from storage every tick so a ``cronjob action=update
+        # model=...`` after a failed run takes effect on the next tick — there
+        # is no in-memory cache.
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+
+        # cron.model / cron.model_provider: a deliberate cron-fleet default
+        # so unattended jobs stop shadowing chat `/model` switches. When an
+        # axis resolves from here, the #44585 drift guard is skipped for that
+        # axis — following cron.model is explicit, not drift.
+        _cron_default_model = ""
+        _cron_default_provider = ""
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -3175,8 +3187,20 @@ def run_job(
                 # Coerce null/missing to {} so a falsy default never
                 # clobbers an already-resolved env value with ``None``.
                 _model_cfg = _cfg.get("model") or {}
+                _cron_cfg_for_model = _cfg.get("cron") or {}
+                if isinstance(_cron_cfg_for_model, dict):
+                    _cron_default_model = str(
+                        _cron_cfg_for_model.get("model") or ""
+                    ).strip()
+                    _cron_default_provider = str(
+                        _cron_cfg_for_model.get("model_provider") or ""
+                    ).strip()
                 if not job.get("model"):
-                    if isinstance(_model_cfg, str):
+                    if _cron_default_model:
+                        # Cron-fleet default beats the global chat model: it is
+                        # the user's explicit "cron runs on this" setting.
+                        model = _cron_default_model
+                    elif isinstance(_model_cfg, str):
                         model = _model_cfg
                     elif isinstance(_model_cfg, dict):
                         # Mirror the CLI/oneshot resolution: prefer ``default``,
@@ -3275,7 +3299,10 @@ def run_job(
             # circuits that precedence and can resurrect old providers (for
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
-                "requested": job.get("provider"),
+                # Per-job user pin wins; otherwise the cron-fleet default
+                # provider (cron.model_provider); otherwise resolve from
+                # persisted global config.
+                "requested": job.get("provider") or _cron_default_provider or None,
                 # Derive provider-specific api_mode from the model this job
                 # will actually run (per-job pin > env > config default), not
                 # the stale persisted default — mirrors the fallback path
@@ -3359,42 +3386,55 @@ def run_job(
         # Back-compat: an axis with no snapshot (pre-existing jobs, no_agent, or
         # any axis whose creation-time resolution failed) behaves exactly as
         # before — the guard never engages for it. Pinned axes are unaffected.
-        _drift: list[str] = []
-        _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
-        if _provider_snapshot and not (job.get("provider") or "").strip():
-            _current_provider = str(
-                primary_provider_for_drift or runtime.get("provider") or ""
-            ).strip().lower()
-            if _current_provider and _current_provider != _provider_snapshot:
-                _drift.append(
-                    f"provider '{_provider_snapshot}' -> '{_current_provider}'"
+        #
+        # cron.model / cron.model_provider: an axis resolved from the explicit
+        # cron-fleet default is NOT drift — the user deliberately routed
+        # unpinned cron jobs there, so the guard is skipped for that axis.
+        if cron_model_drift_guard_enabled(_cfg):
+            _drift: list[str] = []
+            _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
+            if (
+                _provider_snapshot
+                and not (job.get("provider") or "").strip()
+                and not _cron_default_provider
+            ):
+                _current_provider = str(
+                    primary_provider_for_drift or runtime.get("provider") or ""
+                ).strip().lower()
+                if _current_provider and _current_provider != _provider_snapshot:
+                    _drift.append(
+                        f"provider '{_provider_snapshot}' -> '{_current_provider}'"
+                    )
+            _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
+            if (
+                _model_snapshot
+                and not (job.get("model") or "").strip()
+                and not _cron_default_model
+            ):
+                _current_model = str(primary_model_for_drift or "").strip().lower()
+                if _current_model and _current_model != _model_snapshot:
+                    _drift.append(
+                        f"model '{_model_snapshot}' -> '{_current_model}'"
+                    )
+            if _drift:
+                _changes = "; ".join(_drift)
+                logger.warning(
+                    "Job '%s': SKIPPED — global inference config drifted since "
+                    "creation (%s) and this job is unpinned. Skipped to prevent "
+                    "unintended spend. Pin explicitly to proceed: "
+                    "`cronjob action=update job_id=%s provider=<p> model=<m>`.",
+                    job_id,
+                    _changes,
+                    job_id,
                 )
-        _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
-        if _model_snapshot and not (job.get("model") or "").strip():
-            _current_model = str(primary_model_for_drift or "").strip().lower()
-            if _current_model and _current_model != _model_snapshot:
-                _drift.append(
-                    f"model '{_model_snapshot}' -> '{_current_model}'"
+                raise RuntimeError(
+                    f"Skipped to prevent unintended spend: global inference config "
+                    f"drifted since this job was created ({_changes}), and this job "
+                    f"is unpinned. No inference call was made. To run on the new "
+                    f"config, pin it explicitly: `cronjob action=update "
+                    f"job_id={job_id} provider=<provider> model=<model>` "
+                    f"(or pin the original values to keep them). See #44585."
                 )
-        if _drift:
-            _changes = "; ".join(_drift)
-            logger.warning(
-                "Job '%s': SKIPPED — global inference config drifted since "
-                "creation (%s) and this job is unpinned. Skipped to prevent "
-                "unintended spend. Pin explicitly to proceed: "
-                "`cronjob action=update job_id=%s provider=<p> model=<m>`.",
-                job_id,
-                _changes,
-                job_id,
-            )
-            raise RuntimeError(
-                f"Skipped to prevent unintended spend: global inference config "
-                f"drifted since this job was created ({_changes}), and this job "
-                f"is unpinned. No inference call was made. To run on the new "
-                f"config, pin it explicitly: `cronjob action=update "
-                f"job_id={job_id} provider=<provider> model=<model>` "
-                f"(or pin the original values to keep them). See #44585."
-            )
 
         fallback_model = get_fallback_chain(_cfg) or None
         credential_pool = None
