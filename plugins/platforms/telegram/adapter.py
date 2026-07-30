@@ -490,6 +490,7 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
 
 from gateway.platforms.helpers import (
     TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE,
+    compile_mention_patterns,
     convert_table_to_bullets as _wrap_markdown_tables,
 )
 
@@ -3592,6 +3593,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
             TELEGRAM_WEBHOOK_URL    Public HTTPS URL (e.g. https://app.fly.dev/telegram)
             TELEGRAM_WEBHOOK_PORT   Local listen port (default 8443)
+            TELEGRAM_WEBHOOK_HOST   Bind host (default: unset → dual-stack,
+                                    all interfaces IPv4+IPv6)
             TELEGRAM_WEBHOOK_SECRET Secret token for update verification
         """
         # Explicit connect() is the only operation allowed to reopen polling
@@ -3944,6 +3947,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 # start rather than silently run in fail-open mode.
                 # See GHSA-3vpc-7q5r-276h.
                 webhook_port = env_int("TELEGRAM_WEBHOOK_PORT", 8443)
+                # Bind host. Default "" → tornado bind_sockets opens one
+                # listening socket per address family (IPv4 + IPv6). The old
+                # hardcoded "0.0.0.0" bound IPv4 ONLY and was unreachable
+                # over IPv6-only private networks (e.g. Fly.io 6PN) — same
+                # bug as the LINE adapter (NS-603). Pin via
+                # TELEGRAM_WEBHOOK_HOST or platforms.telegram.extra.webhook_host.
+                webhook_host = (
+                    os.getenv("TELEGRAM_WEBHOOK_HOST", "").strip()
+                    or str((self.config.extra or {}).get("webhook_host") or "").strip()
+                )
                 webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
                 if not webhook_secret:
                     raise RuntimeError(
@@ -3962,7 +3975,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 webhook_path = urlparse(webhook_url).path or "/telegram"
 
                 await self._app.updater.start_webhook(
-                    listen="0.0.0.0",
+                    listen=webhook_host,
                     port=webhook_port,
                     url_path=webhook_path,
                     webhook_url=webhook_url,
@@ -3978,8 +3991,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._polling_progress_accepting = False
                 self._send_path_degraded = False
                 logger.info(
-                    "[%s] Webhook server listening on 0.0.0.0:%d%s",
-                    self.name, webhook_port, webhook_path,
+                    "[%s] Webhook server listening on %s:%d%s",
+                    self.name,
+                    webhook_host or "* (all interfaces, IPv4+IPv6)",
+                    webhook_port,
+                    webhook_path,
                 )
             else:
                 # ── Polling mode (default) ───────────────────────────
@@ -5302,6 +5318,16 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_update_prompt failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    # Template attrs for the shared _format_exec_approval core (HTML mode).
+    _EA_HEADER = "⚠️ <b>Command Approval Required</b>\n\n"
+    _EA_CODE_OPEN = "<pre>"
+    _EA_CODE_CLOSE = "</pre>\n\n"
+    _EA_SMART_DENY_LINE = "\n\n<b>Smart DENY:</b> owner override applies to this one operation only."
+    _EA_CMD_BUDGET = 3800
+
+    def _ea_escape(self, text: str) -> str:
+        return _html.escape(text)
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -5319,14 +5345,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
-            text = (
-                f"⚠️ <b>Command Approval Required</b>\n\n"
-                f"<pre>{_html.escape(cmd_preview)}</pre>\n\n"
-                f"Reason: {_html.escape(description)}"
-            )
-            if smart_denied:
-                text += "\n\n<b>Smart DENY:</b> owner override applies to this one operation only."
+            text = self._format_exec_approval(command, description, smart_denied)
 
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
@@ -5394,7 +5413,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            preview = self.format_message(message if len(message) <= 3800 else message[:3800] + "...")
+            preview = self.format_message(self._truncate_preview(message, 3800))
 
             keyboard = InlineKeyboardMarkup([
                 [
@@ -5758,14 +5777,11 @@ class TelegramAdapter(BasePlatformAdapter):
             for p in providers:
                 buttons.append(_provider_button(p))
 
-        page_size = self._PROVIDER_PAGE_SIZE
-        total = len(buttons)
-        total_pages = max(1, (total + page_size - 1) // page_size)
-        page = max(0, min(page, total_pages - 1))
-
-        start = page * page_size
-        end = min(start + page_size, total)
-        page_buttons = buttons[start:end]
+        page_buttons, page_meta = self._format_choice_page(
+            buttons, page, self._PROVIDER_PAGE_SIZE
+        )
+        page = page_meta["page"]
+        total_pages = page_meta["total_pages"]
 
         rows = [page_buttons[i : i + 2] for i in range(0, len(page_buttons), 2)]
 
@@ -5780,19 +5796,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
         rows.append([InlineKeyboardButton("✗ Cancel", callback_data="mx")])
 
-        page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
-        return InlineKeyboardMarkup(rows), page_info
+        return InlineKeyboardMarkup(rows), page_meta["page_info"]
 
     def _build_model_keyboard(self, models: list, page: int) -> tuple:
         """Build paginated model buttons. Returns (keyboard, page_info_text)."""
-        page_size = self._MODEL_PAGE_SIZE
-        total = len(models)
-        total_pages = max(1, (total + page_size - 1) // page_size)
-        page = max(0, min(page, total_pages - 1))
-
-        start = page * page_size
-        end = min(start + page_size, total)
-        page_models = models[start:end]
+        page_models, page_meta = self._format_choice_page(
+            models, page, self._MODEL_PAGE_SIZE
+        )
+        page = page_meta["page"]
+        total_pages = page_meta["total_pages"]
+        start = page_meta["start"]
 
         buttons: list = []
         for i, model_id in enumerate(page_models):
@@ -5821,8 +5834,7 @@ class TelegramAdapter(BasePlatformAdapter):
             InlineKeyboardButton("✗ Cancel", callback_data="mx"),
         ])
 
-        page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
-        return InlineKeyboardMarkup(rows), page_info
+        return InlineKeyboardMarkup(rows), page_meta["page_info"]
 
     async def _handle_model_picker_callback(
         self, query, data: str, chat_id: str
@@ -7807,28 +7819,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 patterns = loaded
 
         if patterns is None:
-            return []
-        if isinstance(patterns, str):
-            patterns = [patterns]
-        if not isinstance(patterns, list):
-            logger.warning(
-                "[%s] telegram mention_patterns must be a list or string; got %s",
-                self.name,
-                type(patterns).__name__,
-            )
+            # Parity with the historical inline implementation: return before
+            # evaluating ``self.name`` (tests construct bare adapters via
+            # object.__new__ that lack the attributes ``name`` reads).
             return []
 
-        compiled: List[re.Pattern] = []
-        for pattern in patterns:
-            if not isinstance(pattern, str) or not pattern.strip():
-                continue
-            try:
-                compiled.append(re.compile(pattern, re.IGNORECASE))
-            except re.error as exc:
-                logger.warning("[%s] Invalid Telegram mention pattern %r: %s", self.name, pattern, exc)
-        if compiled:
-            logger.info("[%s] Loaded %d Telegram mention pattern(s)", self.name, len(compiled))
-        return compiled
+        return compile_mention_patterns(
+            patterns,
+            log_prefix=self.name,
+            platform_label="telegram",
+            display_label="Telegram",
+            logger_=logger,
+        )
 
     def _is_group_chat(self, message: Message) -> bool:
         chat = getattr(message, "chat", None)
@@ -8711,6 +8713,18 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        # Telegram clients split messages above 4096 chars into multiple
+        # updates.  A long command paste (e.g. ``/queue <huge prompt>``)
+        # arrives as a COMMAND chunk near the limit followed by plain TEXT
+        # continuation chunk(s).  Dispatching the command immediately would
+        # orphan the continuation, which then lands as a separate message and
+        # interrupts the running agent.  Route near-limit command chunks
+        # through the same text-batching pipeline so continuations merge in
+        # before dispatch; short commands (/stop, /approve, ...) keep the
+        # immediate path and are never delayed.
+        if len(event.text or "") >= self._SPLIT_THRESHOLD:
+            self._enqueue_text_event(event)
+            return
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9335,14 +9349,10 @@ class TelegramAdapter(BasePlatformAdapter):
         recognized without a gateway restart.
         """
         try:
-            from hermes_constants import get_hermes_home
-            config_path = get_hermes_home() / "config.yaml"
-            if not config_path.exists():
-                return
-
-            import yaml as _yaml
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = _yaml.safe_load(f) or {}
+            # Canonical loader: behavioral read (dm_topics routing) now honors
+            # managed-scope overlay + ${VAR} expansion like every other read.
+            from hermes_cli.config import load_config_readonly
+            config = load_config_readonly()
 
             dm_topics = (
                 config.get("platforms", {})

@@ -238,6 +238,21 @@ export interface MessagingPlatformsResponse {
   platforms: MessagingPlatformInfo[]
 }
 
+/** A pending pairing request, or an already-approved user, for one platform. */
+export interface PairingUser {
+  age_minutes?: number
+  platform: string
+  /** Present on pending rows only — the id `approvePairing` grants on. */
+  request_id?: string
+  user_id: string
+  user_name?: string
+}
+
+export interface PairingResponse {
+  approved: PairingUser[]
+  pending: PairingUser[]
+}
+
 export interface MessagingPlatformUpdate {
   clear_env?: string[]
   enabled?: boolean
@@ -331,6 +346,8 @@ export interface HermesConfig {
   voice?: {
     max_recording_seconds?: number
     auto_tts?: boolean
+    stop_phrases?: unknown
+    thinking_sound?: unknown
   }
 }
 
@@ -470,6 +487,13 @@ export interface SessionInfo {
   output_tokens: number
   /** Parent conversation when this row is a /branch fork. */
   parent_session_id?: null | string
+  /** Durable server-side pin flag (`sessions.pinned`). The list endpoints
+   *  back-fill pinned conversations past their LIMIT, so a pinned row is
+   *  always present in a page — which makes this authoritative for the
+   *  sidebar's Pinned section and lets a second app adopt pins made
+   *  elsewhere. Undefined against a backend predating the flag; treat that as
+   *  "no opinion" and leave the local pin set alone. */
+  pinned?: boolean
   preview: null | string
   source: null | string
   started_at: number

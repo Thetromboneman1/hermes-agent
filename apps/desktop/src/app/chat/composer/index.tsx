@@ -11,6 +11,7 @@ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
+import { interceptsTypedVoiceStop } from '@/lib/voice-stop-word'
 import { sessionCompacting } from '@/store/compaction'
 import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } from '@/store/composer-input-history'
 import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
@@ -95,11 +96,32 @@ export function ChatBar({
   onSubmit: onSubmitProp,
   onTranscribeAudio
 }: ChatBarProps) {
+  // Typed stop phrase during an active voice conversation ends it — same
+  // semantics as SAYING "stop" (voice-stop-word.ts) or clicking the pill's
+  // end control. Populated after useComposerVoice below (the submit wrapper
+  // is created first); render-time assignment keeps the ref current.
+  const voiceStopRef = useRef<{ active: boolean; end: () => void }>({ active: false, end: () => {} })
+
   // Every send (typed, queued, voice) passes through the contributed
   // middleware chain first — rewrite / pass-through / cancel. Empty chain =
   // exact pass-through, so surfaces without contributions are byte-identical.
   const onSubmit = useCallback<ChatBarProps['onSubmit']>(
     async (value, options) => {
+      // Bare stop phrase typed while the voice conversation is live: end the
+      // conversation (mic off, pill dismissed) instead of sending "stop" to
+      // the agent. Spoken transcripts are already stop-checked inside
+      // use-voice-conversation, so this only catches typed/queued sends.
+      // Outside a voice conversation, typed "stop" is a normal message.
+      const voiceStop = voiceStopRef.current
+
+      if (interceptsTypedVoiceStop(voiceStop.active, value, options?.attachments?.length ?? 0)) {
+        voiceStop.end()
+
+        // Consumed (not rejected): report accepted so the submit engine
+        // clears the draft instead of restoring "stop" into the composer.
+        return true
+      }
+
       const draft = await runComposerMiddleware({ text: value, attachments: options?.attachments })
 
       if (!draft) {
@@ -324,7 +346,7 @@ export function ChatBar({
     triggerItems,
     triggerKeyConsumedRef,
     triggerLoading
-  } = useComposerTrigger({ at, draftRef, editorRef, requestMainFocus, setComposerText, slash })
+  } = useComposerTrigger({ at, draftRef, editorRef, recordUndoPoint, requestMainFocus, setComposerText, slash })
 
   // Pull the live contentEditable text into draftRef + the AUI composer state
   // (which drives `hasComposerPayload` → the send button). Shared by the input
@@ -543,6 +565,17 @@ export function ChatBar({
       if (!busy) {
         void drainNextQueued()
       }
+
+      return
+    }
+
+    // The popover is open but its items are still in flight (debounce + RPC).
+    // Tab must not fall through to the browser — it would move focus out of
+    // the composer mid-completion, which reads as the popover "eating" the
+    // keypress. Swallow it; the refresh lands with the items.
+    if (trigger && triggerLoading && triggerItems.length === 0 && event.key === 'Tab') {
+      event.preventDefault()
+      triggerKeyConsumedRef.current = true
 
       return
     }
@@ -834,11 +867,18 @@ export function ChatBar({
     focusInput,
     insertText,
     maxRecordingSeconds,
+    // Voice barge-in mid-generation halts the run like the Stop button.
+    onInterrupt: haltRun,
     onSubmit,
     onTranscribeAudio,
     sessionId,
     target: scope.target
   })
+
+  // Keep the typed-stop interceptor (see onSubmit above) in sync with the
+  // live conversation state. Render-time ref assignment, same pattern as
+  // dispatchSubmitRef — no effect needed for a plain mirror.
+  voiceStopRef.current = { active: voiceConversationActive, end: endConversation }
 
   const contextMenu = (
     <ContextMenu

@@ -26,7 +26,9 @@ import { $gateway } from '@/store/gateway'
 import { applyGoalStatusText } from '@/store/goals'
 import {
   notifyCronChanged,
+  notifyPairingChanged,
   notifyPetChanged,
+  notifyPlatformsChanged,
   notifySessionsChanged,
   type PetChangeMeta,
   setChangeEventsAvailable
@@ -298,7 +300,13 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         return
-      } else if (event.type === 'pet.changed' || event.type === 'cron.changed' || event.type === 'sessions.changed') {
+      } else if (
+        event.type === 'pet.changed' ||
+        event.type === 'cron.changed' ||
+        event.type === 'sessions.changed' ||
+        event.type === 'platforms.changed' ||
+        event.type === 'pairing.changed'
+      ) {
         // Change-watcher broadcasts (server._broadcast_watched_changes): the
         // backend's on-disk signature moved. Route to the live-sync ticks the
         // former pollers now subscribe to. Only the active profile's changes
@@ -311,6 +319,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             notifyPetChanged(payload as PetChangeMeta | undefined)
           } else if (event.type === 'cron.changed') {
             notifyCronChanged()
+          } else if (event.type === 'platforms.changed') {
+            notifyPlatformsChanged()
+          } else if (event.type === 'pairing.changed') {
+            notifyPairingChanged()
           } else {
             notifySessionsChanged()
           }

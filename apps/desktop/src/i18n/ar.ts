@@ -137,6 +137,7 @@ export const ar = defineLocale({
       noSpeechDetected: 'لم يتم اكتشاف كلام',
       playbackFailed: 'فشل تشغيل الصوت',
       recordingFailed: 'فشل التسجيل',
+      sayStopToEnd: phrase => `قل "${phrase}" لإنهاء المحادثة الصوتية.`,
       transcriptionFailed: 'فشل التفريغ النصي',
       transcriptionUnavailable: 'التفريغ النصي غير متاح.',
       tryRecordingAgain: 'حاول التسجيل مرة أخرى.',
@@ -2348,6 +2349,7 @@ export const ar = defineLocale({
       statusError: 'خطأ',
       statusRecovered: 'تم الاسترداد',
       statusDone: 'تم',
+      memoryWriteNoted: 'تم تسجيل كتابة الذاكرة',
       actions: {
         read: 'قراءة',
         reading: 'جار القراءة',

@@ -155,6 +155,7 @@ export const ja = defineLocale({
       noSpeechDetected: '音声が検出されませんでした',
       playbackFailed: '音声再生に失敗しました',
       recordingFailed: '音声録音に失敗しました',
+      sayStopToEnd: phrase => `「${phrase}」と言うと音声チャットを終了できます。`,
       transcriptionFailed: '音声文字起こしに失敗しました',
       transcriptionUnavailable: '音声文字起こしはまだ利用できません。',
       tryRecordingAgain: 'もう一度録音してください。',
@@ -947,6 +948,9 @@ export const ja = defineLocale({
       ready: '準備完了',
       needsSignIn: 'サインインが必要',
       needsSetup: 'セットアップが必要',
+      activeBackend: '使用中',
+      activeBackendHint: 'これが現在アクティブなバックエンドです',
+      useBackend: 'このバックエンドを使う',
       nousIncluded: 'Nous サブスクリプションに含まれています。有効にするには Nous Portal にサインインしてください。',
       nousAuthNeededTitle: 'Nous Portal にサインイン',
       nousAuthNeededMessage: provider =>
@@ -2598,6 +2602,7 @@ export const ja = defineLocale({
       statusError: 'エラー',
       statusRecovered: '回復しました',
       statusDone: '完了',
+      memoryWriteNoted: 'メモリへの書き込みを記録',
       actions: {
         read: '読み取り完了',
         reading: '読み取り中',

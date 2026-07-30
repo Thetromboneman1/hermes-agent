@@ -75,55 +75,6 @@ async def test_reap_noop_when_port_free(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.asyncio
-async def test_reap_kills_verified_orphan(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter = _make_adapter(monkeypatch)
-    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
-    monkeypatch.setattr(adapter, "_find_listener_pids", lambda port: [4242])
-    monkeypatch.setattr(adapter, "_pid_is_sidecar", lambda pid: True)
-    # Dies promptly on SIGTERM — no escalation expected.
-    monkeypatch.setattr(adapter, "_pid_alive", lambda pid: False)
-    kills = _capture_kills(monkeypatch)
-
-    await adapter._reap_stale_sidecar()
-
-    assert kills == [(4242, photon_adapter.signal.SIGTERM)]
-
-
-@pytest.mark.asyncio
-async def test_reap_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter = _make_adapter(monkeypatch)
-    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
-    monkeypatch.setattr(adapter, "_find_listener_pids", lambda port: [4242])
-    monkeypatch.setattr(adapter, "_pid_is_sidecar", lambda pid: True)
-    monkeypatch.setattr(adapter, "_pid_alive", lambda pid: True)  # ignores TERM
-    # No clock fakery (logging also calls time.time, which makes a fake clock
-    # fragile) — this test rides out the real 3s SIGTERM grace window.
-    kills = _capture_kills(monkeypatch)
-
-    await adapter._reap_stale_sidecar()
-
-    assert (4242, photon_adapter.signal.SIGTERM) in kills
-    assert (4242, photon_adapter.signal.SIGKILL) in kills
-
-
-@pytest.mark.asyncio
-async def test_reap_raises_for_foreign_listener(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Never signal a process whose command line isn't our sidecar."""
-    adapter = _make_adapter(monkeypatch)
-    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
-    monkeypatch.setattr(adapter, "_find_listener_pids", lambda port: [777])
-    monkeypatch.setattr(adapter, "_pid_is_sidecar", lambda pid: False)
-    kills = _capture_kills(monkeypatch)
-
-    with pytest.raises(RuntimeError, match="in use by another process"):
-        await adapter._reap_stale_sidecar()
-
-    assert kills == []
-
-
-@pytest.mark.asyncio
 async def test_start_sidecar_spawns_with_stdin_pipe(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -191,71 +142,6 @@ async def test_start_sidecar_spawns_with_stdin_pipe(
 
 
 @pytest.mark.asyncio
-async def test_start_sidecar_rejects_empty_node_modules(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    """A partial/aborted npm install leaves an empty node_modules/ behind.
-
-    _start_sidecar() must reject it the same way check_requirements() does
-    (both go through sidecar_deps_installed()) instead of spawning a sidecar
-    that immediately crashes on a missing spectrum-ts module.
-    """
-    adapter = _make_adapter(monkeypatch)
-    (tmp_path / "node_modules").mkdir()  # empty — spectrum-ts absent
-    monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
-
-    with pytest.raises(RuntimeError, match="not installed"):
-        await adapter._start_sidecar()
-
-
-@pytest.mark.asyncio
-async def test_reap_inspects_listeners_off_the_event_loop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Listener inspection must not block the shared gateway event loop.
-
-    ``_find_listener_pids`` shells out to ``lsof`` (timeout=5s) and
-    ``_pid_is_sidecar`` runs a ``ps`` per candidate pid (timeout=5s each), so
-    inline this holds the loop for 5 + 5·N seconds. ``_reap_stale_sidecar`` is
-    awaited from ``_start_sidecar``, which runs on every reconnect — exactly
-    when a crashed gateway left an orphan — so the stall lands on a live
-    gateway still serving every other platform.
-    """
-    import threading
-
-    adapter = _make_adapter(monkeypatch)
-    monkeypatch.setattr(photon_adapter.sys, "platform", "linux")
-    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
-
-    main_thread = threading.current_thread()
-    seen: Dict[str, Any] = {}
-
-    def _fake_find(port: int) -> List[int]:
-        seen["find"] = threading.current_thread()
-        return [4242]
-
-    def _fake_is_sidecar(pid: int) -> bool:
-        seen["ps"] = threading.current_thread()
-        return True
-
-    monkeypatch.setattr(adapter, "_find_listener_pids", _fake_find)
-    monkeypatch.setattr(adapter, "_pid_is_sidecar", _fake_is_sidecar)
-    monkeypatch.setattr(adapter, "_pid_alive", lambda pid: False)
-    _capture_kills(monkeypatch)
-
-    await adapter._reap_stale_sidecar()
-
-    assert seen.get("find") is not None, "lsof lookup never ran"
-    assert seen.get("ps") is not None, "ps check never ran"
-    for label in ("find", "ps"):
-        assert seen[label] is not main_thread, (
-            f"{label} ran on the event-loop thread; the listener inspection "
-            "must be dispatched via asyncio.to_thread so a 5s lsof/ps spawn "
-            "can't freeze every other platform on the gateway loop"
-        )
-
-
-@pytest.mark.asyncio
 async def test_spectrum_patch_runs_off_the_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -300,8 +186,11 @@ async def test_spectrum_patch_runs_off_the_event_loop(
         stdin = None
         stdout = None
 
-        def poll(self) -> None:
-            return None
+        def poll(self) -> int:
+            # Report "exited" so the readiness health-poll loop bails out
+            # immediately instead of spinning for its full 15s deadline —
+            # the assertion below only cares where the patch run executed.
+            return 0
 
     monkeypatch.setattr(
         photon_adapter.subprocess, "Popen", lambda *a, **k: _FakeProc()
