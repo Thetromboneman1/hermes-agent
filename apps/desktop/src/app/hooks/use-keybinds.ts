@@ -5,6 +5,7 @@ import { closeActiveTab } from '@/app/chat/close-tab'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { closeActiveTerminal, createTerminal, cycleTerminal } from '@/app/right-sidebar/terminal/terminals'
 import { activateTreeTabSlot, cycleTreeTabInFocusedZone, layoutHasRootSide } from '@/components/pane-shell/tree/store'
+import { onReleaseTypingFocus } from '@/components/ui/keyboard-first'
 import { findBarClaimsCombo } from '@/lib/find-in-page'
 import { contributedKeybindHandler, PROFILE_SLOT_COUNT, SESSION_SLOT_COUNT } from '@/lib/keybinds/actions'
 import { comboAllowedInInput, comboFromEvent, isEditableTarget } from '@/lib/keybinds/combo'
@@ -33,7 +34,7 @@ import {
   switchToDefaultProfile,
   toggleShowAllProfiles
 } from '@/store/profile'
-import { requestNewWorktree } from '@/store/projects'
+import { openFolderAsProject, requestNewWorktree } from '@/store/projects'
 import { toggleReview } from '@/store/review'
 import { setModelPickerOpen } from '@/store/session'
 import { reopenLastClosedTile } from '@/store/session-states'
@@ -173,6 +174,9 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     // Only meaningful inside a git repo — a no-op otherwise (the key falls
     // through instead of silently doing nothing).
     'workspace.newWorktree': () => $repoStatus.get() && requestNewWorktree(),
+    // ⌘O: native folder picker → open the folder as a project (upsert) with a
+    // fresh session anchored there.
+    'workspace.openFolder': () => void openFolderAsProject(),
 
     // Narrow-viewport reveal is handled inside the store toggles now.
     'view.toggleSidebar': toggleSidebarOpen,
@@ -223,6 +227,24 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     'profile.toggleAll': toggleShowAllProfiles,
     'profile.create': requestProfileCreate
   }
+
+  // A keyboard-driven overlay closing hands typing back to the composer: Radix
+  // restores focus to the trigger (a toolbar button for the model pill), so
+  // without this the Enter that committed a model also eats the next keystroke.
+  // Deferred one frame and skipped when something else editable has claimed
+  // focus, because a palette action can legitimately open a dialog or navigate
+  // — the release must never steal focus from the surface it just opened.
+  useEffect(
+    () =>
+      onReleaseTypingFocus(() =>
+        requestAnimationFrame(() => {
+          if (!isEditableTarget(document.activeElement)) {
+            requestComposerFocus('active')
+          }
+        })
+      ),
+    []
+  )
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

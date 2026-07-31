@@ -31,12 +31,10 @@ import {
   normalize,
   removePane,
   reorderPaneInGroup as reorderPaneInGroupOp,
-  type RootEdge,
   setActivePane as setActivePaneOp,
   setGroupHeaderHidden as setGroupHeaderHiddenOp,
   setGroupMinimized,
   setSplitWeights as setSplitWeightsOp,
-  splitGroupZone as splitGroupZoneOp,
   type SplitNode
 } from './model'
 import { FLOATING_PLACEMENT } from './renderer/floating-rect'
@@ -200,9 +198,24 @@ function setDismissed(paneId: string, dismissed: boolean) {
 const paneClosers: Record<string, () => void> = {}
 const paneOpeners: Record<string, () => void> = {}
 
-/** Route a pane's Close through the app store that owns its visibility. */
-export function registerPaneCloser(paneId: string, close: () => void) {
-  paneClosers[paneId] = close
+/** Pane ids whose Close an app store owns. True for the main workspace, whose
+ *  pane can't leave the tree but whose TAB can still be emptied — the close
+ *  GESTURE (⌘-click / middle-click) keys off this rather than `uncloseable`.
+ *  An atom, not a lookup: a closer registered by a wiring EFFECT lands after
+ *  the strip's first paint, and a plain read would leave that tab gestureless
+ *  until something else happened to re-render it. */
+export const $panesWithCloser = atom<ReadonlySet<string>>(new Set())
+
+/** Route a pane's Close through the app store that owns its visibility.
+ *  Passing no closer unregisters (a wiring effect's cleanup). */
+export function registerPaneCloser(paneId: string, close?: () => void) {
+  if (close) {
+    paneClosers[paneId] = close
+  } else {
+    delete paneClosers[paneId]
+  }
+
+  $panesWithCloser.set(new Set(Object.keys(paneClosers)))
 }
 
 /**
@@ -646,8 +659,10 @@ export type TreeSide = 'left' | 'right'
 export const $collapsedTreeSides = atom<ReadonlySet<TreeSide>>(new Set())
 
 // Side visibility is DERIVED from an app store (the binding owns persistence
-// + button state); reveals flow back through its setter so they never
-// disagree with the flag.
+// + button state). Reveals un-collapse the column directly instead of writing
+// back through the setter — the right side's store IS the file tree's toggle,
+// so a neighbour's reveal must not press it. Layout reset still reopens every
+// side through its setter, because there the toggles SHOULD move.
 const sideOpeners: Partial<Record<TreeSide, (open: boolean) => void>> = {}
 
 export function setTreeSideCollapsed(side: TreeSide, collapsed: boolean) {
@@ -772,14 +787,12 @@ export function revealTreePane(paneId: string) {
   const side = treeSideOfPane(paneId)
 
   if (side && $collapsedTreeSides.get().has(side)) {
-    const open = sideOpeners[side]
-
-    // Through the bound store when there is one, so the toggle stays truthful.
-    if (open) {
-      open(true)
-    } else {
-      setTreeSideCollapsed(side, false)
-    }
+    // Un-collapse the COLUMN, never the side's bound store: on the right that
+    // store is ⌘J / $fileBrowserOpen, i.e. the file tree's own toggle. Routing
+    // a reveal through it dragged the tree open behind every neighbour that
+    // shares the column — open the diff (⌘G) and the file tree appeared too.
+    // The tree opens only when the user opens it.
+    setTreeSideCollapsed(side, false)
   }
 
   const hiddenNow = $hiddenTreePanes.get()
@@ -798,7 +811,7 @@ export function revealTreePane(paneId: string) {
     // just front its tab behind a collapsed rail. Without this, a tool panel
     // (terminal/logs) in a shared zone stays minimized after its toggle opens
     // it: setPaneCollapsed's shared-zone branch calls revealTreePane instead
-    // of toggleTreeGroupMinimized, so the zone never un-minimizes and the
+    // of setTreeGroupMinimized, so the zone never un-minimizes and the
     // pane appears to "close but not open" on ctrl-` / tab click.
     let next = tree
 
@@ -1205,19 +1218,7 @@ export function reorderTreePane(groupId: string, paneId: string, toIndex: number
   }
 }
 
-/** Split a zone on `side`, moving `movePaneId` out of its stack into the new
- *  zone (VS Code split-and-move — the zone menu's Split actions). */
-export function splitTreeZone(groupId: string, side: RootEdge, movePaneId: string) {
-  const tree = $layoutTree.get()
-
-  if (tree) {
-    commit(splitGroupZoneOp(tree, groupId, side, movePaneId))
-    markActivePreset('custom')
-    markPaneUserPlaced(movePaneId)
-  }
-}
-
-export function toggleTreeGroupMinimized(groupId: string, minimized: boolean) {
+export function setTreeGroupMinimized(groupId: string, minimized: boolean) {
   const tree = $layoutTree.get()
 
   if (tree) {
@@ -1256,7 +1257,7 @@ export function setPaneCollapsed(paneId: string, collapsed: boolean) {
 
         activateTreePane(group.id, group.panes[at - 1] ?? group.panes[at + 1])
       } else {
-        toggleTreeGroupMinimized(group.id, true) // pure tool zone folds as a unit
+        setTreeGroupMinimized(group.id, true) // pure tool zone folds as a unit
       }
     } else if (!collapsed) {
       revealTreePane(paneId)
@@ -1266,7 +1267,7 @@ export function setPaneCollapsed(paneId: string, collapsed: boolean) {
   }
 
   if (Boolean(group.minimized) !== collapsed) {
-    toggleTreeGroupMinimized(group.id, collapsed)
+    setTreeGroupMinimized(group.id, collapsed)
 
     if (!collapsed) {
       revealTreePane(paneId)
@@ -1290,7 +1291,7 @@ export function restoreTreePane(paneId: string) {
     const group = paneGroup(paneId)
 
     if (group?.minimized) {
-      toggleTreeGroupMinimized(group.id, false)
+      setTreeGroupMinimized(group.id, false)
     }
 
     revealTreePane(paneId)
@@ -1301,7 +1302,7 @@ export function restoreTreePane(paneId: string) {
   const group = paneGroup(paneId)
 
   if (group) {
-    toggleTreeGroupMinimized(group.id, false)
+    setTreeGroupMinimized(group.id, false)
     activateTreePane(group.id, paneId)
   }
 }
@@ -1321,7 +1322,7 @@ export function collapseTreePane(paneId: string) {
   const group = paneGroup(paneId)
 
   if (group) {
-    toggleTreeGroupMinimized(group.id, true)
+    setTreeGroupMinimized(group.id, true)
   }
 }
 

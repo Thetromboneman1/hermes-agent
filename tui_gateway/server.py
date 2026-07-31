@@ -4294,6 +4294,44 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
         )
 
 
+def _apply_pending_model_switch(sid: str, session: dict) -> None:
+    """Apply a model switch queued while a turn was running.
+
+    ``config.set model`` on a busy session doesn't mutate the live agent (the
+    worker thread is reading model/client mid-request); it stashes the pick in
+    ``session["pending_model_switch"]``.  This runs on the TURN thread at turn
+    start — before the first model call, nothing in flight — so the in-place
+    swap (client rebuild, the slow part) is safe here.  A failed switch keeps
+    the current model and never blocks the turn, matching
+    ``_sync_agent_model_with_config``.
+    """
+    pending = session.pop("pending_model_switch", None)
+    if not pending or session.get("agent") is None:
+        return
+    try:
+        result = _apply_model_switch(
+            sid,
+            session,
+            pending["raw"],
+            confirm_expensive_model=bool(pending.get("confirm_expensive_model")),
+        )
+        # A queued pick is a deliberate user action; honour the expensive-model
+        # confirm by NOT applying it silently — surface the warning and drop the
+        # switch rather than spend on a pricey model the user never confirmed.
+        if result.get("confirm_required"):
+            _emit(
+                "error",
+                sid,
+                {"message": result.get("confirm_message") or result.get("warning") or ""},
+            )
+    except Exception as e:
+        _emit(
+            "error",
+            sid,
+            {"message": f"Could not switch model: {e}"},
+        )
+
+
 class CompressionLockHeld(Exception):
     """Raised by _compress_session_history when compression skipped due
     to a concurrent lock on the session's compression_locks row."""
@@ -4730,9 +4768,18 @@ def _session_info(agent, session: dict | None = None) -> dict:
         yolo = bool(_YOLO_MODE_FROZEN) or session_yolo or approval_mode == "off"
     except Exception:
         yolo = False
+    # A model switch queued mid-turn (pending_model_switch) applies at the next
+    # turn start, so agent.model still reads the OLD model until then. Report the
+    # pending pick instead — it's the model the next turn will run, and it stops
+    # the end-of-turn settle from blipping the UI back to the old model before
+    # the switch lands. Cleared once _apply_pending_model_switch consumes it.
+    pending_switch = (session or {}).get("pending_model_switch") or {}
+    pending_model = str(pending_switch.get("display_model") or "").strip()
+    pending_provider = str(pending_switch.get("display_provider") or "").strip()
     info: dict = {
-        "model": mirror.get("model", getattr(agent, "model", "")),
-        "provider": mirror.get("provider", getattr(agent, "provider", "")),
+        "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
+        "provider": pending_provider
+        or mirror.get("provider", getattr(agent, "provider", "")),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
@@ -6655,6 +6702,13 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if not content_text.strip() and not has_reasoning:
             continue
         msg = {"role": role, "text": content_text}
+        # Durable row identity, stamped by _rows_to_conversation. The renderer's
+        # own message ids are ephemeral (timestamp+index derived, and a
+        # different shape for live vs rehydrated vs optimistic rows), so
+        # anything that addresses a specific persisted message later — message
+        # reactions — needs this instead.
+        if m.get("_row_id") is not None:
+            msg["row_id"] = m["_row_id"]
         if role == "user":
             invocation = _skill_scaffold_projection(content_text)
             if invocation:
@@ -7499,7 +7553,7 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
     key = session.get("session_key")
     if db is not None and key:
         try:
-            display = db.get_messages_as_conversation(key, include_ancestors=True)
+            display = db.get_messages_as_conversation(key, include_ancestors=True, include_row_ids=True)
             return _reconcile_display_with_live(display, in_memory_fallback)
         except Exception:
             logger.debug("live display projection read failed", exc_info=True)
@@ -8982,6 +9036,11 @@ def _run_prompt_submit(
             # (#29923 review defect). Any config.yaml change is adopted on
             # the NEXT turn, after the finally-restore below.
             if not one_turn_restore:
+                # A model picked mid-turn was queued (not applied in-place) —
+                # apply it now, on the turn thread before the first model call,
+                # so this turn runs on the model the user chose. Runs before the
+                # config sync so an explicit pick wins over a config.yaml change.
+                _apply_pending_model_switch(sid, session)
                 _sync_agent_model_with_config(sid, session)
             cwd = _session_cwd(session)
             _register_session_cwd(session)
@@ -9131,6 +9190,17 @@ def _run_prompt_submit(
                     run_message = f"{SPEECH_INTERRUPTED_NOTE}\n\n{run_message}"
                 elif isinstance(run_message, list):
                     run_message = [{"type": "text", "text": SPEECH_INTERRUPTED_NOTE}, *run_message]
+
+            # Reactions the user added since the last turn ride the MODEL INPUT
+            # only (same enrichment channel as the speech-interrupted note);
+            # persist_user_message below stays the clean prompt, so no
+            # scaffolding reaches the transcript. Cache-safe: annotating the
+            # NEW turn never rewrites an already-sent message.
+            if reaction_notes := _pending_reaction_notes(session):
+                if isinstance(run_message, str):
+                    run_message = f"{reaction_notes}\n\n{run_message}"
+                elif isinstance(run_message, list):
+                    run_message = [{"type": "text", "text": reaction_notes}, *run_message]
 
             def _stream(delta):
                 with session["history_lock"]:
@@ -9938,22 +10008,50 @@ def _(rid, params: dict) -> dict:
             if not value:
                 return _err(rid, 4002, "model value required")
             if session:
-                # Reject during an in-flight turn.  agent.switch_model()
-                # mutates self.model / self.provider / self.base_url /
-                # self.client in place; the worker thread running
-                # agent.run_conversation is reading those on every
-                # iteration.  A mid-turn swap can send an HTTP request
-                # with the new base_url but old model (or vice versa),
-                # producing 400/404s the user never asked for.  Parity
-                # with the gateway's running-agent /model guard.
-                if session.get("running"):
-                    return _err(
-                        rid,
-                        4009,
-                        "session busy — /interrupt the current turn before switching models",
-                    )
                 from hermes_cli.model_switch import parse_model_switch_args
 
+                # A live swap can't run in-place while a turn streams:
+                # agent.switch_model() mutates self.model / self.provider /
+                # self.base_url / self.client, and the worker thread running
+                # agent.run_conversation reads those every iteration — a
+                # mid-turn swap can fire an HTTP request with the new base_url
+                # but old model (400/404s).  So instead of rejecting the pick
+                # (the old 4009), stash it and apply it at the NEXT turn start
+                # (_apply_pending_model_switch), where nothing is in flight.
+                # The user gets to pick, keep typing, and send the next turn on
+                # the new model without waiting for the swap or interrupting.
+                if session.get("running"):
+                    parsed = parse_model_switch_args(value)
+                    try:
+                        pending_model = parsed.model_input
+                    except Exception:
+                        pending_model = str(value)
+                    session["pending_model_switch"] = {
+                        "raw": value,
+                        "confirm_expensive_model": bool(
+                            params.get("confirm_expensive_model", False)
+                        ),
+                        # The resolved model/provider the next turn will run on.
+                        # _session_info reports these while the switch is pending
+                        # so the end-of-turn settle keeps showing the user's pick
+                        # instead of blipping back to the still-live old model.
+                        "display_model": pending_model,
+                        "display_provider": (
+                            getattr(parsed, "explicit_provider", "") or ""
+                        ).strip(),
+                    }
+                    return _ok(
+                        rid,
+                        {
+                            "key": key,
+                            "value": pending_model,
+                            "warning": "",
+                            "confirm_required": False,
+                            "confirm_message": "",
+                            "scope": "session",
+                            "deferred": True,
+                        },
+                    )
                 parsed_flags = parse_model_switch_args(value)
                 explicit_provider = parsed_flags.explicit_provider
                 if session.get("agent") is None and not explicit_provider.strip():
@@ -11671,7 +11769,7 @@ def _format_live_history_output(session: dict) -> str:
     if db is not None and session.get("session_key"):
         try:
             history = db.get_messages_as_conversation(
-                session["session_key"], include_ancestors=True
+                session["session_key"], include_ancestors=True, include_row_ids=True
             )
         except Exception:
             pass
@@ -11711,7 +11809,9 @@ def _format_live_context_output(session: dict) -> str:
     if db is not None and session.get("session_key"):
         try:
             messages = _history_to_messages(
-                db.get_messages_as_conversation(session["session_key"], include_ancestors=True)
+                db.get_messages_as_conversation(
+                    session["session_key"], include_ancestors=True, include_row_ids=True
+                )
             )
         except Exception:
             messages = []
