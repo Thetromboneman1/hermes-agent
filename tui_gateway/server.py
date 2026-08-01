@@ -618,7 +618,7 @@ def _transfer_active_session_slot(
 # TUI backend itself creates ("tui", plus whatever a client passes as its
 # own ``source``) and the CLI's own sessions are NOT gateway-owned.
 _NON_GATEWAY_SOURCES = frozenset({
-    "", "tui", "cli", "webui", "desktop", "cron", "subagent", "test",
+    "", "tui", "cli", "webui", "desktop", "cron", "kanban", "subagent", "test",
     "local", "acp", "webhook", "api_server", "msgraph_webhook",
 })
 
@@ -793,6 +793,39 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         pass
 
 
+# End reasons where the BACKEND reclaimed a session the client never asked to
+# close: the idle-TTL reaper, the LRU cap, and the WS-orphan reap. A client
+# holding that live session id gets no signal today — its next prompt fails
+# against an id the backend has already forgotten, which reads as the session
+# silently vanishing rather than being reclaimed. ``tui_close`` and friends are
+# deliberately absent: the client initiated those and already knows.
+_RECLAIM_END_REASONS = frozenset({"idle_timeout", "lru_evict", "ws_orphan_reap"})
+
+
+def _announce_session_reclaimed(session: dict, end_reason: str) -> None:
+    """Tell connected clients a session was reclaimed out from under them.
+
+    Broadcast rather than session-targeted: the reap paths run on background
+    timer threads with no contextvar binding, and the WS-orphan case has by
+    definition lost its own transport — ``_emit`` would bottom out on stdio and
+    the peer that owns the session would never see it. Best-effort; a failed
+    notify must never break teardown.
+    """
+    if end_reason not in _RECLAIM_END_REASONS:
+        return
+    try:
+        _broadcast_global_event(
+            "session.reclaimed",
+            {
+                "session_id": str(session.get("_sid") or ""),
+                "stored_session_id": str(session.get("session_key") or ""),
+                "reason": end_reason,
+            },
+        )
+    except Exception:
+        logger.debug("session.reclaimed broadcast failed", exc_info=True)
+
+
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
@@ -806,6 +839,7 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     if not session:
         return
     _finalize_session(session, end_reason=end_reason)
+    _announce_session_reclaimed(session, end_reason)
     try:
         from tools.approval import unregister_gateway_notify
 
@@ -9810,6 +9844,26 @@ def _allowed_image_extensions() -> frozenset[str]:
         return frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
 
 
+def _session_images_dir(session: dict) -> Path:
+    """Resolve the uploads ``images/`` dir against the session's effective home.
+
+    Attach RPCs (``image.attach_bytes``, ``clipboard.paste``, ``pdf.attach``)
+    run BEFORE ``prompt.submit`` installs the session's profile HERMES_HOME
+    override, so ``get_hermes_home()`` here would return the gateway's launch
+    home. In a multi-profile / root-gateway deployment that writes the upload to
+    the launch home's ``images/`` while the sandbox mount and the vision host-
+    read allowlist both resolve the *session profile's* ``images/`` at run time
+    — so the file the agent tries to read is never the file we wrote (#69575).
+
+    Anchor the write on the session's stored ``profile_home`` when present
+    (matching the mount/read scope), else fall back to the launch home. Keeps
+    per-profile isolation: a profile's uploads stay under that profile's home.
+    """
+    profile_home = session.get("profile_home")
+    base = Path(profile_home) if profile_home else _hermes_home
+    return base / "images"
+
+
 def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: str) -> Path:
     """Write image bytes into the gateway's images dir and queue them.
 
@@ -9818,7 +9872,7 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
     the existing native-image-attach pipeline. Returns the written path.
     """
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _hermes_home / "images"
+    img_dir = _session_images_dir(session)
     img_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}{ext}"
@@ -11033,10 +11087,11 @@ def _discover_repos_payload(
     return out
 
 
-# Sources excluded from the project tree: cron runs and tool/subagent children
-# are not user conversations. Subagent/compression children are already dropped
-# by list_sessions_rich(include_children=False); cron has its own section.
-_PROJECT_TREE_EXCLUDED_SOURCES = ["cron"]
+# Sources excluded from the project tree: cron runs, and kanban dispatcher
+# workers, are not user conversations. Subagent/compression children are
+# already dropped by list_sessions_rich(include_children=False); cron has its
+# own section, and kanban runs are read on the board.
+_PROJECT_TREE_EXCLUDED_SOURCES = ["cron", "kanban"]
 
 
 def _project_tree_row(r: dict) -> dict:
