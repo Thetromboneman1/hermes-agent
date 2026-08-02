@@ -1009,7 +1009,19 @@ def canonical_custom_identity(
     # Only return it when it actually resolves to a configured custom entry,
     # so we never invent a `custom:<x>` that resolution can't honor.
     try:
-        if _get_named_custom_provider(candidate) is not None:
+        entry = _get_named_custom_provider(candidate)
+        if entry is not None:
+            # ``candidate`` matched, but it may be the entry's DISPLAY NAME —
+            # ``_get_named_custom_provider`` accepts either spelling. For a
+            # keyed ``providers:`` entry the display name is not the durable
+            # identity, so re-resolve through the endpoint the matched entry
+            # owns and return the same config-key slug every other path
+            # returns (7b5a18817). Without this, a display name that differs
+            # from its key heals to ``custom:<display-name>`` and stops
+            # matching the persisted identity.
+            identity = find_custom_provider_identity(str(entry.get("base_url") or ""))
+            if identity:
+                return identity
             if candidate_norm.startswith("custom:"):
                 return candidate_norm
             return f"custom:{candidate_norm}"
@@ -1612,8 +1624,9 @@ def _resolve_explicit_runtime(
         elif provider == "xai":
             api_mode = "codex_responses"
         else:
+            configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode:
+            if configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
                 api_mode = configured_mode
             else:
                 # URL detection first, then the provider's declared transport

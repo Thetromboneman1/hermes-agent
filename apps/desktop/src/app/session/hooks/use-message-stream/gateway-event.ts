@@ -34,7 +34,7 @@ import {
   setChangeEventsAvailable
 } from '@/store/live-sync'
 import { dispatchNativeNotification } from '@/store/native-notifications'
-import { notify } from '@/store/notifications'
+import { isDiskFullErrorMessage, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding, requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { revealDesktopPane } from '@/store/pane-focus'
 import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
@@ -72,6 +72,7 @@ import { ingestBackendSkin } from '@/themes/backend-sync'
 import type { RpcEvent } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
+import { finalizeInterruptedMessages } from '../use-prompt-actions/rewind'
 
 import { hasSessionInfoStatePatch, sessionInfoStatePatch, SUBAGENT_EVENT_TYPES, toTodoPayload } from './utils'
 
@@ -492,6 +493,16 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
                 ...state,
                 awaitingResponse: false,
                 busy,
+                // The turn is over but its streaming bubble may still say
+                // pending — running=false from the agent loop's finally block
+                // is the ONLY settle signal when message.complete never
+                // arrives (turn crash, reconnect gap). Left pending, that
+                // bubble shows a thinking indicator forever, stranded
+                // mid-transcript once the next user message lands after it.
+                // finalizeInterruptedMessages un-pends kept text and drops
+                // empty placeholders; on the normal path message.complete
+                // already settled everything and this is a no-op.
+                messages: finalizeInterruptedMessages(state.messages, state.streamId),
                 pendingBranchGroup: null,
                 streamId: null,
                 turnStartedAt: null
@@ -1161,6 +1172,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (looksLikeProviderSetup) {
           requestDesktopOnboarding(errorMessage)
+        } else if (isDiskFullErrorMessage(errorMessage)) {
+          notifyError(new Error(errorMessage), translateNow('notifications.errors.diskFull'))
         } else {
           // Toast globally, not just when the failing thread is focused: a
           // turn-ending error (e.g. out of funds) blocks every thread, so the

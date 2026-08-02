@@ -4205,6 +4205,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         model: str = None,
         toolsets: List[str] = None,
         provider: str = None,
+        reasoning: str = None,
         api_key: str = None,
         base_url: str = None,
         max_turns: int = None,
@@ -4222,6 +4223,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model: Model to use (default: from env or claude-sonnet)
             toolsets: List of toolsets to enable (default: all)
             provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
+            reasoning: Reasoning effort override for this run (none|minimal|low|medium|high|xhigh|max|ultra). Wins over config.
             api_key: API key (default: from environment)
             base_url: API base URL (default: OpenRouter)
             max_turns: Maximum tool-calling iterations shared with subagents (default: 500)
@@ -4487,6 +4489,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # shared chokepoint in hermes_constants (Closes #21256).
         from hermes_constants import resolve_reasoning_config
         self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
+        # An explicit --reasoning wins over config for this run only (never
+        # persisted). Kanban's dispatcher uses it to pin a task's thinking
+        # depth without touching the worker profile's config.yaml. An
+        # unparseable level is ignored with a warning rather than silently
+        # swapping in the default — same contract as the config path.
+        if reasoning is not None and str(reasoning).strip():
+            _cli_reasoning = _parse_reasoning_config(reasoning)
+            if _cli_reasoning is None:
+                logger.warning(
+                    "Unknown --reasoning '%s', keeping the configured level",
+                    reasoning,
+                )
+            else:
+                self.reasoning_config = _cli_reasoning
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -9595,6 +9611,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             return False
 
+    def _should_handle_background_command_inline(
+        self, text: str, has_images: bool = False
+    ) -> bool:
+        """Return True when /background should be dispatched while the agent runs.
+
+        Same queue problem /steer had. ``/background`` (``/bg``, ``/btw``)
+        exists to start independent work *without* waiting for the current
+        turn, but a slash command typed while the agent is busy goes into
+        ``_pending_input``, and ``process_loop`` is blocked inside
+        ``self.chat()`` for the whole run. The background task therefore only
+        starts once the foreground turn has finished, which is the one moment
+        it was not needed.
+
+        The command's own ``CommandDef`` already declares
+        ``busy_policy="dispatch"``; the gateway honours that, the classic CLI
+        never consulted it. Dispatching inline on the UI thread starts the
+        background session immediately and leaves the foreground turn running
+        untouched: no interrupt, no steer.
+        """
+        if not text or has_images or not _looks_like_slash_command(text):
+            return False
+        if not getattr(self, "_agent_running", False):
+            return False
+        try:
+            from hermes_cli.commands import resolve_command
+            base = text.split(None, 1)[0].lower().lstrip('/')
+            cmd = resolve_command(base)
+            return bool(cmd and cmd.name == "background")
+        except Exception:
+            return False
+
     def _output_console(self):
         """Use prompt_toolkit-safe Rich rendering once the TUI is live."""
         if getattr(self, "_app", None):
@@ -10247,6 +10294,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_wake_command(cmd_original)
         elif canonical == "busy":
             self._handle_busy_command(cmd_original)
+        elif canonical == "indicator":
+            self._handle_indicator_command(cmd_original)
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
@@ -14797,6 +14846,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Surface any active supply-chain security advisories right after the
         # welcome banner. Quiet/single-query paths call this themselves.
         self._show_security_advisories()
+
+        # First-run: a completely unconfigured install must route into
+        # provider onboarding, not a chat that cannot work. Previously a
+        # keyless `hermes` accepted a message, spun for ~30s, then failed
+        # with a provider-specific error the user never chose. Only fires
+        # on a real TTY; quiet/single-query paths keep their own handling.
+        try:
+            if sys.stdin.isatty() and not self._runtime_credentials_ready():
+                self._offer_first_run_setup()
+        except Exception:
+            logger.debug("first-run setup offer failed", exc_info=True)
+
         # If resuming a session, load history and display it immediately
         # so the user has context before typing their first message.
         if self._resumed:
@@ -15197,6 +15258,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # app, so without this the submitted "/steer <text>" can
                     # linger in the input area (looking unsent) and invite an
                     # accidental re-submit. See issue #34569.
+                    event.app.invalidate()
+                    return
+
+                # Same treatment for /background (/bg, /btw) while the agent is
+                # running.  Queuing it defeats the entire point of the command:
+                # process_loop is blocked inside self.chat(), so the background
+                # task would only start once the foreground turn it was meant to
+                # run alongside has already finished (#75221).  The foreground
+                # turn is left alone: no interrupt, no steer.
+                if self._should_handle_background_command_inline(
+                    text, has_images=has_images
+                ):
+                    self.process_command(text)
+                    event.app.current_buffer.reset(append_to_history=True)
+                    # Repaint for the same reason as the /steer branch above:
+                    # process_command() prints through patch_stdout and never
+                    # invalidates the app, so the submitted text can linger in
+                    # the input area looking unsent.
                     event.app.invalidate()
                     return
 
@@ -17791,6 +17870,7 @@ def main(
     skills: str | list[str] | tuple[str, ...] = None,
     model: str = None,
     provider: str = None,
+    reasoning: str = None,
     api_key: str = None,
     base_url: str = None,
     max_turns: int = None,
@@ -17819,6 +17899,7 @@ def main(
         skills: Comma-separated or repeated list of skills to preload for the session
         model: Model to use (default: anthropic/claude-opus-4-20250514)
         provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
+        reasoning: Reasoning effort for this run (none|minimal|low|medium|high|xhigh|max|ultra). Overrides agent.reasoning_effort.
         api_key: API key for authentication
         base_url: Base URL for the API
         max_turns: Maximum tool-calling iterations (default: 60)
@@ -17933,6 +18014,7 @@ def main(
         model=model,
         toolsets=toolsets_list,
         provider=provider,
+        reasoning=reasoning,
         api_key=api_key,
         base_url=base_url,
         max_turns=max_turns,
@@ -18075,6 +18157,10 @@ def main(
     
     # Handle single query mode
     if query or image:
+        # One-shot mode: no between-turns MCP late-binding refresh, so the
+        # agent must wait the full MCP cold-start bound before its first
+        # (and only) tool snapshot. See #51316.
+        cli._single_query_mode = True
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
         try:

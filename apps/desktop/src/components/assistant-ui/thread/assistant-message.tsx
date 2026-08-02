@@ -3,8 +3,8 @@ import {
   BranchPickerPrimitive,
   ErrorPrimitive,
   MessagePrimitive,
-  useAui,
-  useAuiState
+  useAuiState,
+  useMessageRuntime
 } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import { type FC, useCallback, useMemo, useState } from 'react'
@@ -54,7 +54,7 @@ export const AssistantMessage: FC<{
   onDismissError?: (messageId: string) => void
 }> = ({ onBranchInNewChat, onDismissError }) => {
   const messageId = useAuiState(s => s.message.id)
-  const messageRuntime = useAui().message
+  const messageRuntime = useMessageRuntime()
   const { t } = useI18n()
 
   // PERF: this component must NOT subscribe to the streaming text. Every
@@ -70,6 +70,13 @@ export const AssistantMessage: FC<{
   // tool-heavy turn doesn't grow a copy/refresh bar per paragraph (see
   // ChatMessage.interim).
   const isInterim = useAuiState(s => s.message.metadata?.custom?.interim === true)
+
+  // The thinking/stall indicator belongs to the TAIL of the thread, period. A
+  // stale pending bubble mid-transcript (a turn that ended without its settle
+  // event, a steer race) must never show one — a spinner above a later user
+  // message reads as the agent answering out of order. Booleans are stable
+  // across token flushes, so this selector adds no streaming re-renders.
+  const isLastMessage = useAuiState(s => s.thread.messages[s.thread.messages.length - 1]?.id === s.message.id)
 
   // Preview targets only materialize once the turn completes — while running
   // the selector returns '' (stable), so per-token flushes skip the regex
@@ -124,7 +131,7 @@ export const AssistantMessage: FC<{
       >
         {/* Todos render in the composer status stack now, not inline. */}
         <MessagePrimitive.Parts components={MESSAGE_PARTS_COMPONENTS} />
-        {isPlaceholder ? <ResponseLoadingIndicator /> : isRunning && <StreamStallIndicator />}
+        {isLastMessage && (isPlaceholder ? <ResponseLoadingIndicator /> : isRunning && <StreamStallIndicator />)}
         {previewTargets.length > 0 && (
           <div className="mt-3 flex flex-wrap gap-2">
             {previewTargets.map(target => (
