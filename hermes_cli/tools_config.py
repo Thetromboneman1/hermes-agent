@@ -152,7 +152,7 @@ def gui_toolset_label(label: str) -> str:
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search"}
+_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a"}
 
 
 # Config-only capabilities: they appear in `hermes tools` for provider/API-key
@@ -189,7 +189,21 @@ def _xai_credentials_present() -> bool:
             return True
     except Exception:
         pass
-    return bool(str(os.environ.get("XAI_API_KEY") or "").strip())
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:  # pragma: no cover — secret_scope is in-repo
+        return bool(str(os.environ.get("XAI_API_KEY") or "").strip())
+    return bool(str(get_secret("XAI_API_KEY") or "").strip())
+
+
+def _homeassistant_credentials_present() -> bool:
+    """Return whether the active profile has a Home Assistant token."""
+    try:
+        from agent.secret_scope import get_secret
+
+        return bool((get_secret("HASS_TOKEN", "") or "").strip())
+    except Exception:
+        return False
 
 # Platform-scoped toolsets: only appear in the `hermes tools` checklist for
 # these platforms, and only resolve/save for these platforms.  A toolset
@@ -2282,7 +2296,7 @@ def _get_platform_tools(
             default_off = set(_DEFAULT_OFF_TOOLSETS)
             if platform in default_off and platform not in _TOOLSET_PLATFORM_RESTRICTIONS:
                 default_off.remove(platform)
-            if "homeassistant" in default_off and os.getenv("HASS_TOKEN"):
+            if "homeassistant" in default_off and _homeassistant_credentials_present():
                 default_off.remove("homeassistant")
             _exempt_explicit_platform_native(
                 default_off, platform, explicitly_configured=explicitly_configured
@@ -2344,7 +2358,7 @@ def _get_platform_tools(
         # (e.g. cron) that run through _get_platform_tools without an
         # explicit saved toolset list. Without this, Norbert's HA cron jobs
         # regressed after #14798 made cron honor per-platform tool config.
-        if "homeassistant" in default_off and os.getenv("HASS_TOKEN"):
+        if "homeassistant" in default_off and _homeassistant_credentials_present():
             default_off.remove("homeassistant")
         # Symmetric carve-out for x_search auto-enable (see the inject
         # block above). Without this, the default_off subtraction would

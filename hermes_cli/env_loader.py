@@ -6,6 +6,7 @@ import codecs
 import io
 import os
 import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -48,6 +49,7 @@ _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
 # in-process cache prevents redundant network calls, but the print, the
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
+_SECRET_SOURCE_CACHE_LOCK = threading.RLock()
 
 
 def _known_hermes_env_keys() -> set[str]:
@@ -162,6 +164,78 @@ def get_secret_source_values(
     """Return the external-secret value snapshot for ``hermes_home``."""
     home_key = str(Path(hermes_home).resolve())
     return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(home_key, {}))
+
+
+def hydrate_profile_secret_sources(
+    hermes_home: str | os.PathLike,
+) -> dict[str, str]:
+    """Resolve one profile's configured sources without mutating ``os.environ``.
+
+    Multiplex gateways can route a first turn to a secondary profile that has
+    never run the process-global dotenv startup path.  Resolve that profile's
+    sources against a private mapping seeded from its own ``.env`` and record
+    the usual per-home snapshot for ``build_profile_secret_scope()``.
+
+    Fail-open and once-per-home semantics intentionally mirror
+    ``_apply_external_secret_sources``.  The returned mapping contains only
+    values actually contributed by external sources, never the profile's
+    plaintext ``.env`` entries.
+    """
+    with _SECRET_SOURCE_CACHE_LOCK:
+        return _hydrate_profile_secret_sources(Path(hermes_home))
+
+
+def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
+    """Locked implementation for :func:`hydrate_profile_secret_sources`."""
+    home_key = str(home.resolve())
+    if home_key in _APPLIED_HOMES:
+        return get_secret_source_values(home)
+
+    try:
+        cfg = _load_secrets_config(home)
+    except Exception:  # noqa: BLE001 — external sources must not block routing
+        return {}
+    if not cfg:
+        return {}
+
+    try:
+        from agent.secret_scope import _is_global_env, load_env_file
+        from agent.secret_sources.registry import apply_all
+
+        local_env = {
+            name: value
+            for name, value in os.environ.items()
+            if _is_global_env(name)
+        }
+        local_env.update(load_env_file(home / ".env"))
+        # Mirror load_hermes_dotenv()'s .op.env bootstrap: the 1Password
+        # service-account token lives in <home>/.op.env (gitignored), not
+        # .env. Without seeding it here a cold profile configured for the
+        # supported .op.env flow fails 1Password hydration (sweeper review
+        # on #74549). .env values win — never override an existing key.
+        op_env = home / ".op.env"
+        if op_env.exists():
+            for _name, _value in load_env_file(op_env).items():
+                local_env.setdefault(_name, _value)
+        local_env["HERMES_HOME"] = str(home)
+        report = apply_all(cfg, home, environ=local_env)
+    except Exception:  # noqa: BLE001 — preserve fail-open startup behavior
+        return {}
+
+    if not report.sources:
+        return {}
+
+    _APPLIED_HOMES.add(home_key)
+    values: dict[str, str] = {}
+    for name, applied in report.provenance.items():
+        value = local_env.get(name)
+        if value is None:
+            continue
+        _SECRET_SOURCES[name] = applied.source
+        values[name] = value
+    if values:
+        _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+    return dict(values)
 
 
 def reset_secret_source_cache() -> None:
@@ -438,7 +512,48 @@ def load_hermes_dotenv(
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
 
+    # config.yaml is the documented source of truth for terminal.* settings,
+    # but the dotenv loads above run with override=True — so a stale
+    # TERMINAL_ENV=docker left in ~/.hermes/.env (e.g. written by an older
+    # `hermes setup` before the user switched terminal.backend in config.yaml)
+    # silently wins again on every reload. Startup launchers bridge
+    # config→env once, but long-lived processes (gateway per-turn reload,
+    # cron standalone runs) call load_hermes_dotenv() repeatedly and used to
+    # flip the effective backend back to the stale .env value mid-session
+    # (#29186, #67323). Re-apply config.yaml's explicit terminal keys last so
+    # the documented config path always wins. Runs after _apply_managed_env()
+    # so the merged config (which already carries the managed overlay) is
+    # what lands in the env.
+    _reapply_terminal_config_bridge(home_path)
+
     return loaded
+
+
+def _reapply_terminal_config_bridge(home_path: Path) -> None:
+    """Re-assert config.yaml's explicit ``terminal.*`` keys over reloaded .env.
+
+    Delegates to ``hermes_cli.config.apply_terminal_config_to_env`` — the
+    single shared bridge (same one terminal_tool's fallback and the TUI/
+    dashboard launchers use) — so key coverage, explicit-keys-only override
+    semantics, cwd placeholder handling, and the managed-scope overlay can't
+    drift from the other bridge sites. Only keys the user actually wrote in
+    config.yaml's ``terminal`` section override env values; a config.yaml
+    without a terminal section leaves .env/shell selections untouched.
+
+    Scoped to the process HERMES_HOME: the shared bridge reads the
+    process-global config, so re-applying it for a *different* profile's
+    ``load_hermes_dotenv(hermes_home=...)`` call would bridge the wrong
+    profile's config. Fail-open — a config problem must never break dotenv
+    loading (the historical env-driven behavior still applies).
+    """
+    try:
+        if Path(home_path).resolve() != _process_hermes_home().resolve():
+            return
+        from hermes_cli.config import apply_terminal_config_to_env
+
+        apply_terminal_config_to_env(env=None)
+    except Exception:  # noqa: BLE001 — early bootstrap / malformed config
+        pass
 
 
 def _apply_managed_env() -> None:

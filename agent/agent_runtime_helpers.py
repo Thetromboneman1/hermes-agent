@@ -52,6 +52,45 @@ logger = logging.getLogger(__name__)
 _MAX_AUTH_REFRESH_ATTEMPTS = 2
 
 
+_REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought")
+_TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
+
+_REASONING_BLOCK_PATTERNS = tuple(
+    re.compile(rf"<{name}>.*?</{name}>", re.DOTALL | re.IGNORECASE)
+    for name in _REASONING_TAG_NAMES
+)
+
+_TOOL_CALL_BLOCK_PATTERNS = tuple(
+    re.compile(rf"<{name}\b[^>]*>.*?</{name}>", re.DOTALL | re.IGNORECASE)
+    for name in _TOOL_CALL_TAG_NAMES
+)
+
+# Named <function name=...> blocks — see strip_think_blocks step 1c for the
+# full rationale (sentence-boundary lookbehind + tempered-dot body so a plain
+# prose mention of "function" is never eaten).
+_NAMED_FUNCTION_BLOCK_PATTERN = re.compile(
+    r'(?:(?<=^)|(?<=[\n\r.!?:]))[ \t]*'
+    r'<function\b[^>]*\bname\s*=[^>]*>'
+    r'(?:(?:(?!</function>).)*)</function>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+_UNTERMINATED_REASONING_BLOCK_PATTERN = re.compile(
+    rf'(?:^|\n)[ \t]*<(?:{"|".join(_REASONING_TAG_NAMES)})\b[^>]*>.*$',
+    re.DOTALL | re.IGNORECASE,
+)
+
+_ORPHAN_REASONING_TAG_PATTERN = re.compile(
+    rf'</?(?:{"|".join(_REASONING_TAG_NAMES)})>\s*',
+    re.IGNORECASE,
+)
+
+_STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
+    rf'</(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function)>\s*',
+    re.IGNORECASE,
+)
+
+
 def _ra():
     """Lazy ``run_agent`` reference for test-patch routing."""
     import run_agent
@@ -151,7 +190,7 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                     except json.JSONDecodeError:
                         # This shouldn't happen since we validate and retry during conversation,
                         # but if it does, log warning and use empty dict
-                        logger.warning(f"Unexpected invalid JSON in trajectory conversion: {tool_call['function']['arguments'][:100]}")
+                        logger.warning("Unexpected invalid JSON in trajectory conversion: %s", tool_call['function']['arguments'][:100])
                         arguments = {}
                     
                     tool_call_json = {
@@ -826,62 +865,31 @@ def strip_think_blocks(agent, content: str) -> str:
     # 1. Closed tag pairs — case-insensitive for all variants so
     #    mixed-case tags (<THINK>, <Thinking>) don't slip through to
     #    the unterminated-tag pass and take trailing content with them.
-    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
-    content = re.sub(r'<thinking>.*?</thinking>', '', content, flags=re.DOTALL | re.IGNORECASE)
-    content = re.sub(r'<reasoning>.*?</reasoning>', '', content, flags=re.DOTALL | re.IGNORECASE)
-    content = re.sub(r'<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>', '', content, flags=re.DOTALL | re.IGNORECASE)
-    content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE)
+    for _pattern in _REASONING_BLOCK_PATTERNS:
+        content = _pattern.sub('', content)
     # 1b. Tool-call XML blocks (openclaw/openclaw#67318). Handle the
     #     generic tag names first — they have no attribute gating since
     #     a literal <tool_call> in prose is already vanishingly rare.
-    for _tc_name in ("tool_call", "tool_calls", "tool_result",
-                      "function_call", "function_calls"):
-        content = re.sub(
-            rf'<{_tc_name}\b[^>]*>.*?</{_tc_name}>',
-            '',
-            content,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
+    for _pattern in _TOOL_CALL_BLOCK_PATTERNS:
+        content = _pattern.sub('', content)
     # 1c. <function name="...">...</function> — Gemma-style standalone
     #     tool call. Only strip when the tag sits at a block boundary
     #     (start of text, after a newline, or after sentence-ending
     #     punctuation) AND carries a name="..." attribute. This keeps
     #     prose mentions like "Use <function> to declare" safe.
-    content = re.sub(
-        r'(?:(?<=^)|(?<=[\n\r.!?:]))[ \t]*'
-        r'<function\b[^>]*\bname\s*=[^>]*>'
-        r'(?:(?:(?!</function>).)*)</function>',
-        '',
-        content,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+    content = _NAMED_FUNCTION_BLOCK_PATTERN.sub('', content)
     # 2. Unterminated reasoning block — open tag at a block boundary
     #    (start of text, or after a newline) with no matching close.
     #    Strip from the tag to end of string.  Fixes #8878 / #9568
     #    (MiniMax M2.7 leaking raw reasoning into assistant content).
-    content = re.sub(
-        r'(?:^|\n)[ \t]*<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)\b[^>]*>.*$',
-        '',
-        content,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+    content = _UNTERMINATED_REASONING_BLOCK_PATTERN.sub('', content)
     # 3. Stray orphan open/close tags that slipped through.
-    content = re.sub(
-        r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*',
-        '',
-        content,
-        flags=re.IGNORECASE,
-    )
+    content = _ORPHAN_REASONING_TAG_PATTERN.sub('', content)
     # 3b. Stray tool-call closers. (We do NOT strip bare <function> or
     #     unterminated <function name="..."> because a truncated tail
     #     during streaming may still be valuable to the user; matches
     #     OpenClaw's intentional asymmetry.)
-    content = re.sub(
-        r'</(?:tool_call|tool_calls|tool_result|function_call|function_calls|function)>\s*',
-        '',
-        content,
-        flags=re.IGNORECASE,
-    )
+    content = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub('', content)
     return content
 
 
@@ -1210,7 +1218,7 @@ def recover_with_credential_pool(
                         refreshed_id,
                     )
                     return False, has_retried_429
-            _ra().logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
+            _ra().logger.info("Credential auth failure — refreshed pool entry %s", getattr(refreshed, 'id', '?'))
             agent._swap_credential(refreshed)
             return True, has_retried_429
         # Refresh failed — rotate to next credential instead of giving up.
@@ -1835,7 +1843,7 @@ def dump_api_request_debug(
         return dump_file
     except Exception as dump_error:
         if agent.verbose_logging:
-            logger.warning(f"Failed to dump API request debug payload: {dump_error}")
+            logger.warning("Failed to dump API request debug payload: %s", dump_error)
         return None
 
 
@@ -1857,6 +1865,66 @@ def _direct_native_anthropic_tool_cache_capability(
     )
 
 
+def cache_ttl_means_disabled(ttl: Any) -> bool:
+    """Return True when a ``prompt_caching.cache_ttl`` value means caching off.
+
+    Single source of truth for the disable-synonym detection shared by
+    ``agent_init`` (live-agent ``_cache_disabled`` flag) and the stub policy
+    paths below. Keeping one predicate prevents the two sites from drifting
+    (a synonym added in only one place would recreate #76085).
+
+    Unknown values (e.g. ``"2h"``, integers) are NOT a disable — callers keep
+    caching enabled with the default TTL, matching ``agent_init``.
+    """
+    if ttl in ("5m", "1h"):
+        return False
+    if ttl is False or ttl is None:
+        return True
+    return str(ttl).lower() in ("off", "false", "disabled", "no", "none")
+
+
+def prompt_caching_disabled_from_config() -> bool:
+    """Return True when ``prompt_caching.cache_ttl`` is configured as off.
+
+    Same disable detection as ``agent_init`` (via ``cache_ttl_means_disabled``)
+    so stub-based policy paths (MoA slot decoration, auxiliary fallback
+    replan) honor the same config contract without holding a live
+    ``AIAgent`` (#76085 / #33555).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        pc_cfg = load_config_readonly().get("prompt_caching", {}) or {}
+        ttl = pc_cfg.get("cache_ttl", "5m")
+    except Exception:
+        return False
+    return cache_ttl_means_disabled(ttl)
+
+
+def blank_cache_policy_stub(cache_disabled: Optional[bool] = None):
+    """Build the destination-identity-blank stub for ``anthropic_prompt_cache_policy``.
+
+    Single sanctioned constructor for that stub. Callers that resolve cache
+    policy against a destination identified out-of-band (not a live
+    ``AIAgent``) must go through here so ``_cache_disabled`` is never left
+    off a hand-rolled ``SimpleNamespace`` (#76085).
+
+    When ``cache_disabled`` is omitted, falls back to the global config so
+    stub paths without an agent snapshot still honor an operator disable.
+    """
+    from types import SimpleNamespace
+
+    if cache_disabled is None:
+        cache_disabled = prompt_caching_disabled_from_config()
+    return SimpleNamespace(
+        provider="",
+        base_url="",
+        api_mode="",
+        model="",
+        _cache_disabled=bool(cache_disabled),
+    )
+
+
 def plan_cache_sections_for_destination(
     messages: list,
     tools: Optional[list],
@@ -1865,6 +1933,7 @@ def plan_cache_sections_for_destination(
     base_url: str,
     api_mode: str,
     model: str,
+    cache_disabled: Optional[bool] = None,
 ) -> Tuple[list, list]:
     """Plan request-local cache sections for one resolved destination.
 
@@ -1877,16 +1946,19 @@ def plan_cache_sections_for_destination(
 
     Never mutates ``messages`` or ``tools`` — both return values are
     request-local copies.
-    """
-    from types import SimpleNamespace
 
+    ``cache_disabled`` threads the operator's ``prompt_caching.cache_ttl``
+    disable into the blank policy stub. When omitted, the live config is
+    consulted so MoA/auxiliary paths cannot re-enable markers after the
+    user turned caching off (#76085).
+    """
     from agent.prompt_caching import (
         build_prompt_cache_plan,
         strip_anthropic_cache_control,
         strip_anthropic_tool_cache_control,
     )
 
-    stub = SimpleNamespace(provider="", base_url="", api_mode="", model="")
+    stub = blank_cache_policy_stub(cache_disabled)
     should_cache, native_layout = anthropic_prompt_cache_policy(
         stub,
         provider=provider,
@@ -3895,6 +3967,9 @@ __all__ = [
     "restore_primary_runtime",
     "extract_reasoning",
     "dump_api_request_debug",
+    "prompt_caching_disabled_from_config",
+    "blank_cache_policy_stub",
+    "plan_cache_sections_for_destination",
     "anthropic_prompt_cache_policy",
     "create_openai_client",
     "switch_model",
