@@ -1,0 +1,44 @@
+name: Workflow lifecycle email
+
+on:
+  workflow_run:
+    workflows:
+      - Contributor Attribution Check
+      - Deploy Site
+      - Docker Build and Publish
+      - Docs Site Checks
+      - Nix Lockfile Check
+      - Nix
+      - Build Skills Index
+      - Supply Chain Audit
+      - Tests
+      - Sync with NousResearch upstream
+    types:
+      - in_progress
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: workflow-lifecycle-email-${{ github.event.workflow_run.id }}-${{ github.event.action }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    name: Send lifecycle email
+    if: github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Send workflow lifecycle email
+        uses: Thetromboneman1/github-actions-lifecycle-email@b0c44ad834e89824fa0eb30359fe2ee4d0e9643a
+        with:
+          op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          phase: ${{ github.event.action == 'in_progress' && 'started' || (github.event.workflow_run.conclusion == 'success' && 'success' || github.event.workflow_run.conclusion == 'cancelled' && 'cancelled' || 'failure') }}
+          status: ${{ github.event.action == 'in_progress' && 'started' || github.event.workflow_run.conclusion }}
+          workload-summary: Observed lifecycle transition for the source workflow run.
+          correlation-id: ${{ github.repository }}:${{ github.event.workflow_run.id }}:${{ github.event.workflow_run.run_attempt }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
