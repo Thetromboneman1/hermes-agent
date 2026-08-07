@@ -617,7 +617,7 @@ WORKFLOW = '''name: Documentation health
 on:
   push:
     branches:
-      - '**'
+      - "**"
   pull_request:
 
 permissions:
