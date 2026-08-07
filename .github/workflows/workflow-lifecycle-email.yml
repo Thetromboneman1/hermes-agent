@@ -33,10 +33,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Send workflow lifecycle email
-        uses: Thetromboneman1/github-actions-lifecycle-email@b0c44ad834e89824fa0eb30359fe2ee4d0e9643a
+        uses: Thetromboneman1/github-actions-lifecycle-email@c212ddea79bf533cb88ea6be7d318df5a96626a9
         with:
           op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
-          phase: ${{ github.event.action == 'in_progress' && 'started' || (github.event.workflow_run.conclusion == 'success' && 'success' || github.event.workflow_run.conclusion == 'cancelled' && 'cancelled' || 'failure') }}
+          phase: ${{ github.event.action == 'in_progress' && 'started' || (github.event.workflow_run.conclusion == 'success' && 'success' || github.event.workflow_run.conclusion == 'cancelled' && 'cancelled' || github.event.workflow_run.conclusion == 'skipped' && 'skipped' || 'failure') }}
           status: ${{ github.event.action == 'in_progress' && 'started' || github.event.workflow_run.conclusion }}
           workload-summary: Observed lifecycle transition for the source workflow run.
           correlation-id: ${{ github.repository }}:${{ github.event.workflow_run.id }}:${{ github.event.workflow_run.run_attempt }}
