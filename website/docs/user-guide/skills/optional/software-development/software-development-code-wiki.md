@@ -201,13 +201,8 @@ where it exits, where state lives.>
 
 ## System Diagram
 
-```mermaid
-flowchart TD
-    User([User]) --> Entry[Entry Point]
-    Entry --> Core[Core Engine]
-    Core --> StorageA[(Database)]
-    Core --> ExternalAPI{{External API}}
-```
+![Rendered system diagram](../../../../../../docs/architecture/generated/mermaid-8b905ccd30ff.png)
+
 
 ## Data Flow
 
@@ -274,22 +269,8 @@ Pick the 5–10 most important classes/types. `read_file` them, then write:
 
 ## Core Types
 
-```mermaid
-classDiagram
-    class Agent {
-        +string name
-        +list~Tool~ tools
-        +chat(message) string
-    }
-    class Tool {
-        <<interface>>
-        +name string
-        +execute(args) any
-    }
-    Agent --> Tool : uses
-    Tool <|-- TerminalTool
-    Tool <|-- WebTool
-```
+![Rendered system diagram](../../../../../../docs/architecture/generated/mermaid-e43330249fe9.png)
+
 
 ## Notes
 
@@ -309,19 +290,8 @@ Pick 2–4 of the most important workflows. Trace each call path through the cod
 
 <1 sentence describing what this does and when it runs.>
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant CLI
-    participant Agent
-    participant LLM
-    User->>CLI: types message
-    CLI->>Agent: chat(message)
-    Agent->>LLM: API call
-    LLM-->>Agent: response + tool_calls
-    Agent->>Agent: execute tools
-    Agent-->>CLI: final response
-```
+![Rendered system diagram](../../../../../../docs/architecture/generated/mermaid-9b821893b9b6.png)
+
 
 ### Walkthrough
 

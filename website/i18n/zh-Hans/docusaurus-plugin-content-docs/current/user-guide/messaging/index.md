@@ -41,64 +41,8 @@ description: "通过 Telegram、Discord、Slack、WhatsApp、Signal、SMS、Emai
 
 ## 架构
 
-```mermaid
-flowchart TB
-    subgraph Gateway["Hermes Gateway"]
-        subgraph Adapters["Platform adapters"]
-            tg[Telegram]
-            dc[Discord]
-            wa[WhatsApp]
-            sl[Slack]
-            gc[Google Chat]
-            sig[Signal]
-            sms[SMS]
-            em[Email]
-            ha[Home Assistant]
-            mm[Mattermost]
-            mx[Matrix]
-            dt[DingTalk]
-    fs[Feishu/Lark]
-    wc[WeCom]
-    wcb[WeCom Callback]
-    wx[Weixin]
-    bb[BlueBubbles]
-    qq[QQ]
-    yb[Yuanbao]
-    ms[Microsoft Teams]
-    api["API Server<br/>(OpenAI-compatible)"]
-    wh[Webhooks]
-        end
+![Rendered system diagram](../../../../../../../docs/architecture/generated/mermaid-3e97e05bd51a.png)
 
-        store["Session store<br/>per chat"]
-        agent["AIAgent<br/>run_agent.py"]
-        cron["Cron scheduler<br/>ticks every 60s"]
-    end
-
-    tg --> store
-    dc --> store
-    wa --> store
-    sl --> store
-    gc --> store
-    sig --> store
-    sms --> store
-    em --> store
-    ha --> store
-    mm --> store
-    mx --> store
-    dt --> store
-    fs --> store
-    wc --> store
-    wcb --> store
-    wx --> store
-    bb --> store
-    qq --> store
-    yb --> store
-    ms --> store
-    api --> store
-    wh --> store
-    store --> agent
-    cron --> store
-```
 
 每个平台适配器接收消息，通过每个聊天的会话存储进行路由，并将其分发给 AIAgent 处理。网关还运行 cron 调度器，每 60 秒触发一次以执行到期任务。
 

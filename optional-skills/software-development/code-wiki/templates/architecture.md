@@ -9,13 +9,8 @@
 
 ## System Diagram
 
-```mermaid
-flowchart TD
-    User([User]) --> Entry[Entry Point]
-    Entry --> Core[Core Engine]
-    Core --> StorageA[(Database)]
-    Core --> ExternalAPI{{External API}}
-```
+![Rendered system diagram](../../../../docs/architecture/generated/mermaid-8b905ccd30ff.png)
+
 
 ## Data Flow
 

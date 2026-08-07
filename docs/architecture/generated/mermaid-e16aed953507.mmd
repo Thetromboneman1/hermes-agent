@@ -1,0 +1,13 @@
+flowchart TD
+  user["User command\n(hermes, gateway)"]
+  agent["AIAgent\n(run_agent.py)"]
+  tools["File & terminal tools"]
+  cpMgr["CheckpointManager"]
+  store["Shared shadow store\n~/.hermes/checkpoints/store/"]
+
+  user --> agent
+  agent -->|"tool call"| tools
+  tools -->|"before mutate\nensure_checkpoint()"| cpMgr
+  cpMgr -->|"git add/commit-tree/update-ref"| store
+  cpMgr -->|"OK / skipped"| tools
+  tools -->|"apply changes"| agent

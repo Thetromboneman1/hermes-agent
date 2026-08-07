@@ -10,13 +10,8 @@ description: "通过 OpenAI 兼容 API 服务器将 Open WebUI 连接到 Hermes 
 
 ## 架构
 
-```mermaid
-flowchart LR
-    A["Open WebUI<br/>浏览器 UI<br/>端口 3000"]
-    B["hermes-agent<br/>gateway API 服务器<br/>端口 8642"]
-    A -->|POST /v1/chat/completions| B
-    B -->|SSE 流式响应| A
-```
+![Rendered system diagram](../../../../../../../docs/architecture/generated/mermaid-67918888a954.png)
+
 
 Open WebUI 连接 Hermes Agent 的 API 服务器，方式与连接 OpenAI 完全相同。Hermes 使用其完整工具集——终端、文件操作、网络搜索、记忆、技能——处理请求并返回最终响应。
 

@@ -1,0 +1,5 @@
+flowchart TD
+    A["Open WebUI<br/>browser UI<br/>port 3000"]
+    B["hermes-agent<br/>gateway API server<br/>port 8642"]
+    A -->|POST /v1/chat/completions| B
+    B -->|SSE streaming response| A

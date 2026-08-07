@@ -66,21 +66,8 @@ At a high level:
   - Stages into a per-project index, builds a tree, and commits to a per-project ref (`refs/hermes/<project-hash>`).
 - These per-project refs form a checkpoint history that you can inspect and restore via `/rollback`.
 
-```mermaid
-flowchart LR
-  user["User command\n(hermes, gateway)"]
-  agent["AIAgent\n(run_agent.py)"]
-  tools["File & terminal tools"]
-  cpMgr["CheckpointManager"]
-  store["Shared shadow store\n~/.hermes/checkpoints/store/"]
+![Rendered system diagram](../../../docs/architecture/generated/mermaid-e16aed953507.png)
 
-  user --> agent
-  agent -->|"tool call"| tools
-  tools -->|"before mutate\nensure_checkpoint()"| cpMgr
-  cpMgr -->|"git add/commit-tree/update-ref"| store
-  cpMgr -->|"OK / skipped"| tools
-  tools -->|"apply changes"| agent
-```
 
 ## Configuration
 

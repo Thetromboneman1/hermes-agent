@@ -16,14 +16,8 @@ They're developer conveniences, not shipped commands. Drop them in `~/.zshrc`; a
 
 One checkout is the **deps checkout** — the one place you actually run `npm install`. Every other worktree links against it, and only re-installs locally when its lockfile diverges (a branch that bumps a dependency must not silently run against stale packages).
 
-```mermaid
-flowchart TD
-    A[htui / hgui in a worktree] --> B{package-lock.json<br/>matches deps checkout?}
-    B -- yes --> C[symlink node_modules<br/>from deps checkout]
-    B -- no --> D[local npm ci<br/>in this worktree]
-    C --> E[launch surface]
-    D --> E
-```
+![Rendered system diagram](../../../docs/architecture/generated/mermaid-78a25e11d673.png)
+
 
 Two env vars name the canonical checkout:
 

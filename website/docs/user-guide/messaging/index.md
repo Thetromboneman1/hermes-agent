@@ -55,64 +55,8 @@ Bots need both a model provider and tool providers (TTS, web). A [Nous Portal](/
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    subgraph Gateway["Hermes Gateway"]
-        subgraph Adapters["Platform adapters"]
-            tg[Telegram]
-            dc[Discord]
-            wa[WhatsApp]
-            sl[Slack]
-            gc[Google Chat]
-            sig[Signal]
-            sms[SMS]
-            em[Email]
-            ha[Home Assistant]
-            mm[Mattermost]
-            mx[Matrix]
-            dt[DingTalk]
-    fs[Feishu/Lark]
-    wc[WeCom]
-    wcb[WeCom Callback]
-    wx[Weixin]
-    bb[BlueBubbles]
-    qq[QQ]
-    yb[Yuanbao]
-    ms[Microsoft Teams]
-    api["API Server<br/>(OpenAI-compatible)"]
-    wh[Webhooks]
-        end
+![Rendered system diagram](../../../../docs/architecture/generated/mermaid-3e97e05bd51a.png)
 
-        store["Session store<br/>per chat"]
-        agent["AIAgent<br/>run_agent.py"]
-        cron["Cron scheduler<br/>ticks every 60s"]
-    end
-
-    tg --> store
-    dc --> store
-    wa --> store
-    sl --> store
-    gc --> store
-    sig --> store
-    sms --> store
-    em --> store
-    ha --> store
-    mm --> store
-    mx --> store
-    dt --> store
-    fs --> store
-    wc --> store
-    wcb --> store
-    wx --> store
-    bb --> store
-    qq --> store
-    yb --> store
-    ms --> store
-    api --> store
-    wh --> store
-    store --> agent
-    cron --> store
-```
 
 Each platform adapter receives messages, routes them through a per-chat session store, and dispatches them to the AIAgent for processing. The gateway also runs the cron scheduler, ticking every 60 seconds to execute any due jobs.
 

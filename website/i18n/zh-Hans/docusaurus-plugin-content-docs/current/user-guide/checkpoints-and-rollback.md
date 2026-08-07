@@ -66,21 +66,8 @@ Agent 每个目录每轮**最多创建一个检查点**，因此长时间运行�
   - 写入每个项目的索引，构建树对象，并提交到每个项目的引用（`refs/hermes/<project-hash>`）。
 - 这些每项目引用构成可通过 `/rollback` 检查和恢复的检查点历史。
 
-```mermaid
-flowchart LR
-  user["User command\n(hermes, gateway)"]
-  agent["AIAgent\n(run_agent.py)"]
-  tools["File & terminal tools"]
-  cpMgr["CheckpointManager"]
-  store["Shared shadow store\n~/.hermes/checkpoints/store/"]
+![Rendered system diagram](../../../../../../docs/architecture/generated/mermaid-e16aed953507.png)
 
-  user --> agent
-  agent -->|"tool call"| tools
-  tools -->|"before mutate\nensure_checkpoint()"| cpMgr
-  cpMgr -->|"git add/commit-tree/update-ref"| store
-  cpMgr -->|"OK / skipped"| tools
-  tools -->|"apply changes"| agent
-```
 
 ## 配置
 

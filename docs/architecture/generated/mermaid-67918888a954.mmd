@@ -1,0 +1,5 @@
+flowchart TD
+    A["Open WebUI<br/>浏览器 UI<br/>端口 3000"]
+    B["hermes-agent<br/>gateway API 服务器<br/>端口 8642"]
+    A -->|POST /v1/chat/completions| B
+    B -->|SSE 流式响应| A

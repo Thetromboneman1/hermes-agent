@@ -20,7 +20,7 @@ Standalone `index.html` — the top-level composition. **Does NOT use `<template
     >
       <!-- clips go here -->
       <video id="clip-1" data-start="0" data-duration="5" data-track-index="0" src="intro.mp4" muted playsinline></video>
-      <img id="logo" data-start="2" data-duration="3" data-track-index="1" src="logo.png" />
+      <img id="logo" data-start="2" data-duration="3" data-track-index="1" src="../../../../website/static/img/logo.png" />
       <audio id="music" data-start="0" data-duration="10" data-track-index="2" data-volume="0.5" src="music.wav"></audio>
     </div>
 

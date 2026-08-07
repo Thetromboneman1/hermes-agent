@@ -1,0 +1,6 @@
+flowchart TD
+    A[htui / hgui in a worktree] --> B{package-lock.json<br/>matches deps checkout?}
+    B -- yes --> C[symlink node_modules<br/>from deps checkout]
+    B -- no --> D[local npm ci<br/>in this worktree]
+    C --> E[launch surface]
+    D --> E

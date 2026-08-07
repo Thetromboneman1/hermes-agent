@@ -1,0 +1,11 @@
+sequenceDiagram
+    participant User
+    participant CLI
+    participant Agent
+    participant LLM
+    User->>CLI: types message
+    CLI->>Agent: chat(message)
+    Agent->>LLM: API call
+    LLM-->>Agent: response + tool_calls
+    Agent->>Agent: execute tools
+    Agent-->>CLI: final response

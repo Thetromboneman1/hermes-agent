@@ -1,0 +1,5 @@
+flowchart TD
+    User([User]) --> Entry[Entry Point]
+    Entry --> Core[Core Engine]
+    Core --> StorageA[(Database)]
+    Core --> ExternalAPI{{External API}}

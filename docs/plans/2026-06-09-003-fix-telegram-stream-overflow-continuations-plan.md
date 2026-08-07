@@ -46,26 +46,8 @@ This is especially visible in Telegram forum topics because a long final respons
 
 ## High-Level Technical Design
 
-```mermaid
-sequenceDiagram
-    participant C as GatewayStreamConsumer
-    participant T as TelegramAdapter.edit_message
-    participant B as Telegram Bot API
+![Rendered system diagram](../architecture/generated/mermaid-5cc9c1928c81.png)
 
-    C->>T: finalize/edit long accumulated response
-    T->>B: edit original message with chunk 1
-    loop remaining chunks
-        T->>B: send continuation in same topic/thread
-    end
-    alt all chunks delivered
-        T-->>C: success, last message id, continuation ids
-        C->>C: mark final response delivered
-    else any continuation failed
-        T-->>C: partial overflow failure with delivered prefix metadata
-        C->>C: do not mark final delivered
-        C->>B: fallback sends missing tail or full final response safely
-    end
-```
 
 ---
 

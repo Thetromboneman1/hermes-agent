@@ -1,0 +1,14 @@
+classDiagram
+    class Agent {
+        +string name
+        +list~Tool~ tools
+        +chat(message) string
+    }
+    class Tool {
+        <<interface>>
+        +name string
+        +execute(args) any
+    }
+    Agent --> Tool : uses
+    Tool <|-- TerminalTool
+    Tool <|-- WebTool
