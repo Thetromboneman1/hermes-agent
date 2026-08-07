@@ -16,7 +16,7 @@ import struct
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_PASSES = 3
@@ -461,7 +461,7 @@ def write_repository_state(root: Path) -> None:
     lines = [
         "# Repository State",
         "",
-        f"Updated: {date.today().isoformat()}",
+        f"Updated: {datetime.now(timezone.utc).date().isoformat()}",
         "",
         "This file is generated from the tracked repository tree. It is committed so",
         "the documentation record advances with implementation changes.",
@@ -680,7 +680,7 @@ import struct
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 '''
