@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Send workflow lifecycle email
-        uses: Thetromboneman1/github-actions-lifecycle-email@c212ddea79bf533cb88ea6be7d318df5a96626a9
+        uses: Thetromboneman1/github-actions-lifecycle-email@c639809639bbb890f9337b047a7a31dbf911bf8d
         with:
           op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
           phase: ${{ github.event.action == 'in_progress' && 'started' || (github.event.workflow_run.conclusion == 'success' && 'success' || github.event.workflow_run.conclusion == 'cancelled' && 'cancelled' || github.event.workflow_run.conclusion == 'skipped' && 'skipped' || 'failure') }}
