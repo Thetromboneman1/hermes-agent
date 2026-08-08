@@ -54,6 +54,7 @@ import {
   setSessions,
   setSessionStartedAt,
   setTurnStartedAt,
+  setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
 import {
@@ -297,6 +298,16 @@ export function useSessionActions({
       setAwaitingResponse(false)
       clearNotifications()
       setIntroSeed(seed => seed + 1)
+      // A fresh chat takes the screen. Front the workspace — and ONLY that:
+      // `$terminalTakeover` is the terminal's open/closed state in every
+      // layout, not a Focus-only overlay flag, so clearing it here would close
+      // a terminal sitting harmlessly in its own zone (Default, Terminal deck,
+      // Quad) and would persist a `false` that leaves the Focus tab unable to
+      // mount its workspace on the next boot. Behind another tab the terminal
+      // is hidden, not closed: it keeps its PTYs and the overlay stops
+      // painting on the pane-hidden marker, which is what actually cleared the
+      // chat.
+      revealTreePane('workspace')
       // Clear the durable route intent synchronously, before React Router
       // publishes /new. Submit uses that intent to heal an existing-session
       // rebind race, so leaving the old id here could revive it on a very fast
@@ -340,6 +351,11 @@ export function useSessionActions({
         setCurrentCwd(workspaceTarget)
       }
 
+      // A fresh draft resolves its own workspace right here, so it owns it. The
+      // selected stored id is null for a draft, and so is the owner — they match,
+      // which keeps workspace surfaces live on a new chat instead of treating the
+      // draft as an un-re-homed switch (#71254).
+      setWorkspaceCwdOwner(null)
       setCurrentBranch('')
       // Never clear the composer here — ChatBar's per-thread draft swap owns it.
       setFreshDraftReady(true)
@@ -504,13 +520,23 @@ export function useSessionActions({
           upsertOptimisticSession(created, stored, null, null)
         }
 
-        // A tile lives in its OWN worktree — it must not publish its cwd/branch
-        // into the composer atoms the main pane renders from.
+        // A tile lives in its OWN worktree, so it must not run the full
+        // foreground composer publish. A CENTER tile is the focused surface,
+        // though, and the Files pane still keys off the global `$currentCwd` —
+        // so the right rail kept showing the previous session's tree when a
+        // Project "+" created a session while the main chat was occupied
+        // (#76696). Split/side tiles deliberately stay isolated.
         const runtimeInfo = applyRuntimeInfo(created.info, { foreground: false })
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
         openSessionTile(stored, dir)
         patchSessionTile(stored, { runtimeId: created.session_id })
+
+        if (dir === 'center' && runtimeInfo?.cwd) {
+          setCurrentCwd(runtimeInfo.cwd)
+          setWorkspaceCwdOwner(stored)
+        }
+
         revealTreePane(`session-tile:${stored}`)
 
         if (listed) {
@@ -691,6 +717,12 @@ export function useSessionActions({
           activeSessionIdRef.current = cachedRuntimeId
           syncSessionStateToView(cachedRuntimeId, cachedViewState)
           setCurrentCwd(cachedViewState.cwd)
+          // The warm cache IS this conversation's own workspace truth, so the
+          // switch is already re-homed here. This claim cannot wait for
+          // `session.activate`: its missing-RPC compat branch returns before
+          // `applyRuntimeInfo` runs, which would leave the workspace marked
+          // un-owned for the life of the session (#71254).
+          setWorkspaceCwdOwner(storedSessionId)
           setCurrentBranch(cachedViewState.branch)
           setSessionStartedAt(Date.now())
 
@@ -834,7 +866,7 @@ export function useSessionActions({
       const stored =
         $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
 
-      applyStoredSessionPreviewRuntimeInfo(stored)
+      applyStoredSessionPreviewRuntimeInfo(stored, storedSessionId)
 
       if (stored) {
         applyStoredUsage(stored)
