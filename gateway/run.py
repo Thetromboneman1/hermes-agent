@@ -63,7 +63,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
 )
-from hermes_cli.config import cfg_get
+from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -716,6 +716,19 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         return text
     if _gateway_surface_passes_raw_text(platform):
         return text
+
+    # Lone UTF-16 surrogates (U+D800–U+DFFF) in model output crash chat
+    # surfaces downstream: Telegram's ``utf16_len`` length check and Signal
+    # formatting both ``.encode()`` the reply and raise UnicodeEncodeError
+    # before any send (#55143, #55309). The stored-history copy is already
+    # sanitized by ``build_assistant_message`` and ``finalize_turn`` scrubs
+    # the returned ``final_response``, but this boundary is the last line of
+    # defense for every legacy/plugin delivery path that hands us raw text.
+    # Raw-text/programmatic surfaces above keep passthrough — their JSON
+    # consumers escape surrogates safely.
+    from agent.message_sanitization import _sanitize_surrogates
+
+    text = _sanitize_surrogates(str(text))
 
     # Cancellation metadata, not assistant prose. ACP/TUI already suppress
     # this sentinel; chat surfaces should too (#7921).
@@ -2129,7 +2142,6 @@ if _config_path.exists():
                     # to the Hermes host/container HOME (often /opt/data). Shared
                     # predicate with terminal_tool so the two sites can't drift.
                     if _cfg_key == "cwd" and isinstance(_val, str):
-                        from tools.terminal_tool import _is_ssh_remote_tilde_cwd
                         if not _is_ssh_remote_tilde_cwd(_terminal_backend, _val.strip()):
                             _val = os.path.expanduser(_val)
                     if isinstance(_val, (list, dict)):
@@ -3029,6 +3041,23 @@ def _is_control_interrupt_message(message: Optional[str]) -> bool:
     return normalized in _CONTROL_INTERRUPT_MESSAGES
 
 
+def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
+    """Return the visible text portion of a response before direct send().
+
+    Queued follow-up resends only replay explicit ``MEDIA:`` attachments in
+    this path. Keep bare local paths and ordinary image URLs visible because
+    the post-stream uploader intentionally ignores them (#20834).
+
+    Do not apply a broad ``MEDIA:`` regex after ``extract_media()`` — the
+    extractor deliberately preserves protected code/inline spans and
+    unsupported or unvalidated tags in the cleaned text.
+    """
+    _, cleaned = adapter.extract_media(response)
+    cleaned = cleaned.replace("[[audio_as_voice]]", "").strip()
+    cleaned = cleaned.replace("[[as_document]]", "").strip()
+    return cleaned.strip()
+
+
 def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:
     """Derive the /command slug and declared frontmatter name from a SKILL.md.
 
@@ -3488,8 +3517,33 @@ def _normalize_empty_agent_response(
         return response
 
     if agent_result.get("failed"):
-        error_detail = agent_result.get("error", "unknown error")
+        # None-safe: the gateway result dict is built with
+        # ``'error': holder.get('error')`` and can carry an EXPLICIT None,
+        # which bypasses dict.get's default and would render
+        # "The request failed: None".
+        error_detail = agent_result.get("error") or "unknown error"
         error_str = str(error_detail).lower()
+        # Session-persistence failures get a dedicated recovery message.
+        # Suggesting /reset here would be actively harmful: it destroys the
+        # user's conversation context and does nothing to fix the underlying
+        # storage problem (lock contention, disk exhaustion, ...).
+        failure_reason = str(agent_result.get("failure_reason") or "")
+        if failure_reason.startswith("session_persistence_failed") or (
+            "session storage" in error_str
+        ):
+            if failure_reason.endswith(":disk") or "disk" in error_str:
+                return (
+                    "⚠️ Session storage was temporarily unavailable, so this "
+                    "turn was stopped to protect your conversation history. "
+                    "Please check available disk space, then send your "
+                    "message again."
+                )
+            return (
+                "⚠️ Session storage was temporarily unavailable, so this "
+                "turn was stopped to protect your conversation history. "
+                "Your message should already be saved — please send it "
+                "again in a moment."
+            )
         is_context_failure = any(
             p in error_str
             for p in ("context", "token", "too large", "too long", "exceed", "payload")
@@ -4381,6 +4435,56 @@ class TurnRunner:
         except Exception as _e:
             logger.debug("event_callback hook error: %s", _e)
 
+    def _attach_session_title_callback(self, agent, ctx) -> None:
+        """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
+
+        The session titler runs inside the turn prologue now (it derives the
+        title from the user's first message, so it no longer needs the
+        response), which means the callback has to be attached before the run
+        rather than registered after it. The lane predicates and their
+        rationale are unchanged from the old post-response registration.
+        """
+        try:
+            # Gateway auto-title failures must NOT be surfaced as user-visible
+            # messages (#23246) — they are not actionable to the end user.
+            # Overriding the failure sink here keeps CLI mode on the agent's
+            # _emit_auxiliary_failure path while the gateway logs at debug.
+            def _title_failure_cb(task: str, exc: BaseException) -> None:
+                logger.debug(
+                    "Gateway auto-title failure suppressed (not user-visible): %s: %s",
+                    task, exc,
+                )
+
+            agent._title_failure_callback = _title_failure_cb
+
+            session_id = getattr(agent, "session_id", None)
+            source = ctx.source
+
+            if self._runner._is_telegram_topic_lane(source):
+                agent._on_session_title = lambda title: (
+                    self._runner._schedule_telegram_topic_title_rename(
+                        source, session_id, title,
+                    )
+                )
+            elif self._runner._is_discord_auto_thread_lane(source) or (
+                self._runner._is_relay_discord_channel_lane(source)
+            ):
+                # Relay note: the second predicate is shape-only (relay
+                # Discord channel event). Whether the connector actually
+                # auto-threaded our reply is only knowable AFTER delivery
+                # (send-result feedback), so the callback must be registered
+                # eagerly and the rename lane performs the cache lookup at
+                # fire time (staging repro 2026-07-31: gating registration on
+                # the cache read meant it never registered and no
+                # thread_rename op was ever sent).
+                agent._on_session_title = lambda title: (
+                    self._runner._schedule_discord_semantic_thread_rename(
+                        source, session_id, title,
+                    )
+                )
+        except Exception:
+            logger.debug("Failed to attach session title callback", exc_info=True)
+
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         ctx = self._ctx
         if not ctx._status_adapter or not ctx._run_still_current():
@@ -5099,6 +5203,10 @@ class TurnRunner:
         agent.thinking_progress = ctx._thinking_enabled
         # Store agent reference for interrupt support
         ctx.agent_holder[0] = agent
+        # Wire the platform thread-rename lane onto the agent, because the
+        # session titler now fires from the turn prologue rather than after
+        # the response. Titles are pushed here the moment they land.
+        self._attach_session_title_callback(agent, ctx)
         # Publish turn ownership for explicit /stop, /new, disconnect, and
         # shutdown interrupts. Older session processes are outside this
         # baseline and remain alive.
@@ -5670,74 +5778,13 @@ class TurnRunner:
                     unique_tags.insert(0, "[[audio_as_voice]]")
                 final_response = final_response + "\n" + "\n".join(unique_tags)
 
-        # Auto-generate session title after first exchange (non-blocking)
-        if final_response and self._runner._session_db:
-            try:
-                from agent.title_generator import maybe_auto_title
-                all_msgs = ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else []
-                # In Gateway mode, auto-title failures must NOT be
-                # surfaced as user-visible messages (fixes #23246).
-                # Log them at debug level only — they are not actionable
-                # to the end user. CLI mode keeps the existing behaviour
-                # via the agent's _emit_auxiliary_failure path.
-                def _title_failure_cb(task: str, exc: BaseException) -> None:
-                    logger.debug(
-                        "Gateway auto-title failure suppressed (not user-visible): %s: %s",
-                        task, exc,
-                    )
-                # Snapshot the runtime identity; the validator lets the
-                # background titler skip its LLM call if the session's
-                # model changed before it fires (a stale request would
-                # reload an unloaded Ollama model, #19027).
-                _title_model = getattr(agent, "model", None) if agent else None
-                _title_provider = getattr(agent, "provider", None) if agent else None
-                maybe_auto_title_kwargs = {
-                    "failure_callback": _title_failure_cb,
-                    "main_runtime": {
-                        "model": getattr(agent, "model", None),
-                        "provider": getattr(agent, "provider", None),
-                        "base_url": getattr(agent, "base_url", None),
-                        "api_key": getattr(agent, "api_key", None),
-                        "api_mode": getattr(agent, "api_mode", None),
-                    } if agent else None,
-                    "runtime_validator": (lambda: (
-                        getattr(agent, "model", None) == _title_model
-                        and getattr(agent, "provider", None) == _title_provider
-                    )) if agent else None,
-                }
-                if self._runner._is_telegram_topic_lane(ctx.source):
-                    maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_telegram_topic_title_rename(
-                        ctx.source,
-                        effective_session_id,
-                        title,
-                    )
-                elif self._runner._is_discord_auto_thread_lane(ctx.source) or (
-                    self._runner._is_relay_discord_channel_lane(ctx.source)
-                ):
-                    # Relay note: the second predicate is shape-only (relay
-                    # Discord channel event). Whether the connector actually
-                    # auto-threaded our reply is only knowable AFTER delivery
-                    # (send-result feedback), which on the non-streaming lane
-                    # happens after this registration runs — so the callback
-                    # must be registered eagerly and the rename lane performs
-                    # the cache lookup at fire time (staging repro 2026-07-31:
-                    # gating registration on the cache read meant it never
-                    # registered and no thread_rename op was ever sent).
-                    maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_discord_semantic_thread_rename(
-                        ctx.source,
-                        effective_session_id,
-                        title,
-                    )
-                maybe_auto_title(
-                    getattr(self._runner._session_db, "_db", self._runner._session_db),
-                    effective_session_id,
-                    ctx.message,
-                    final_response,
-                    all_msgs,
-                    **maybe_auto_title_kwargs,
-                )
-            except Exception:
-                pass
+        # Auto-titling runs at TURN START (agent/turn_context.py) from the
+        # user's message alone, so it no longer waits on final_response — a
+        # failed or interrupted turn still gets a titled session. The
+        # platform-specific thread-rename callbacks are attached to the agent
+        # as `_on_session_title` before the run starts (see
+        # _attach_session_title_callback), because the titler now fires from
+        # inside the turn prologue rather than from here.
 
         return {
             "final_response": final_response,
@@ -8146,15 +8193,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     def _load_ephemeral_system_prompt() -> str:
         """Load ephemeral system prompt from config or env var.
-        
-        Checks HERMES_EPHEMERAL_SYSTEM_PROMPT env var first, then falls back to
-        agent.system_prompt in ~/.hermes/config.yaml.
+
+        Checks HERMES_EPHEMERAL_SYSTEM_PROMPT env var first, then
+        ``display.personality`` / ``agent.system_prompt`` in config.yaml.
         """
+        from hermes_cli.config import resolve_ephemeral_system_prompt_from_config
+
         prompt = os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
         if prompt:
             return prompt
         cfg = _load_gateway_runtime_config()
-        return str(cfg_get(cfg, "agent", "system_prompt", default="") or "").strip()
+        return resolve_ephemeral_system_prompt_from_config(cfg)
 
     def _resolve_model_for_channel(
         self,
@@ -14340,6 +14389,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "restart": self._handle_restart_command,
                 "approve": self._handle_approve_command,
                 "deny": self._handle_deny_command,
+                "pause": self._handle_pause_command,
                 "agents": self._handle_agents_command,
                 "background": self._handle_background_command,
                 "kanban": self._handle_kanban_command,
@@ -14367,6 +14417,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return (
             f"⏳ Agent is running — `/{name}` can't run "
             f"mid-turn. Wait for the current response or `/stop` first."
+        )
+
+    async def _handle_pause_command(self, event: MessageEvent):
+        """`/pause [reason]` engages the global emergency stop; `/pause off`
+        (aliases: resume/stop) lifts it.
+
+        This is the in-band resume path for messaging-only operators — the
+        estop gate above deliberately lets recognized slash commands through
+        while paused so a user without host-shell access is never locked out.
+        """
+        from agent import estop
+
+        args = (event.get_command_args() or "").strip()
+        if args.lower() in {"off", "resume", "stop", "disengage"}:
+            if estop.disengage():
+                return "▶️ Resumed — new work is accepted again."
+            return "Hermes wasn't paused."
+        state = estop.get_state()
+        if state is not None and not args:
+            reason = state.get("reason")
+            suffix = f" (reason: {reason})" if reason else ""
+            return (
+                f"⏸️ Hermes is already paused{suffix}. "
+                "Use `/pause off` to resume."
+            )
+        estop.engage(reason=args or None)
+        suffix = f" (reason: {args})" if args else ""
+        return (
+            f"⏸️ Paused{suffix}. New cron/kanban/gateway work is on hold; "
+            "in-flight work finishes normally. Use `/pause off` to resume."
         )
 
     async def _busy_start_command(self, event: MessageEvent, quick_key: str, source):
@@ -14716,6 +14796,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # gate — pause stops NEW work, it never kills or orphans running
         # work. Placed after auth so unauthorized senders keep the normal
         # silent/pairing behavior and can't probe pause state.
+        #
+        # Passthroughs (pause blocks new AGENT turns, not control traffic):
+        #   * recognized slash commands — /status, /help, /new, /approve and
+        #     friends must keep working while paused, and /pause off is the
+        #     in-band resume path for messaging-only users;
+        #   * replies owned by IN-FLIGHT work — a pending detached-update
+        #     prompt, clarify, slash-confirm, or dangerous-command approval,
+        #     plus any message steering a session whose agent is already
+        #     running. Swallowing those would stall work the pause promised
+        #     not to touch.
         if not is_internal:
             try:
                 from agent.estop import paused_reply as _estop_paused_reply
@@ -14723,12 +14813,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except ImportError:
                 _paused_notice = None
             if _paused_notice is not None:
-                logger.info(
-                    "Gateway turn paused by global emergency stop (platform=%s chat=%s)",
-                    getattr(getattr(source, "platform", None), "value", "unknown"),
-                    getattr(source, "chat_id", None) or "unknown",
-                )
-                return _paused_notice
+                _estop_allow = False
+                _estop_cmd = None
+                try:
+                    _estop_cmd = event.get_command()
+                except Exception:
+                    _estop_cmd = None
+                if _estop_cmd:
+                    try:
+                        from hermes_cli.commands import (
+                            resolve_command as _resolve_estop_cmd,
+                        )
+                        _estop_allow = _resolve_estop_cmd(_estop_cmd) is not None
+                    except Exception:
+                        _estop_allow = False
+                if not _estop_allow:
+                    try:
+                        _estop_key = self._session_key_for_source(source)
+                        _estop_state = self._peek_session_state(_estop_key)
+                        if (
+                            _estop_state is not None
+                            and _estop_state.persistent.update_prompt_pending
+                        ):
+                            _estop_allow = True
+                        if not _estop_allow and self._is_session_running(_estop_key):
+                            # Steering / interrupting in-flight work (which
+                            # also covers pending clarify + tool approvals
+                            # held by the running agent).
+                            _estop_allow = True
+                        if not _estop_allow:
+                            from tools import slash_confirm as _estop_confirm_mod
+                            if _estop_confirm_mod.get_pending(_estop_key):
+                                _estop_allow = True
+                        if not _estop_allow:
+                            from tools.approval import (
+                                has_blocking_approval as _estop_has_approval,
+                            )
+                            if _estop_has_approval(_estop_key):
+                                _estop_allow = True
+                    except Exception:
+                        pass
+                if not _estop_allow:
+                    logger.info(
+                        "Gateway turn paused by global emergency stop (platform=%s chat=%s)",
+                        getattr(getattr(source, "platform", None), "value", "unknown"),
+                        getattr(source, "chat_id", None) or "unknown",
+                    )
+                    return _paused_notice
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -15277,6 +15408,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _cmd_def = _resolve_cmd(command) if command else None
                     canonical = _cmd_def.name if _cmd_def else command
                     break
+
+        if canonical == "pause":
+            return await self._handle_pause_command(event)
 
         if canonical == "new":
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
@@ -18113,6 +18247,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
                 "response": (response or "")[:500],
+                "model": agent_result.get("model", ""),
+                "provider": agent_result.get("provider", ""),
             })
             
             # Check for pending process watchers (check_interval on background processes)
@@ -19596,11 +19732,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         audio_path = None
-        actual_path = None
+        actual_paths: List[str] = []
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
-            tts_text = _strip_markdown_for_tts(text[:4000])
+            tts_text = _strip_markdown_for_tts(text)
             if not tts_text:
                 return
 
@@ -19620,9 +19756,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Auto voice reply TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
                 return
 
-            # Use the actual file path from result (may differ after opus conversion)
-            actual_path = result.get("file_path", audio_path)
-            if not result.get("success") or not os.path.isfile(actual_path):
+            # Final delivery may be one combined file or multiple separately
+            # valid files when combination is unavailable or would exceed a
+            # platform limit. Preserve legacy single-file results.
+            actual_paths = result.get("file_paths") or [
+                result.get("file_path", audio_path)
+            ]
+            actual_paths = [
+                str(path) for path in actual_paths
+                if path and os.path.isfile(path)
+            ]
+            if not result.get("success") or not actual_paths:
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
                 return
 
@@ -19630,14 +19774,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # If connected to a voice channel, play there instead of sending a file
             guild_id = self._get_guild_id(event)
-            if (guild_id
-                    and hasattr(adapter, "play_in_voice_channel")
-                    and hasattr(adapter, "is_in_voice_channel")
-                    and adapter.is_in_voice_channel(guild_id)):
-                await adapter.play_in_voice_channel(guild_id, actual_path)
-            elif adapter and hasattr(adapter, "send_voice"):
-                reply_anchor = self._reply_anchor_for_event(event)
-                thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+            play_in_voice_channel = getattr(adapter, "play_in_voice_channel", None)
+            is_in_voice_channel = getattr(adapter, "is_in_voice_channel", None)
+            send_voice = getattr(adapter, "send_voice", None)
+            in_voice_channel = bool(
+                guild_id
+                and callable(play_in_voice_channel)
+                and callable(is_in_voice_channel)
+                and is_in_voice_channel(guild_id)
+            )
+            reply_anchor = self._reply_anchor_for_event(event)
+            thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+            if not in_voice_channel and callable(send_voice):
                 # Mark the auto voice reply as notify-worthy.  Mirrors the
                 # final-text path in gateway/platforms/base.py which sets
                 # ``notify=True`` so platform adapters that gate push
@@ -19650,17 +19798,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_meta["notify"] = True
                 else:
                     thread_meta = {"notify": True}
-                send_kwargs: Dict[str, Any] = {
-                    "chat_id": event.source.chat_id,
-                    "audio_path": actual_path,
-                    "reply_to": reply_anchor,
-                    "metadata": thread_meta,
-                }
-                await adapter.send_voice(**send_kwargs)
+            for actual_path in actual_paths:
+                if in_voice_channel:
+                    play_voice = cast(Callable[..., Awaitable[Any]], play_in_voice_channel)
+                    await play_voice(guild_id, actual_path)
+                elif callable(send_voice):
+                    send_voice_call = cast(Callable[..., Awaitable[Any]], send_voice)
+                    send_kwargs: Dict[str, Any] = {
+                        "chat_id": event.source.chat_id,
+                        "audio_path": actual_path,
+                        "reply_to": reply_anchor,
+                        "metadata": thread_meta,
+                    }
+                    await send_voice_call(**send_kwargs)
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
-            for p in {audio_path, actual_path} - {None}:
+            for p in ({audio_path, *actual_paths} - {None}):
                 try:
                     os.unlink(p)
                 except OSError:
@@ -19671,6 +19825,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response: str,
         event: MessageEvent,
         adapter,
+        thread_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Extract explicit MEDIA: tags from a response and deliver them.
 
@@ -19717,7 +19872,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # stale inspected content), not an attachment request.
             adapter.extract_images(cleaned)
 
-            _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+            _thread_meta = (
+                dict(thread_metadata)
+                if thread_metadata is not None
+                else self._thread_metadata_for_source(
+                    event.source,
+                    self._reply_anchor_for_event(event),
+                )
+            )
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
@@ -19775,7 +19937,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
 
+    async def _deliver_queued_first_response(
+        self,
+        response: str,
+        source: SessionSource,
+        adapter,
+        metadata: Optional[Dict[str, Any]] = None,
+        event_message_id: Optional[str] = None,
+        text_already_delivered: bool = False,
+        deliver_media: bool = True,
+    ) -> None:
+        """Deliver a queued response using the normal text+attachment split."""
+        if not text_already_delivered:
+            text_content = _strip_response_attachments_for_direct_send(response, adapter)
+            if text_content:
+                await adapter.send(
+                    source.chat_id,
+                    text_content,
+                    metadata=metadata,
+                )
 
+        # Failed turns still deliver their (normalized failure) text above,
+        # but must not upload attachments as if the turn succeeded — mirrors
+        # the ``not agent_result.get("failed")`` guard on the completed-turn
+        # delivery path.
+        if not deliver_media:
+            return
+
+        synthetic_event = MessageEvent(
+            text="",
+            source=source,
+            message_id=event_message_id,
+        )
+        await self._deliver_media_from_response(
+            response,
+            synthetic_event,
+            adapter,
+            thread_metadata=metadata,
+        )
 
     async def _run_background_task(
         self,
@@ -21206,6 +21405,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from tools.ansi_strip import strip_ansi
             return strip_ansi(text)
 
+        def _read_output_since(path: Path, offset: int) -> tuple[str, int]:
+            """Read update output defensively; logs may contain invalid UTF-8."""
+            try:
+                data = path.read_bytes()
+            except OSError:
+                return "", offset
+            if len(data) <= offset:
+                return "", len(data)
+            return data[offset:].decode("utf-8", errors="replace"), len(data)
+
         bytes_sent = 0
         last_stream_time = loop.time()
         buffer = ""
@@ -21241,10 +21450,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Read any remaining output
                 if output_path.exists():
                     try:
-                        content = output_path.read_text(encoding="utf-8")
-                        if len(content) > bytes_sent:
-                            buffer += content[bytes_sent:]
-                            bytes_sent = len(content)
+                        chunk, bytes_sent = _read_output_since(output_path, bytes_sent)
+                        if chunk:
+                            buffer += chunk
                     except OSError:
                         pass
                 await _flush_buffer()
@@ -21282,10 +21490,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Check for new output
             if output_path.exists():
                 try:
-                    content = output_path.read_text(encoding="utf-8")
-                    if len(content) > bytes_sent:
-                        buffer += content[bytes_sent:]
-                        bytes_sent = len(content)
+                    chunk, bytes_sent = _read_output_since(output_path, bytes_sent)
+                    if chunk:
+                        buffer += chunk
                 except OSError:
                     pass
 
@@ -21424,7 +21631,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Read the captured update output
             output = ""
             if output_path.exists():
-                output = output_path.read_text(encoding="utf-8")
+                output = output_path.read_bytes().decode("utf-8", errors="replace")
 
             # Resolve adapter
             platform = Platform(platform_str)
@@ -21844,9 +22051,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from agent.memory_manager import sanitize_context
 
         analysis_prompt = (
-            "Describe everything visible in this image in thorough detail. "
-            "Include any text, code, data, objects, people, layout, colors, "
-            "and any other notable visual information."
+            "Concisely describe this image in 2-4 sentences "
+            "(~200 Chinese characters or ~150 English words). "
+            "Cover the main subject, key visible text/data/code, and overall context. "
+            "If it is a chart, diagram, or scientific figure, include the important "
+            "labels, legend, and key values. Skip decorative details."
         )
 
         enriched_parts = []
@@ -26144,24 +26353,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                             session_key or "?",
                         )
-                    elif first_response and not _already_streamed:
+                    elif first_response:
                         try:
-                            logger.info(
-                                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
-                                session_key or "?",
-                            )
-                            await adapter.send(
-                                source.chat_id,
+                            if _already_streamed:
+                                logger.info(
+                                    "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing.",
+                                    session_key or "?",
+                                )
+                            else:
+                                logger.info(
+                                    "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                                    session_key or "?",
+                                )
+                            await self._deliver_queued_first_response(
                                 first_response,
+                                source=source,
+                                adapter=adapter,
                                 metadata=_status_thread_metadata,
+                                event_message_id=event_message_id,
+                                text_already_delivered=_already_streamed,
+                                deliver_media=not _delivery_result.get("failed"),
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
-                    elif first_response:
-                        logger.info(
-                            "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
-                            session_key or "?",
-                        )
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in

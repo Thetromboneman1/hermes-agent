@@ -62,6 +62,21 @@ declare global {
         onState: (callback: (payload: PetOverlayStatePayload) => void) => () => void
         onControl: (callback: (payload: PetOverlayControl) => void) => () => void
       }
+      // HUD mode: the chrome-free floating chat. A FULL app renderer with its
+      // own gateway (like an instance window), sized and skinned as a floating
+      // bar — so it mounts the real composer rather than a lookalike. Main
+      // owns the window; `onChanged` keeps every window's toggle truthful.
+      hud?: {
+        open: (request?: { sessionId?: null | string }) => Promise<{ ok: boolean }>
+        close: () => Promise<{ ok: boolean }>
+        setIgnoreMouse: (ignore: boolean) => void
+        moveBy: (delta: { x: number; y: number }) => void
+        setVibrancy: (on: boolean) => Promise<{ ok: boolean }>
+        setSession: (sessionId: null | string) => void
+        onGoto: (callback: (sessionId: string) => void) => () => void
+        onChanged: (callback: (state: { open: boolean; sessionId: null | string }) => void) => () => void
+        onCursor: (callback: (point: { x: number; y: number } | null) => void) => () => void
+      }
       // Quick Entry: a global-hotkey mini composer window. Main owns the OS
       // shortcut registration + the persisted preference (it must restore the
       // shortcut on a cold launch without the renderer visiting Settings), so
@@ -119,6 +134,18 @@ declare global {
       api: <T>(request: HermesApiRequest) => Promise<T>
       notify: (payload: HermesNotification) => Promise<boolean>
       requestMicrophoneAccess: () => Promise<boolean>
+      /** read_window_below tool: metadata for the OS window directly underneath this one (never pixels). */
+      readWindowBelow?: () => Promise<{
+        frontmost: { app: string; title: string } | null
+        note?: string
+        platform: string
+        window: {
+          app: string
+          bounds: { height: number; width: number; x: number; y: number }
+          id: number
+          title: string
+        } | null
+      } | null>
       readFileDataUrl: (filePath: string) => Promise<string>
       /** Remote non-image attach: higher dedicated cap than preview/Settings default. */
       readFileDataUrlForAttach?: (filePath: string) => Promise<string>

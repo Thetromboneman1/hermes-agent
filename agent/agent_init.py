@@ -493,6 +493,7 @@ def init_agent(
     clarify_callback: callable = None,
     read_terminal_callback: callable = None,
     read_preview_callback: callable = None,
+    read_window_below_callback: callable = None,
     step_callback: callable = None,
     stream_delta_callback: callable = None,
     interim_assistant_callback: callable = None,
@@ -767,6 +768,7 @@ def init_agent(
     agent.clarify_callback = clarify_callback
     agent.read_terminal_callback = read_terminal_callback
     agent.read_preview_callback = read_preview_callback
+    agent.read_window_below_callback = read_window_below_callback
     agent.step_callback = step_callback
     agent.stream_delta_callback = stream_delta_callback
     agent.interim_assistant_callback = interim_assistant_callback
@@ -2078,6 +2080,27 @@ def init_agent(
             codex_app_server_auto_compaction,
         )
         codex_app_server_auto_compaction = "native"
+    # Native OpenAI Responses server-side compaction (opt-in). Only ever
+    # engages for gpt-5.6-family models on api.openai.com or the ChatGPT
+    # Codex backend — the per-request gate lives in agent/native_compaction.py.
+    codex_responses_native_compaction = bool(
+        _compression_cfg.get("codex_responses_native", False)
+    )
+    _native_threshold_raw = _compression_cfg.get(
+        "codex_responses_compact_threshold", 200_000
+    )
+    try:
+        if isinstance(_native_threshold_raw, bool):
+            raise ValueError
+        codex_responses_compact_threshold = int(_native_threshold_raw)
+        if codex_responses_compact_threshold <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        _ra().logger.warning(
+            "Invalid compression.codex_responses_compact_threshold=%r; using 200000.",
+            _native_threshold_raw,
+        )
+        codex_responses_compact_threshold = 200_000
     # Opt-in idle compaction: compact a session up front when it resumes after
     # this many seconds of inactivity (0 = disabled). Time-based, so it
     # complements the size-based threshold above. Consumed by build_turn_context().
@@ -2534,6 +2557,8 @@ def init_agent(
             compression_micro_compact_defrag_tokens
         )
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
+    agent.codex_responses_native_compaction = codex_responses_native_compaction
+    agent.codex_responses_compact_threshold = codex_responses_compact_threshold
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds

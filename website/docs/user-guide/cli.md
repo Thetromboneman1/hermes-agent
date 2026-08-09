@@ -42,6 +42,8 @@ hermes chat -s github-pr-workflow -q "open a draft PR"
 # Resume previous sessions
 hermes --continue             # Resume the most recent CLI session (-c)
 hermes --resume <session_id>  # Resume a specific session by ID (-r)
+hermes --resume latest        # Resume the most recent session (same as -c)
+hermes --resume latest --in ./dir  # Resume ./dir's latest session, staying in ./dir
 
 # Verbose mode (debug output)
 hermes chat --verbose
@@ -94,6 +96,7 @@ A persistent status bar sits above the input area, updating in real time:
 | 🗜️ N | **Context compression count** — how many times the running session has been auto-compressed. Appears once the first compression fires. |
 | ▶ N | **Active background tasks** — how many `/background` prompts are still running in the current session. Appears whenever at least one task is in flight. |
 | Duration | Elapsed session time |
+| Session title | Once the session has a title, it appears as a gold badge pinned to the far-right edge. Long titles truncate before displacing the essential model and context fields. |
 | ⚠ YOLO | **YOLO mode warning** — shown whenever `HERMES_YOLO_MODE` is on (either `hermes --yolo` at launch or `/yolo` toggled mid-session). Mirrors the banner-line warning so you can't forget you're in auto-approve mode. |
 
 The bar adapts to terminal width — full layout at ≥ 76 columns, compact at 52–75, minimal (model + duration, plus the YOLO badge when active) below 52.
@@ -391,6 +394,8 @@ hermes -c                                  # Short form
 hermes -c "my project"                     # Resume a named session (latest in lineage)
 hermes --resume 20260225_143052_a1b2c3     # Resume a specific session by ID
 hermes --resume "refactoring auth"         # Resume by title
+hermes --resume latest                     # Resume the most recent session (same as -c)
+hermes --resume latest --in ./my-project   # Latest session for ./my-project's workspace
 hermes -r 20260225_143052_a1b2c3           # Short form
 ```
 

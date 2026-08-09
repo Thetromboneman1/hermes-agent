@@ -51,7 +51,7 @@ import {
   $sessions,
   sessionMatchesStoredId,
   setCurrentBranch,
-  setCurrentCwd,
+  setCurrentCwdTransient,
   setCurrentFastMode,
   setCurrentPersonality,
   setCurrentReasoningEffort,
@@ -59,6 +59,7 @@ import {
   setCurrentUsage,
   setMessages,
   setSessions,
+  setTerminalBackend,
   setTurnStartedAt,
   setWorkspaceCwdOwner,
   setYoloActive
@@ -445,7 +446,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             const sameSession = !!sessionId && sessionId === lastCwdInfoSessionRef.current
 
             lastCwdInfoSessionRef.current = sessionId
-            setCurrentCwd(payload.cwd)
+            setCurrentCwdTransient(payload.cwd)
 
             // The backend just confirmed the selected conversation's real
             // workspace, so it owns the path we wrote. Without the claim the
@@ -462,6 +463,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
           if (typeof payload?.branch === 'string') {
             setCurrentBranch(payload.branch)
+          }
+
+          if (typeof payload?.terminal_backend === 'string') {
+            setTerminalBackend(payload.terminal_backend)
           }
 
           if (typeof payload?.personality === 'string') {
@@ -1073,6 +1078,26 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
               text: result ? JSON.stringify(result) : ''
             })
           })
+        }
+      } else if (event.type === 'window.read.request') {
+        // read_window_below tool: main owns native window enumeration, so ask
+        // it over IPC and answer. Empty text = unavailable (no bridge, or
+        // enumeration unsupported on this system e.g. Wayland).
+        const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+
+        if (requestId) {
+          const read = window.hermesDesktop?.readWindowBelow
+
+          const answer = (result: unknown) =>
+            $gateway.get()?.request('window.read.respond', {
+              request_id: requestId,
+              text: result ? JSON.stringify(result) : ''
+            })
+
+          // .catch: ipcRenderer.invoke rejects on an older shell without the
+          // handler or a main-side throw — without an empty answer the tool
+          // would stall its full 30s timeout.
+          void Promise.resolve(read ? read() : null).then(answer, () => answer(null))
         }
       } else if (event.type === 'agent.terminal.output') {
         // Live chunk from a background process → its read-only agent terminal tab.

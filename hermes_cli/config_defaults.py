@@ -743,6 +743,16 @@ DEFAULT_CONFIG = {
                                       # Hermes' compression threshold triggers
                                       # thread/compact/start; off = never auto-trigger
                                       # (codex may still compact natively).
+        "codex_responses_native": False,  # Opt in to OpenAI's server-side compaction
+                                      # on the Responses API. Engages ONLY for
+                                      # gpt-5.6-family models on api.openai.com or
+                                      # the ChatGPT Codex backend; every other
+                                      # route/model is unaffected. Hermes' local
+                                      # compression stays armed as the fallback.
+        "codex_responses_compact_threshold": 200000,  # Server-side compaction trigger
+                                      # (input tokens). Clamped below the local
+                                      # compression threshold at request time so
+                                      # the server compacts before Hermes does.
         "in_place": True,             # When True, compaction rewrites the message
                                       # list and rebuilds the system prompt WITHOUT
                                       # rotating the session id — the conversation
@@ -2782,6 +2792,17 @@ DEFAULT_CONFIG = {
         # attributable per query shape. 0 logs every search. Bridged to
         # HERMES_SEARCH_SLOW_MS (internal carrier).
         "search_slow_ms": 1000,
+        # Transcript safety limits. A runaway session (hundreds of thousands
+        # of rows) can exhaust memory when its transcript is materialized in
+        # one shot, so interactive resume and in-memory export are guarded by
+        # bounded row counts. Set a limit to 0 to disable that guard.
+        # Max active messages (across the full compression lineage) a session
+        # may hold and still be resumed interactively (CLI/TUI/desktop).
+        "max_resume_messages": 20000,
+        # Max active messages a single session may hold for an in-memory
+        # (non-streaming) export such as `hermes sessions export`. Checked
+        # per session, so full-DB backups of many small sessions still work.
+        "max_export_messages": 20000,
     },
 
     # Contextual first-touch onboarding hints (see agent/onboarding.py).

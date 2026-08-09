@@ -2931,6 +2931,49 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
     return node
 
 
+_NEUTRAL_PERSONALITY_NAMES = frozenset({"", "none", "default", "neutral"})
+
+
+def _prompt_text(value: Any) -> str:
+    """Normalize config prompt values from YAML before handing them to AIAgent."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(str(item).strip() for item in value if str(item).strip())
+    return str(value).strip()
+
+
+def render_personality_prompt(value: Any) -> str:
+    """Render a string or structured personality definition to a prompt."""
+    if isinstance(value, dict):
+        parts = [value.get("system_prompt", "")]
+        if value.get("tone"):
+            parts.append(f'Tone: {value["tone"]}')
+        if value.get("style"):
+            parts.append(f'Style: {value["style"]}')
+        return "\n".join(str(part).strip() for part in parts if str(part).strip())
+    return _prompt_text(value)
+
+
+def resolve_ephemeral_system_prompt_from_config(cfg: Optional[Dict[str, Any]]) -> str:
+    """Resolve the session overlay from config.yaml.
+
+    ``display.personality`` is the selected named personality and wins when set.
+    Otherwise fall back to the user-owned ``agent.system_prompt``. Callers should
+    still prefer ``HERMES_EPHEMERAL_SYSTEM_PROMPT`` when that env var is set.
+    """
+    name = str(cfg_get(cfg, "display", "personality", default="") or "").strip().lower()
+    personalities = cfg_get(cfg, "agent", "personalities", default={}) or {}
+    if (
+        name not in _NEUTRAL_PERSONALITY_NAMES
+        and isinstance(personalities, dict)
+        and name in personalities
+    ):
+        return render_personality_prompt(personalities[name])
+    return _prompt_text(cfg_get(cfg, "agent", "system_prompt", default=""))
+
 
 def read_raw_config() -> Dict[str, Any]:
     """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
@@ -3231,6 +3274,18 @@ def terminal_config_env_var_for_key(key: str) -> Optional[str]:
     return TERMINAL_CONFIG_ENV_MAP.get(key[len(prefix):])
 
 
+def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
+    """Return whether the remote SSH shell must expand *cwd* itself.
+
+    Expanding ``~`` on the Hermes host rewrites it to the host or container
+    home before SSH sees it. Preserve ``~`` and ``~/...`` so they follow the
+    user selected by the SSH connection.
+    """
+    if (backend or "").strip().lower() != "ssh":
+        return False
+    return cwd == "~" or cwd.startswith("~/")
+
+
 def apply_terminal_config_to_env(
     *,
     env: Optional[Dict[str, str]] = None,
@@ -3267,6 +3322,15 @@ def apply_terminal_config_to_env(
     # override existing env values; keys inherited from DEFAULT_CONFIG are
     # backfill-only.
     explicit_keys = terminal_cfg.keys() if config is not None else raw_terminal_cfg.keys()
+    backend_is_explicit = config is not None or "backend" in raw_terminal_cfg
+    if backend_is_explicit:
+        terminal_backend = str(
+            terminal_cfg.get("backend") or target.get("TERMINAL_ENV") or ""
+        )
+    else:
+        terminal_backend = str(
+            target.get("TERMINAL_ENV") or terminal_cfg.get("backend") or ""
+        )
 
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
         if cfg_key not in terminal_cfg:
@@ -3276,7 +3340,9 @@ def apply_terminal_config_to_env(
             raw_cwd = str(value or "").strip()
             if raw_cwd in {".", "auto", "cwd"}:
                 continue
-            if isinstance(value, str):
+            if isinstance(value, str) and not _is_ssh_remote_tilde_cwd(
+                terminal_backend, raw_cwd
+            ):
                 value = os.path.expanduser(value)
         if (should_override and cfg_key in explicit_keys) or env_var not in target:
             target[env_var] = _terminal_env_value(value)

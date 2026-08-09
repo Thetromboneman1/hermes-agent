@@ -1391,6 +1391,17 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
 
+        # Native server-side compaction (gpt-5.6 on direct OpenAI API /
+        # ChatGPT Codex routes only) — None on every other route/model, in
+        # which case the request is unchanged from pre-feature behavior.
+        from agent.native_compaction import native_compaction_context_management
+        _context_management = native_compaction_context_management(
+            agent,
+            is_codex_backend=is_codex_backend,
+            is_xai_responses=is_xai_responses,
+            is_github_responses=is_github_responses,
+        )
+
         # xAI's /responses endpoint rejects ``pattern`` and ``format`` keywords
         # in tool schemas (HTTP 400 "Invalid arguments passed to the model").
         # Most commonly hit when MCP-derived tools carry JSON Schema validation
@@ -1441,6 +1452,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
+            context_management=_context_management,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────
@@ -2317,11 +2329,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             defer_logical_completion=True,
         )
 
-    summary_request = (
-        "You've reached the maximum number of tool-calling iterations allowed. "
-        "Please provide a final response summarizing what you've found and accomplished so far, "
-        "without calling any more tools."
-    )
+    # Shared constant so compaction recognizers can identify this runtime nudge
+    # by its stable content after SessionDB projection strips metadata flags
+    # (see MAX_ITERATIONS_SUMMARY_REQUEST / _is_synthetic_compression_user_turn).
+    from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
+
+    summary_request = MAX_ITERATIONS_SUMMARY_REQUEST
     messages.append({"role": "user", "content": summary_request})
 
     try:

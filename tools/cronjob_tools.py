@@ -40,7 +40,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from cron.jobs import (
     AmbiguousJobReference,
     claim_job_for_fire,
+    effective_job_state,
     get_job,
+    is_job_runnable,
     list_jobs,
     mark_job_run,
     parse_schedule,
@@ -573,7 +575,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "last_status": job.get("last_status"),
         "last_delivery_error": job.get("last_delivery_error"),
         "enabled": job.get("enabled", True),
-        "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
+        # Derive from enabled so half-paused records never render as paused.
+        "state": effective_job_state(job),
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
     }
@@ -623,7 +626,7 @@ def _execute_job_now(
             refreshed = get_job(job_id)
             if refreshed is None:
                 reason = "Job no longer exists; nothing to run."
-            elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
+            elif not is_job_runnable(refreshed):
                 reason = "Job is paused/disabled; resume it before running."
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
@@ -915,7 +918,7 @@ def _try_dispatch_background_run(
             refreshed = get_job(job_id)
             if refreshed is None:
                 reason = "Job no longer exists; nothing to run."
-            elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
+            elif not is_job_runnable(refreshed):
                 reason = "Job is paused/disabled; resume it before running."
             else:
                 reason = "Job is already being fired by the scheduler; not run again."

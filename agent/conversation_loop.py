@@ -86,6 +86,9 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
+# Bind before the turn starts so a source-tree swap cannot load a skewed
+# finalizer at turn end.
+from agent.turn_finalizer import finalize_turn
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -177,6 +180,16 @@ _LOCAL_PROCESSING_MODULES = frozenset({
 _API_CALL_MODULES = frozenset({
     "chat_completion_helpers",
 })
+
+
+def _join_truncated_parts(parts: List[str]) -> str:
+    """Join continuation fragments, adding a newline where two would glue together (#78577)."""
+    joined = ""
+    for part in parts:
+        if joined and not joined[-1].isspace() and part and not part[0].isspace():
+            joined += "\n"
+        joined += part
+    return joined
 
 
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
@@ -1472,6 +1485,11 @@ def run_conversation(
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
+    # Cause of the most recent persistence failure this turn ('locked',
+    # 'disk', or 'unknown' — see hermes_state.classify_persistence_error).
+    # Reset alongside the failure flag so a lock-contention diagnosis from a
+    # previous turn can never leak into this turn's user-facing explanation.
+    agent._last_persistence_error_cause = None
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -1790,6 +1808,9 @@ def run_conversation(
                 api_msg.pop("finish_reason")
             # Strip internal thinking-prefill marker
             api_msg.pop("_thinking_prefill", None)
+            # Strip length-continuation marks; not every transport drops underscore keys.
+            api_msg.pop("_length_continuation_fragment", None)
+            api_msg.pop("_length_continuation_nudge", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields
@@ -2383,6 +2404,16 @@ def run_conversation(
                         api_messages,
                         tools_for_api=tools_for_api,
                     )
+                # Outbound-request surrogate chokepoint (#50959): the messages
+                # were scrubbed above, but the rest of the request body —
+                # tool/function descriptions (session_search's ±-heavy text is
+                # the recorded repro), extra_body, system strings routed via
+                # kwargs — can still carry invalid code points that providers
+                # reject with a non-retryable HTTP 400 ("invalid unicode code
+                # point"). One in-place walk here guarantees the entire
+                # payload json.dumps()-safe regardless of which leaf produced
+                # the string. Fast no-op when the payload is clean.
+                _sanitize_structure_surrogates(api_kwargs)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -3064,8 +3095,8 @@ def run_conversation(
                 if finish_reason == "length":
                     if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
                         agent._vprint(
-                            f"{agent.log_prefix}⚠️  Stream interrupted by network error "
-                            f"(finish_reason='length' on partial-stream-stub)",
+                            f"{agent.log_prefix}⚠️  Response truncated — stream "
+                            f"ended before completion",
                             force=True,
                         )
                     else:
@@ -3192,6 +3223,11 @@ def run_conversation(
                                 # gets a coherent continuation point.
                                 if truncated_response_parts:
                                     messages = agent._get_messages_up_to_last_assistant(messages)
+                                # Unmark survivors: their text left the stitched partial.
+                                for _frag in messages:
+                                    if isinstance(_frag, dict):
+                                        _frag.pop("_length_continuation_fragment", None)
+                                        _frag.pop("_length_continuation_nudge", None)
                                 agent._session_messages = messages
                                 length_continue_retries = 0
                                 truncated_response_parts = []
@@ -3228,6 +3264,8 @@ def run_conversation(
                             )
                             if not _is_empty_partial_stub:
                                 interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                                # Marked so the ceiling exit can drop the fragment trail.
+                                interim_msg["_length_continuation_fragment"] = True
                                 messages.append(interim_msg)
                                 if assistant_message.content:
                                     truncated_response_parts.append(assistant_message.content)
@@ -3266,13 +3304,45 @@ def run_conversation(
                                 continue_msg = {
                                     "role": "user",
                                     "content": _continue_content,
+                                    "_length_continuation_nudge": True,
                                 }
                                 messages.append(continue_msg)
                                 agent._session_messages = messages
                                 _retry.restart_with_length_continuation = True
                                 break
 
-                            partial_response = agent._strip_think_blocks("".join(truncated_response_parts)).strip()
+                            partial_response = agent._strip_think_blocks(_join_truncated_parts(truncated_response_parts)).strip()
+                            if partial_response:
+                                agent._vprint(
+                                    f"{agent.log_prefix}⚠️  Response still truncated "
+                                    f"after 4 continuation attempts — keeping the "
+                                    f"partial response received so far.",
+                                    force=True,
+                                )
+                            # Unanswered continue nudges made every later turn re-truncate.
+                            _turn_start = (
+                                current_turn_user_idx + 1
+                                if isinstance(current_turn_user_idx, int)
+                                and current_turn_user_idx >= 0
+                                else 0
+                            )
+                            messages[_turn_start:] = [
+                                m for m in messages[_turn_start:]
+                                if not (
+                                    isinstance(m, dict)
+                                    and (
+                                        m.get("_length_continuation_fragment")
+                                        or m.get("_length_continuation_nudge")
+                                    )
+                                )
+                            ]
+                            if partial_response:
+                                messages.append({
+                                    "role": "assistant",
+                                    "content": partial_response,
+                                    "finish_reason": "length",
+                                })
+                            agent._session_messages = messages
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
                             return {
@@ -4307,6 +4377,37 @@ def run_conversation(
                         replay_stats["messages"],
                     )
                     continue
+
+                # ── Native compaction rejection recovery ──────────────
+                # Provider explicitly rejected the ``context_management``
+                # field (structured 400 naming the param). One-shot: turn
+                # native compaction off for the rest of the session and
+                # retry — the next _build_api_kwargs re-resolves the gate
+                # and omits the field, and Hermes' local compression takes
+                # over as the sole owner. Generic 4xx/5xx/timeouts do NOT
+                # match (see is_native_compaction_rejection) and take the
+                # normal retry path.
+                if (
+                    agent.api_mode == "codex_responses"
+                    and not _retry.native_compaction_reject_retry_attempted
+                    and bool(getattr(agent, "codex_responses_native_compaction", False))
+                ):
+                    from agent.native_compaction import is_native_compaction_rejection
+                    if is_native_compaction_rejection(api_error):
+                        _retry.native_compaction_reject_retry_attempted = True
+                        agent.codex_responses_native_compaction = False
+                        agent._vprint(
+                            f"{agent.log_prefix}⚠️  Provider rejected native compaction "
+                            f"(context_management) — disabled for this session, "
+                            f"local compression stays active. Retrying...",
+                            force=True,
+                        )
+                        logger.warning(
+                            "%sNative compaction rejection recovery: disabled "
+                            "codex_responses_native for this session and retrying",
+                            agent.log_prefix,
+                        )
+                        continue
 
                 # ── llama.cpp grammar-parse recovery ──────────────────
                 # llama.cpp's ``json-schema-to-grammar`` converter rejects
@@ -6058,7 +6159,20 @@ def run_conversation(
                             "codex_message_items",
                         ):
                             if _key in interim_msg:
-                                last_msg[_key] = interim_msg[_key]
+                                if _key == "codex_reasoning_items":
+                                    # Merge instead of overwrite: a native
+                                    # compaction checkpoint captured on the
+                                    # earlier incomplete response is the only
+                                    # copy — the continuation won't re-emit
+                                    # it. See merge_interim_reasoning_items.
+                                    from agent.native_compaction import (
+                                        merge_interim_reasoning_items,
+                                    )
+                                    last_msg[_key] = merge_interim_reasoning_items(
+                                        last_msg.get(_key), interim_msg[_key]
+                                    )
+                                else:
+                                    last_msg[_key] = interim_msg[_key]
                     else:
                         messages.append(interim_msg)
                         agent._emit_interim_assistant_message(interim_msg)
@@ -6505,6 +6619,10 @@ def run_conversation(
                     )
                 except Exception as exc:
                     _tool_turn_persisted = False
+                    from hermes_state import classify_persistence_error
+                    agent._last_persistence_error_cause = (
+                        classify_persistence_error(exc)
+                    )
                     logger.warning(
                         "Incremental tool-call persistence failed before execution "
                         "(session=%s): %s",
@@ -6517,6 +6635,10 @@ def run_conversation(
                     # run side-effecting tools from state that exists only in
                     # this process. Breaking also avoids retrying the same
                     # unpersisted turn until the iteration budget is exhausted.
+                    # The flush may have classified the cause internally; if
+                    # nothing was recorded, the cause is genuinely unknown.
+                    if getattr(agent, "_last_persistence_error_cause", None) is None:
+                        agent._last_persistence_error_cause = "unknown"
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
@@ -7141,9 +7263,14 @@ def run_conversation(
                 codex_ack_continuations = 0
 
                 if truncated_response_parts:
-                    final_response = "".join(truncated_response_parts) + final_response
+                    final_response = _join_truncated_parts([*truncated_response_parts, final_response])
                     truncated_response_parts = []
                     length_continue_retries = 0
+                    # The continuation recovered, so the fragments stay in the transcript.
+                    for _frag in messages:
+                        if isinstance(_frag, dict):
+                            _frag.pop("_length_continuation_fragment", None)
+                            _frag.pop("_length_continuation_nudge", None)
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
                 
@@ -7500,7 +7627,6 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
-    from agent.turn_finalizer import finalize_turn
     return finalize_turn(
         agent,
         final_response=final_response,
