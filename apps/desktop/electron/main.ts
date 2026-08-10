@@ -105,6 +105,7 @@ import {
   reviewCreatePr,
   reviewDiff,
   reviewList,
+  reviewPrList,
   reviewPush,
   reviewRevert,
   reviewRevParse,
@@ -121,6 +122,7 @@ import {
   removeWorktree,
   switchBranch
 } from './git-worktree-ops'
+import { readAndConsumeHandoffResult } from './handoff-result'
 import {
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
   clampDataUrlReadMaxMb,
@@ -135,6 +137,7 @@ import {
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
 import { cursorPointInWindow } from './hud-cursor'
+import { buildHudWindowUrl } from './hud-url'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -204,8 +207,10 @@ import {
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
   resolveStagedUpdaterBinary,
+  resolveUpdateScriptHandoff,
   spawnUpdaterProcess,
-  stagedUpdaterSupportsPrewrittenMarker
+  stagedUpdaterSupportsPrewrittenMarker,
+  wrapHandoffForDetachedConsole
 } from './updater-process'
 import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
@@ -1801,6 +1806,28 @@ async function waitForUpdateToFinish() {
     timeoutMs: UPDATE_WAIT_TIMEOUT_MS
   })
 
+  // The detached hand-off script (scripts/desktop-update.ps1) runs hidden;
+  // its result file is the ONLY way the user learns a detached update
+  // failed. Consume it exactly once, here, right where boot passes the
+  // update gate — success gets a log line, failure gets a real dialog
+  // (previously a failed detached update was indistinguishable from
+  // "nothing happened").
+  try {
+    const result = readAndConsumeHandoffResult(HERMES_HOME)
+
+    if (result && result.ok) {
+      rememberLog(`[updates] detached update finished OK (branch ${result.branch})`)
+    } else if (result) {
+      rememberLog(`[updates] detached update FAILED (exit ${result.exitCode}): ${result.message}`)
+      dialog.showErrorBox(
+        'Hermes update did not finish',
+        `${result.message}\n\nDetails: ${path.join(HERMES_HOME, 'logs', 'desktop-update-handoff.log')}`
+      )
+    }
+  } catch (err) {
+    rememberLog(`[updates] could not read hand-off result: ${err.message}`)
+  }
+
   if (outcome === 'clear') {
     return false
   }
@@ -2847,35 +2874,45 @@ async function applyUpdates(opts = {}) {
     if (!updater) {
       // No staged updater binary — this is a CLI-installed user (they ran
       // `hermes desktop`, never the Tauri installer that self-copies
-      // hermes-setup.exe into HERMES_HOME). They DO have a working `hermes`
-      // on PATH / in the venv, so the correct path is the one-liner in their
-      // native medium. We show the EXACT command, branch-pinned to the
-      // checkout they're on — bare `hermes update` defaults to main and would
-      // silently switch a bb/gui (or any non-main) install off-branch. Mirror
-      // the GUI button's contract: append --branch <current> for non-main
-      // checkouts, keep it bare for main so the card stays clean.
+      // hermes-setup.exe into HERMES_HOME). On Windows the repo hand-off
+      // script serves them just as well as installer users — it only needs
+      // PowerShell and the checkout — so fall through to the normal hand-off
+      // when the script exists. Only when the checkout predates the script do
+      // we surface the manual one-liner.
       const updateRoot = resolveUpdateRoot()
-      let command = 'hermes update'
 
-      try {
-        const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
-        const current = (head.stdout || '').trim()
+      if (!resolveUpdateScriptHandoff(updateRoot)) {
+        // They DO have a working `hermes` on PATH / in the venv, so the
+        // correct path is the one-liner in their native medium. We show the
+        // EXACT command, branch-pinned to the checkout they're on — bare
+        // `hermes update` defaults to main and would silently switch a
+        // bb/gui (or any non-main) install off-branch. Mirror the GUI
+        // button's contract: append --branch <current> for non-main
+        // checkouts, keep it bare for main so the card stays clean.
+        let command = 'hermes update'
 
-        if (head.code === 0 && current && current !== 'HEAD') {
-          const branch = await resolveHealedBranch(updateRoot, current)
+        try {
+          const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
+          const current = (head.stdout || '').trim()
 
-          if (branch !== 'main') {
-            command = `hermes update --branch ${branch}`
+          if (head.code === 0 && current && current !== 'HEAD') {
+            const branch = await resolveHealedBranch(updateRoot, current)
+
+            if (branch !== 'main') {
+              command = `hermes update --branch ${branch}`
+            }
           }
+        } catch {
+          // Best-effort: fall back to bare `hermes update` if branch detection fails.
         }
-      } catch {
-        // Best-effort: fall back to bare `hermes update` if branch detection fails.
+
+        rememberLog(`[updates] no staged updater; surfacing manual \`${command}\` for CLI install at ${updateRoot}`)
+        emitUpdateProgress({ stage: 'manual', message: command, percent: null })
+
+        return { ok: true, manual: true, command, hermesRoot: updateRoot }
       }
 
-      rememberLog(`[updates] no staged updater; surfacing manual \`${command}\` for CLI install at ${updateRoot}`)
-      emitUpdateProgress({ stage: 'manual', message: command, percent: null })
-
-      return { ok: true, manual: true, command, hermesRoot: updateRoot }
+      rememberLog('[updates] no staged updater; using repo hand-off script for CLI install')
     }
 
     const handoffConflict = updateHandoffConflict(HERMES_HOME)
@@ -2973,41 +3010,101 @@ async function applyUpdates(opts = {}) {
 
     // Detached so the updater outlives this process — it needs us GONE before
     // `hermes update` will run (the venv shim is locked while we live).
-    const child = spawnUpdaterProcess(updater, updaterArgs, {
-      cwd: HERMES_HOME,
-      env: {
-        ...process.env,
-        HERMES_HOME,
-        PATH: pathWithHermesManagedNode(venvBin)
-      },
-      detached: true,
-      stdio: 'ignore'
-    })
-
-    // Write the update-in-progress marker IMMEDIATELY — before the 2.5s
-    // quit dwell. The Tauri updater won't write its own marker for several
-    // seconds (window init + manifest), and during that gap our renderer
-    // can reconnect and spawn a fresh backend that re-locks .pyd files in
-    // the venv. By writing the marker ourselves the renderer's
-    // waitForUpdateToFinish() gate sees a live update and parks instead.
-    // The updater overwrites this with its own PID later; same format.
     //
-    // SKIPPED for pre-#74782 staged updaters: those have no self-PID
-    // exclusion, so they read this very marker as a foreign live owner and
-    // abort with "Another Hermes update is already running (PID <itself>)" —
-    // an unbreakable loop, because the update that would replace the stale
-    // binary is the one being refused. Losing the anti-respawn hardening is
-    // strictly better than never updating again, and the updater still writes
-    // its own marker moments later.
-    if (Number.isInteger(child.pid) && stagedUpdaterSupportsPrewrittenMarker(updater)) {
-      writeUpdateMarker(HERMES_HOME, child.pid)
-    } else if (Number.isInteger(child.pid)) {
+    // Prefer the repo-owned hand-off script over the staged Tauri binary.
+    // The staged binary is frozen (no self-update path) and historically runs
+    // months-stale updater logic — pre-#67369 cache resolver, pre-#74782
+    // marker adoption — producing failures that were fixed on main long ago
+    // (2026-08-09 incident). scripts/desktop-update.ps1 ships WITH the
+    // checkout, so each `hermes update` refreshes the code that drives the
+    // next one. Checkouts that predate the script fall back to the binary
+    // path unchanged.
+    const scriptHandoff = resolveUpdateScriptHandoff(updateRoot)
+    let child
+
+    if (scriptHandoff) {
+      // A bare detached+hidden powershell spawn silently dies before -File
+      // processing (console-subsystem init failure — see
+      // wrapHandoffForDetachedConsole). Route through `cmd start` so the
+      // script gets its own minimized console and survives our exit. The
+      // wrapper cmd.exe exits immediately, so child.pid is NOT the script's
+      // pid — the script claims the update marker itself with its own $PID
+      // as its first action, and a relaunched Desktop parks on that.
+      const wrapped = wrapHandoffForDetachedConsole(scriptHandoff, [
+        '-InstallRoot',
+        updateRoot,
+        '-Branch',
+        branch,
+        '-DesktopPid',
+        String(process.pid),
+        '-RelaunchExe',
+        process.execPath
+      ])
+
+      child = spawnUpdaterProcess(wrapped.command, wrapped.args, {
+        cwd: HERMES_HOME,
+        env: {
+          ...process.env,
+          HERMES_HOME,
+          PATH: pathWithHermesManagedNode(venvBin)
+        },
+        detached: true,
+        stdio: 'ignore'
+      })
+
+      // Bridge marker: child.pid is the short-lived cmd.exe WRAPPER, not the
+      // script (see wrapHandoffForDetachedConsole). Write it anyway to cover
+      // the first moments of the hand-off — the script's step 0 overwrites it
+      // with its own live $PID, and if the script never starts the wrapper's
+      // dead pid makes the marker read as stale and self-delete (no wedge).
+      // The `hermes update` child adopts the SCRIPT's claim via
+      // update_lock.py's process-ancestry rule; no mtime heuristics needed.
+      if (Number.isInteger(child.pid)) {
+        writeUpdateMarker(HERMES_HOME, child.pid)
+      }
+
       rememberLog(
-        `[updates] skipping marker pre-write: staged updater predates self-adopt (${updater}); it would refuse its own claim`
+        `[updates] launched repo hand-off script: ${scriptHandoff.scriptPath} (branch ${branch}); exiting desktop to release venv shim`
+      )
+    } else {
+      child = spawnUpdaterProcess(updater, updaterArgs, {
+        cwd: HERMES_HOME,
+        env: {
+          ...process.env,
+          HERMES_HOME,
+          PATH: pathWithHermesManagedNode(venvBin)
+        },
+        detached: true,
+        stdio: 'ignore'
+      })
+
+      // Write the update-in-progress marker IMMEDIATELY — before the 2.5s
+      // quit dwell. The Tauri updater won't write its own marker for several
+      // seconds (window init + manifest), and during that gap our renderer
+      // can reconnect and spawn a fresh backend that re-locks .pyd files in
+      // the venv. By writing the marker ourselves the renderer's
+      // waitForUpdateToFinish() gate sees a live update and parks instead.
+      // The updater overwrites this with its own PID later; same format.
+      //
+      // SKIPPED for pre-#74782 staged updaters: those have no self-PID
+      // exclusion, so they read this very marker as a foreign live owner and
+      // abort with "Another Hermes update is already running (PID <itself>)" —
+      // an unbreakable loop, because the update that would replace the stale
+      // binary is the one being refused. Losing the anti-respawn hardening is
+      // strictly better than never updating again, and the updater still writes
+      // its own marker moments later.
+      if (Number.isInteger(child.pid) && stagedUpdaterSupportsPrewrittenMarker(updater)) {
+        writeUpdateMarker(HERMES_HOME, child.pid)
+      } else if (Number.isInteger(child.pid)) {
+        rememberLog(
+          `[updates] skipping marker pre-write: staged updater predates self-adopt (${updater}); it would refuse its own claim`
+        )
+      }
+
+      rememberLog(
+        `[updates] launched updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release venv shim`
       )
     }
-
-    rememberLog(`[updates] launched updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release venv shim`)
 
     // Linger on the "updating — don't reopen" overlay long enough for the user
     // to actually read it (and to bridge the gap until the updater's own window
@@ -9059,6 +9156,12 @@ let hudRestoreMainWindow = false
 // the id and hands it over in the close broadcast.
 let hudSessionId = null
 
+// The profile the live HUD renderer booted against (rides hudUrl's query
+// string). A renderer adopts its backend once at boot, so a retarget onto a
+// session from a DIFFERENT profile cannot be a same-window `goto` — the HUD
+// must be respawned against the new profile's backend (see openHudWindow).
+let hudProfile = null
+
 // A wide, short bar parked near the bottom of the active display — the shape
 // of a game chat frame, and where one belongs. Defaults only: once the user
 // moves or resizes the HUD, hud-state.json wins (same pattern as the main
@@ -9193,15 +9296,17 @@ function hudBounds() {
   }
 }
 
-function hudUrl(sessionId) {
-  const query = '?win=hud'
-  const route = sessionId ? `#/${encodeURIComponent(sessionId)}` : '#/'
-
-  if (DEV_SERVER) {
-    return `${DEV_SERVER.endsWith('/') ? DEV_SERVER.slice(0, -1) : DEV_SERVER}/${query}${route}`
-  }
-
-  return `${pathToFileURL(resolveRendererIndex()).toString()}${query}${route}`
+function hudUrl(sessionId, profile) {
+  // The profile rides the query string next to `win=hud` (BEFORE the '#', so
+  // HashRouter never sees it). The HUD renderer's gateway boot reads it and
+  // adopts that backend instead of the primary — without it, a HUD opened on a
+  // non-primary profile's conversation resolves the session id against the
+  // wrong backend and falls back to the default profile's last session.
+  return buildHudWindowUrl(sessionId, {
+    devServer: DEV_SERVER,
+    profile,
+    rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
+  })
 }
 
 // Tell every window whether the HUD is up, so a toggle in any of them reads
@@ -9218,7 +9323,7 @@ function broadcastHudState(open) {
   }
 }
 
-function spawnHudWindow(sessionId) {
+function spawnHudWindow(sessionId, profile) {
   const win = new BrowserWindow({
     ...hudBounds(),
     minWidth: 380,
@@ -9301,7 +9406,7 @@ function spawnHudWindow(sessionId) {
     broadcastHudState(false)
   })
 
-  loadWindowUrl(win, hudUrl(sessionId), 'HUD')
+  loadWindowUrl(win, hudUrl(sessionId, profile), 'HUD')
 
   return win
 }
@@ -9319,8 +9424,28 @@ function restoreMainWindowFromHud() {
   }
 }
 
-function openHudWindow(sessionId) {
+function openHudWindow(sessionId, profile) {
+  const profileKey = typeof profile === 'string' && profile.trim() ? profile.trim() : null
+
   if (hudWindow && !hudWindow.isDestroyed()) {
+    // Pointed at another PROFILE: the live renderer is bound to the old
+    // profile's backend, and a renderer adopts its backend exactly once at
+    // boot — an in-place goto would resolve the id against the wrong backend
+    // (the #82285 fallback). Respawn against the right one.
+    if (profileKey && hudProfile !== profileKey) {
+      const win = hudWindow
+      hudWindow = null
+      win.removeAllListeners('closed')
+      win.destroy()
+
+      hudSessionId = sessionId || null
+      hudProfile = profileKey
+      hudWindow = spawnHudWindow(sessionId, profileKey)
+      broadcastHudState(true)
+
+      return hudWindow
+    }
+
     // Already up, but pointed somewhere else — switch it rather than just
     // raising it. Asking for HUD mode from another tab means "put THIS
     // conversation in the HUD", and a plain focus leaves the wrong one there.
@@ -9339,7 +9464,8 @@ function openHudWindow(sessionId) {
 
   hudRestoreMainWindow = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible())
   hudSessionId = sessionId || null
-  hudWindow = spawnHudWindow(sessionId)
+  hudProfile = profileKey
+  hudWindow = spawnHudWindow(sessionId, profileKey)
   broadcastHudState(true)
 
   return hudWindow
@@ -10035,7 +10161,10 @@ ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
 
 // --- HUD mode (chrome-free floating chat) -----------------------------------
 ipcMain.handle('hermes:hud:open', async (_event, request) => {
-  openHudWindow(typeof request?.sessionId === 'string' ? request.sessionId : null)
+  openHudWindow(
+    typeof request?.sessionId === 'string' ? request.sessionId : null,
+    typeof request?.profile === 'string' ? request.profile : null
+  )
 
   return { ok: true }
 })
@@ -11689,6 +11818,9 @@ ipcMain.handle('hermes:git:review:commitContext', async (_event, repoPath) =>
 )
 ipcMain.handle('hermes:git:review:push', async (_event, repoPath) => reviewPush(repoPath, resolveGitBinary()))
 ipcMain.handle('hermes:git:review:shipInfo', async (_event, repoPath) => reviewShipInfo(repoPath, resolveGhBinary()))
+ipcMain.handle('hermes:git:review:prList', async (_event, repoPath, branches, numbers) =>
+  reviewPrList(repoPath, resolveGhBinary(), branches, numbers)
+)
 ipcMain.handle('hermes:git:review:createPr', async (_event, repoPath) =>
   reviewCreatePr(repoPath, resolveGitBinary(), resolveGhBinary())
 )

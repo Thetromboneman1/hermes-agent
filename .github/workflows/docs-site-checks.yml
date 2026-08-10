@@ -22,6 +22,9 @@ jobs:
           cache: npm
           cache-dependency-path: website/package-lock.json
 
+      - name: Use the website-supported npm release
+        run: npm install --global npm@11.17.0
+
       - name: Install website dependencies
         run: npm ci
         working-directory: website
