@@ -99,6 +99,13 @@ def repository_name(root: Path) -> str:
 
 
 def default_branch(root: Path) -> str:
+    result = run(
+        ["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        cwd=root,
+        check=False,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip().removeprefix("origin/")
     result = run(["git", "branch", "--show-current"], cwd=root, check=False)
     return result.stdout.strip() or "detached"
 
