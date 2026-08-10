@@ -31,6 +31,7 @@ import os
 import re
 import difflib
 import hashlib
+import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
@@ -731,6 +732,10 @@ DEFAULT_READ_LIMIT = 2000
 DEFAULT_SEARCH_OFFSET = 0
 DEFAULT_SEARCH_LIMIT = 50
 
+# Echoed by the size probe when the path exists but is not a regular file.
+# `wc -c` prints only digits, so this can never collide with a real size.
+NOT_REGULAR_SENTINEL = "__hermes_not_regular__"
+
 
 def _coerce_int(value: Any, default: int) -> int:
     """Best-effort integer coercion for tool pagination inputs."""
@@ -1219,6 +1224,40 @@ class ShellFileOperations(FileOperations):
     # READ Implementation
     # =========================================================================
     
+    def _size_probe_cmd(self, path: str) -> str:
+        """Byte size of a regular file, without opening one that never ends.
+
+        ``wc -c < path`` opens the path. On a FIFO with no writer, a socket,
+        or a character device like /dev/zero that never reaches EOF, that
+        read blocks forever — and the read helpers pass no timeout to
+        :meth:`_exec`, so the turn wedges until the process is killed. The
+        device blocklist in ``tools/file_tools.py`` cannot cover this: it
+        matches literal ``/dev/*`` names, while a FIFO is a file *type* and
+        can sit at any path.
+
+        ``[ -f ]`` is a stat, not an open — it answers exactly the question
+        the size probe needs (regular file, symlinks followed) without
+        touching the contents. Non-regular paths that exist report the
+        sentinel so callers can say so instead of claiming the file is
+        missing; a genuinely absent path still exits non-zero.
+        """
+        arg = self._escape_shell_arg(path)
+        return (
+            f"if [ -f {arg} ]; then wc -c < {arg} 2>/dev/null; "
+            f"elif [ -e {arg} ]; then echo {NOT_REGULAR_SENTINEL}; "
+            f"else exit 1; fi"
+        )
+
+    @staticmethod
+    def _not_regular_error(path: str) -> ReadResult:
+        """Error for a path that exists but would block if read."""
+        return ReadResult(
+            error=(
+                f"Cannot read '{path}': not a regular file (directory, FIFO, "
+                "socket, or device). Reading it could block indefinitely."
+            )
+        )
+
     def read_file(self, path: str, offset: int = 1, limit: int = 2000) -> ReadResult:
         """
         Read a file with pagination, binary detection, and line numbers.
@@ -1236,15 +1275,32 @@ class ShellFileOperations(FileOperations):
         
         offset, limit = normalize_read_pagination(offset, limit)
         
-        # Check if file exists and get size (wc -c is POSIX, works on Linux + macOS)
-        stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
-        
+        # Check if file exists and get size (POSIX, works on Linux + macOS)
+        stat_result = self._exec(self._size_probe_cmd(path))
+
         if stat_result.exit_code != 0:
-            # File not found - try to suggest similar files
+            # File not found. Before failing, try unicode-equivalent
+            # spellings — NFC/NFD, narrow no-break space, curly quotes
+            # render identically in a terminal, so the model retyping a
+            # visually-correct path can never discover the byte mismatch
+            # on its own (retrying is the tool's job, not the model's).
+            variant = self._unicode_variant_match(path)
+            if variant is not None:
+                result = self.read_file(variant, offset=offset, limit=limit)
+                note = (
+                    f"Note: '{path}' not found byte-for-byte; resolved to "
+                    f"the unicode-equivalent file '{variant}' (invisible "
+                    "encoding difference: NFC/NFD or special space/quote "
+                    "characters)."
+                )
+                result.hint = f"{note} {result.hint}" if result.hint else note
+                return result
+            # No equivalent spelling — suggest similar files
             return self._suggest_similar_files(path)
-        
+
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
+        if stat_output.strip() == NOT_REGULAR_SENTINEL:
+            return self._not_regular_error(path)
         try:
             file_size = int(stat_output.strip())
         except ValueError:
@@ -1314,7 +1370,30 @@ class ShellFileOperations(FileOperations):
         hint = None
         if truncated:
             hint = f"Use offset={end_line + 1} to continue reading (showing {offset}-{end_line} of {total_lines} lines)"
-        
+
+        # Ambiguous-silence guards: an empty content string is
+        # indistinguishable, from inside the model, from a broken tool —
+        # it re-reads, widens the window, tries another path. Name the
+        # dead end and its recovery instead.
+        if file_size == 0:
+            return ReadResult(
+                content="",
+                total_lines=0,
+                file_size=0,
+                hint="File is empty (0 bytes).",
+            )
+        if offset > total_lines > 0:
+            return ReadResult(
+                content="",
+                total_lines=total_lines,
+                file_size=file_size,
+                hint=(
+                    f"Note: offset {offset} is beyond the end of the file "
+                    f"({total_lines} lines total). Retry with offset <= "
+                    f"{total_lines}."
+                ),
+            )
+
         return ReadResult(
             content=self._add_line_numbers(read_output, offset),
             total_lines=total_lines,
@@ -1323,6 +1402,50 @@ class ShellFileOperations(FileOperations):
             hint=hint
         )
     
+    def _unicode_variant_match(self, path: str) -> Optional[str]:
+        """Find an existing file whose name is unicode-equivalent to ``path``.
+
+        macOS names screenshots with a NARROW NO-BREAK SPACE (U+202F) before
+        AM/PM, stores names NFD-decomposed, and Finder renames turn ' into
+        \u2019 — all invisible in rendered text. Compare directory entries
+        under a normalization that erases exactly those differences and
+        return the on-disk spelling when exactly one entry matches.
+        """
+        dir_path = os.path.dirname(path) or "."
+        filename = os.path.basename(path)
+        if not filename:
+            return None
+
+        def _canon(name: str) -> str:
+            # NFC first so composed/decomposed collapse together, then the
+            # confusable space/quote characters seen in real filenames.
+            out = unicodedata.normalize("NFC", name)
+            for src, dst in (
+                ("\u202f", " "),  # narrow no-break space
+                ("\u00a0", " "),  # no-break space
+                ("\u2019", "'"),  # right single quotation mark
+                ("\u2018", "'"),  # left single quotation mark
+            ):
+                out = out.replace(src, dst)
+            return out
+
+        target = _canon(filename)
+        ls_cmd = f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null"
+        ls_result = self._exec(ls_cmd)
+        if ls_result.exit_code != 0 or not ls_result.stdout.strip():
+            return None
+        candidates = [
+            entry
+            for entry in _strip_terminal_fence_leaks(ls_result.stdout).splitlines()
+            if entry and entry != filename and _canon(entry) == target
+        ]
+        # Exactly one equivalent spelling = unambiguous repair. Zero or
+        # several = fall through to suggestions; guessing among homoglyph
+        # collisions would silently read the wrong file.
+        if len(candidates) == 1:
+            return os.path.join(dir_path, candidates[0]) if dir_path != "." or "/" in path else candidates[0]
+        return None
+
     def _suggest_similar_files(self, path: str) -> ReadResult:
         """Suggest similar files when the requested file is not found."""
         dir_path = os.path.dirname(path) or "."
@@ -1363,6 +1486,13 @@ class ShellFileOperations(FileOperations):
                     common = set(lower_name) & set(lf)
                     if len(common) >= max(len(lower_name), len(lf)) * 0.4:
                         score = 30
+                # Near-miss spelling (AGENT.md -> AGENTS.md): substring
+                # checks above find nothing, but a high sequence ratio
+                # catches 1-2 edit typos without a homegrown levenshtein.
+                if score == 0 and difflib.SequenceMatcher(
+                    None, lower_name, lf
+                ).ratio() >= 0.8:
+                    score = 50
 
                 if score > 0:
                     scored.append((score, os.path.join(dir_path, f)))
@@ -1382,11 +1512,12 @@ class ShellFileOperations(FileOperations):
         Uses cat so the full file is returned regardless of size.
         """
         path = self._expand_path(path)
-        stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
+        stat_result = self._exec(self._size_probe_cmd(path))
         if stat_result.exit_code != 0:
             return self._suggest_similar_files(path)
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
+        if stat_output.strip() == NOT_REGULAR_SENTINEL:
+            return self._not_regular_error(path)
         try:
             file_size = int(stat_output.strip())
         except ValueError:
@@ -1423,13 +1554,14 @@ class ShellFileOperations(FileOperations):
     def read_file_bytes(self, path: str, max_bytes: Optional[int] = None) -> ReadResult:
         """Read binary-safe bytes from any shell-backed environment."""
         path = self._expand_path(path)
-        stat_result = self._exec(
-            f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        )
+        stat_result = self._exec(self._size_probe_cmd(path))
         if stat_result.exit_code != 0:
             return ReadResult(error=f"File not found: {path}")
+        stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
+        if stat_output.strip() == NOT_REGULAR_SENTINEL:
+            return self._not_regular_error(path)
         try:
-            file_size = int(_strip_terminal_fence_leaks(stat_result.stdout).strip())
+            file_size = int(stat_output.strip())
         except ValueError:
             return ReadResult(error=f"Could not determine file size: {path}")
         if max_bytes is not None and file_size > max_bytes:
