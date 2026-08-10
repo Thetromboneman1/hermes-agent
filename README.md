@@ -294,7 +294,7 @@ are documented in [docs/repository-maintenance.md](docs/repository-maintenance.m
 ![hermes-agent system architecture](docs/architecture/hermes-agent-system-architecture.png)
 
 - **Default branch:** `main`
-- **Implementation fingerprint:** `22d1bdcd8e70322a`
+- **Implementation fingerprint:** `42e83d061a0f61d8`
 - **Detected structure:** Automation modules, GitHub Actions, Tests and validation, Maintained documentation.
 - **Documentation contract:** editable diagram sources, committed PNG renderings,
   resolved local image links, and generated state are checked on every commit.
