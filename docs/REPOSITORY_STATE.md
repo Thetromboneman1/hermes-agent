@@ -9,7 +9,7 @@ the documentation record advances with implementation changes.
 - Default branch: `main`
 - Implementation fingerprint: `ef311b3db7c87efb`
 - Maintained documents: 1558
-- Architecture assets: 29
+- Architecture assets: 26
 
 ## Detected architecture
 

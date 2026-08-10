@@ -99,6 +99,8 @@ def repository_name(root: Path) -> str:
 
 
 def default_branch(root: Path) -> str:
+    if os.getenv("GITHUB_BASE_REF"):
+        return os.environ["GITHUB_BASE_REF"]
     result = run(
         ["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
         cwd=root,
