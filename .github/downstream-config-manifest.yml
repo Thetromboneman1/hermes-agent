@@ -1,0 +1,23 @@
+schema_version: 1
+maintenance_status: active
+authoritative_upstream: NousResearch/hermes-agent
+upstream_branch: main
+downstream_branch: local-first-acp-optimizations
+sync_strategy: rebase
+last_reconstructed: 2026-08-10
+recovery_branch: backup/local-first-acp-optimizations-pre-rebase-20260810
+intentional_differences:
+  - purpose: Optional loopback-bound SSH access for Hermes Desktop
+    paths:
+      - Dockerfile
+      - docker/cont-init.d/016-sshd-authorized-keys
+      - docker/s6-rc.d/hermes-sshd
+      - docker/s6-rc.d/user/contents.d/hermes-sshd
+    invariants:
+      - Password and keyboard-interactive authentication remain disabled.
+      - The service remains down unless HERMES_HOME/.ssh/authorized_keys is a regular file.
+      - The image never contains an authorized key or private credential.
+      - Host port publication is loopback-only and remains an operator responsibility.
+validation:
+  - shellcheck docker/cont-init.d/016-sshd-authorized-keys docker/s6-rc.d/hermes-sshd/run docker/s6-rc.d/hermes-sshd/finish
+  - docker build --tag hermes-agent:local-first-validation .
