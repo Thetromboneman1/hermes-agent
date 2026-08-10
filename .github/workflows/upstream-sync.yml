@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: repository-writes-${{ github.repository }}-refs/heads/main
@@ -149,19 +150,79 @@ jobs:
 
       - name: Rebase local-first-acp-optimizations onto updated main
         id: rebase
-        continue-on-error: true
+        env:
+          EXPECTED_MAIN: ${{ needs.sync-main.outputs.after }}
         run: |
           BRANCH="local-first-acp-optimizations"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           # Check branch exists in fork
           if ! git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
             echo "ℹ️  Branch $BRANCH not found in fork — skipping"
             exit 0
           fi
-          git checkout "$BRANCH"
-          if git rebase main && git push origin "$BRANCH" --force-with-lease; then
+          # actions/checkout starts this dependent job at the workflow's
+          # original SHA. Refresh both refs so the rebase targets the commit
+          # produced by sync-main rather than that stale checkout.
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+          ACTUAL_MAIN=$(git rev-parse refs/remotes/origin/main)
+          if [ "$ACTUAL_MAIN" != "$EXPECTED_MAIN" ]; then
+            echo "::error::Remote main $ACTUAL_MAIN does not match sync output $EXPECTED_MAIN"
+            exit 1
+          fi
+          git checkout -B "$BRANCH" "refs/remotes/origin/$BRANCH"
+          ORIGINAL_SHA=$(git rev-parse HEAD)
+          BACKUP_BRANCH="automation-backups/${BRANCH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "original_sha=$ORIGINAL_SHA" >> "$GITHUB_OUTPUT"
+          echo "backup_branch=$BACKUP_BRANCH" >> "$GITHUB_OUTPUT"
+          git push origin "$ORIGINAL_SHA:refs/heads/$BACKUP_BRANCH"
+
+          if git rebase "refs/remotes/origin/main" && git push origin "$BRANCH" \
+            --force-with-lease="refs/heads/$BRANCH:$ORIGINAL_SHA"; then
             echo "✅ $BRANCH rebased and pushed"
           else
+            CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+            {
+              echo "conflicts<<EOF"
+              printf '%s\n' "${CONFLICTS:-No unmerged paths were reported; inspect the push and rebase logs.}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
             git rebase --abort || true
-            echo "::warning::Rebase conflict on $BRANCH — manual intervention needed"
+            echo "::error::Rebase or protected push failed on $BRANCH — manual intervention needed"
             exit 1
+          fi
+
+      - name: Record rebase failure
+        if: failure() && steps.rebase.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.rebase.outputs.branch }}
+          ORIGINAL_SHA: ${{ steps.rebase.outputs.original_sha }}
+          BACKUP_BRANCH: ${{ steps.rebase.outputs.backup_branch }}
+          CONFLICTS: ${{ steps.rebase.outputs.conflicts }}
+        run: |
+          TITLE="Upstream sync conflict: ${BRANCH}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          BODY=$(cat <<EOF
+          The automated rebase failed and the job was intentionally marked failed.
+
+          - Branch: \`${BRANCH}\`
+          - Original commit: \`${ORIGINAL_SHA:-unknown}\`
+          - Recovery branch: \`${BACKUP_BRANCH:-not created}\`
+          - Run: ${RUN_URL}
+
+          Conflicting paths or failure detail:
+
+          \`\`\`
+          ${CONFLICTS:-See the linked run logs.}
+          \`\`\`
+          EOF
+          )
+          ISSUE_NUMBER=$(gh issue list --state open --search "${TITLE} in:title" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$ISSUE_NUMBER" ]; then
+            gh issue comment "$ISSUE_NUMBER" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
           fi
