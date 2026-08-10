@@ -1,0 +1,8 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+
+if [ -e /run/hermes-sshd-disabled ]; then
+    exit 0
+fi
+
+exec /usr/sbin/sshd -D -e
