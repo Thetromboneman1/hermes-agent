@@ -6,7 +6,7 @@ This file is generated from the tracked repository tree. It is committed so
 the documentation record advances with implementation changes.
 
 - Repository: `Thetromboneman1/hermes-agent`
-- Default branch: `main`
+- Default branch: `repair/nous-sync-20260810-run121`
 - Implementation fingerprint: `ef311b3db7c87efb`
 - Maintained documents: 1558
 - Architecture assets: 26
