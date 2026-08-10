@@ -92,7 +92,9 @@ jobs:
     # (which uses the build-and-push job above).
     if: github.repository != 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The arm64 leg runs under QEMU on GitHub-hosted amd64 runners. A cold
+    # multi-arch build can exceed 60 minutes even after the amd64 smoke build.
+    timeout-minutes: 120
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
