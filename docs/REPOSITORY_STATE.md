@@ -1,14 +1,14 @@
 # Repository State
 
-Updated: 2026-08-07
+Updated: 2026-08-10
 
 This file is generated from the tracked repository tree. It is committed so
 the documentation record advances with implementation changes.
 
 - Repository: `Thetromboneman1/hermes-agent`
-- Default branch: `main`
-- Implementation fingerprint: `827da0b6507ca4e2`
-- Maintained documents: 1534
+- Default branch: `backup/pre-nous-sync-20260810-run121`
+- Implementation fingerprint: `26fec1bc3fff8cef`
+- Maintained documents: 1558
 - Architecture assets: 29
 
 ## Detected architecture
