@@ -219,6 +219,18 @@ jobs:
           \`\`\`
           EOF
           )
+          {
+            echo "## Downstream rebase recovery"
+            printf '%s\n' "$BODY"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          HAS_ISSUES=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.has_issues' \
+            2>/dev/null || printf 'false')
+          if [ "$HAS_ISSUES" != "true" ]; then
+            echo "::warning::Repository Issues are disabled; recovery details remain in the run summary"
+            exit 0
+          fi
+
           ISSUE_NUMBER=$(gh issue list --state open --search "${TITLE} in:title" \
             --json number --jq '.[0].number // empty')
           if [ -n "$ISSUE_NUMBER" ]; then
