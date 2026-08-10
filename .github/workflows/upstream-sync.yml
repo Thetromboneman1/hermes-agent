@@ -178,7 +178,50 @@ jobs:
           echo "backup_branch=$BACKUP_BRANCH" >> "$GITHUB_OUTPUT"
           git push origin "$ORIGINAL_SHA:refs/heads/$BACKUP_BRANCH"
 
-          if git rebase "refs/remotes/origin/main" && git push origin "$BRANCH" \
+          REBASE_OK=false
+          if git rebase "refs/remotes/origin/main"; then
+            REBASE_OK=true
+          else
+            # Generated repository fingerprints are branch-specific and may
+            # conflict after main advances. Resolve only those two known files
+            # in favor of the new base; never auto-resolve product/config files.
+            DOC_CONFLICT_ATTEMPTS=0
+            while [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; do
+              DOC_CONFLICT_ATTEMPTS=$((DOC_CONFLICT_ATTEMPTS + 1))
+              if [ "$DOC_CONFLICT_ATTEMPTS" -gt 5 ]; then
+                echo "::error::Generated-documentation conflict retry limit exceeded"
+                break
+              fi
+              CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+              NON_GENERATED=$(printf '%s\n' "$CONFLICTS" | \
+                grep -Ev '^(README\.md|docs/REPOSITORY_STATE\.md)$' || true)
+              if [ -z "$CONFLICTS" ] || [ -n "$NON_GENERATED" ]; then
+                break
+              fi
+              echo "Resolving generated-documentation conflicts against updated main"
+              git checkout --ours -- README.md docs/REPOSITORY_STATE.md
+              git add README.md docs/REPOSITORY_STATE.md
+              if git diff --cached --quiet; then
+                git rebase --skip || break
+              else
+                GIT_EDITOR=true git rebase --continue || true
+              fi
+            done
+            if [ ! -d .git/rebase-merge ] && [ ! -d .git/rebase-apply ] && \
+              git merge-base --is-ancestor "refs/remotes/origin/main" HEAD; then
+              REBASE_OK=true
+            fi
+          fi
+
+          if [ "$REBASE_OK" = "true" ]; then
+            python3 scripts/documentation_health.py --write
+            if ! git diff --quiet -- README.md docs/REPOSITORY_STATE.md; then
+              git add README.md docs/REPOSITORY_STATE.md
+              git commit -m "docs: refresh generated repository state [skip ci]"
+            fi
+          fi
+
+          if [ "$REBASE_OK" = "true" ] && git push origin "$BRANCH" \
             --force-with-lease="refs/heads/$BRANCH:$ORIGINAL_SHA"; then
             echo "✅ $BRANCH rebased and pushed"
           else
