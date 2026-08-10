@@ -16722,4 +16722,3 @@ def test_save_cfg_keeps_unicode_personalities_readable(tmp_path, monkeypatch):
     assert "你好" in text
     assert "(=^･ω･^=)" in text
     assert "\\u4f60" not in text
-
