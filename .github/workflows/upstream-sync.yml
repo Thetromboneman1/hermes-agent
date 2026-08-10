@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: repository-writes-${{ github.repository }}-refs/heads/main
+  cancel-in-progress: false
+
 jobs:
   sync-main:
     name: Sync main ← NousResearch/hermes-agent
@@ -95,6 +99,25 @@ jobs:
             fi
           fi
 
+          PUSHED=false
+          for ATTEMPT in 1 2 3; do
+            if git push origin main; then
+              PUSHED=true
+              break
+            fi
+            if [ "$ATTEMPT" -eq 3 ]; then
+              break
+            fi
+            echo "Remote main advanced during sync; integrating it before retry $((ATTEMPT + 1))/3"
+            git fetch origin main
+            git merge --no-edit origin/main
+            sleep $((ATTEMPT * 2))
+          done
+          if [ "$PUSHED" != "true" ]; then
+            echo "::error::Unable to push synchronized main after 3 attempts"
+            exit 1
+          fi
+
           AFTER=$(git rev-parse HEAD)
           echo "after=$AFTER" >> "$GITHUB_OUTPUT"
 
@@ -105,8 +128,6 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "ℹ️  main already up to date"
           fi
-
-          git push origin main
 
   rebase-custom-branches:
     name: Rebase local-first-acp-optimizations

@@ -99,6 +99,14 @@ def repository_name(root: Path) -> str:
 
 
 def default_branch(root: Path) -> str:
+    event_path = os.getenv("GITHUB_EVENT_PATH")
+    if event_path:
+        try:
+            repository = json.loads(Path(event_path).read_text(encoding="utf-8")).get("repository", {})
+            if repository.get("default_branch"):
+                return str(repository["default_branch"])
+        except (OSError, json.JSONDecodeError):
+            pass
     if os.getenv("GITHUB_BASE_REF"):
         return os.environ["GITHUB_BASE_REF"]
     result = run(
