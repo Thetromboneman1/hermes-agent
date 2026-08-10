@@ -2,7 +2,7 @@
 
 # Repository maintenance
 
-Last audited: 2026-07-26
+Last audited: 2026-08-10
 
 ## Purpose and role
 
@@ -12,7 +12,7 @@ The agent that grows with you
 - Maintenance status: `active`
 - Repository roles: `GitHub fork`, `downstream customization`, `container repository`, `deployment repository`, `build repository`
 - Authoritative upstream: `NousResearch/hermes-agent`
-- Downstream consumers: None documented.
+- Downstream consumers: Hermes Desktop through the optional loopback-bound SSH container path.
 
 ## Upstream synchronization
 
@@ -20,6 +20,10 @@ The agent that grows with you
 - Automation status: `configured`
 - Schedule and manual recovery: use the repository's registered upstream-sync workflow when configured.
 - Safety rule: synchronize through a dedicated review branch; never discard downstream commits or force-push a shared branch.
+- `local-first-acp-optimizations` is reconstructed on current `main`; its intentional
+  differences are recorded in `.github/downstream-config-manifest.yml`. The
+  pre-reconstruction history is preserved at
+  `backup/local-first-acp-optimizations-pre-rebase-20260810`.
 
 ## Workflows
 
@@ -47,6 +51,10 @@ The agent that grows with you
 - Run repository-specific build and test commands documented in the root README before promotion.
 - Validate workflow changes with `actionlint`, parse structured configuration, and inspect the resulting GitHub Actions run.
 - For upstream changes, verify downstream configuration and generated artifacts before merging the review branch.
+- The optional SSH service uses key-only root authentication and starts only
+  when `HERMES_HOME/.ssh/authorized_keys` is a regular file. Publish container
+  port 22 only on a loopback host address; the image does not expose it by
+  default.
 
 ## Configuration and secrets
 

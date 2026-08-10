@@ -70,8 +70,19 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # hermes process, the dashboard, and per-profile gateways.
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-server docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
+
+# Optional key-only SSH access for a loopback-bound Hermes Desktop tunnel.
+# The supervised sshd service stays down unless stage2 finds an authorized_keys
+# file under HERMES_HOME. Host port exposure remains an operator decision.
+RUN mkdir -p /run/sshd && \
+    printf '%s\n' \
+        'PermitRootLogin prohibit-password' \
+        'PasswordAuthentication no' \
+        'KbdInteractiveAuthentication no' \
+        'PubkeyAuthentication yes' \
+        > /etc/ssh/sshd_config.d/99-hermes-key-only.conf
 
 # Prefer the fixed SQLite over Debian's vulnerable libsqlite3.so.0. Keep the
 # public library name stable so both the system interpreter and the uv-created
@@ -362,6 +373,7 @@ RUN mkdir -p /etc/cont-init.d && \
         > /etc/cont-init.d/01-hermes-setup && \
     chmod +x /etc/cont-init.d/01-hermes-setup
 COPY --chmod=0755 docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
+COPY --chmod=0755 docker/cont-init.d/016-sshd-authorized-keys /etc/cont-init.d/016-sshd-authorized-keys
 COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
 
 # ---------- Runtime ----------
