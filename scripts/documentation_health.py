@@ -102,6 +102,9 @@ def default_branch(root: Path) -> str:
     github_base_ref = os.environ.get("GITHUB_BASE_REF", "").strip()
     if github_base_ref:
         return github_base_ref
+    repository_default_branch = os.environ.get("REPOSITORY_DEFAULT_BRANCH", "").strip()
+    if repository_default_branch:
+        return repository_default_branch
     remote_head = run(
         ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
         cwd=root,
@@ -643,6 +646,8 @@ concurrency:
 jobs:
   documentation-health:
     runs-on: ubuntu-latest
+    env:
+      REPOSITORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
