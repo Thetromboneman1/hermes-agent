@@ -424,12 +424,13 @@ def readme_section(root: Path, overview_png: Path) -> str:
     readme = root / "README.md"
     relative = os.path.relpath(overview_png, readme.parent).replace(os.sep, "/")
     areas = detect_areas(root)
+    display_name = repository_name(root).split("/")[-1]
     area_summary = ", ".join(areas["implementation"] + areas["operations"])
     return f'''{MARKER_START}
 
 ## Current repository state
 
-![{root.name} system architecture]({relative})
+![{display_name} system architecture]({relative})
 
 - **Default branch:** `{default_branch(root)}`
 - **Implementation fingerprint:** `{implementation_fingerprint(root)}`
