@@ -1,6 +1,7 @@
 # Architecture Assets
 
 <!-- fleet-documentation-contract:start -->
+
 ## Rendering contract
 
 PNG files are the viewer-compatible diagrams embedded in repository documents.

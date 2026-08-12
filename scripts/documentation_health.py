@@ -99,23 +99,6 @@ def repository_name(root: Path) -> str:
 
 
 def default_branch(root: Path) -> str:
-    event_path = os.getenv("GITHUB_EVENT_PATH")
-    if event_path:
-        try:
-            repository = json.loads(Path(event_path).read_text(encoding="utf-8")).get("repository", {})
-            if repository.get("default_branch"):
-                return str(repository["default_branch"])
-        except (OSError, json.JSONDecodeError):
-            pass
-    if os.getenv("GITHUB_BASE_REF"):
-        return os.environ["GITHUB_BASE_REF"]
-    result = run(
-        ["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
-        cwd=root,
-        check=False,
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip().removeprefix("origin/")
     result = run(["git", "branch", "--show-current"], cwd=root, check=False)
     return result.stdout.strip() or "detached"
 
@@ -433,6 +416,7 @@ def readme_section(root: Path, overview_png: Path) -> str:
     areas = detect_areas(root)
     area_summary = ", ".join(areas["implementation"] + areas["operations"])
     return f'''{MARKER_START}
+
 ## Current repository state
 
 ![{root.name} system architecture]({relative})
@@ -519,6 +503,7 @@ def write_architecture_guide(root: Path) -> None:
     path = root / "docs/architecture/README.md"
     existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
     contract = '''<!-- fleet-documentation-contract:start -->
+
 ## Rendering contract
 
 PNG files are the viewer-compatible diagrams embedded in repository documents.

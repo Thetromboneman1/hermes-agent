@@ -10,8 +10,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: repository-writes-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: documentation-health-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   documentation-health:
