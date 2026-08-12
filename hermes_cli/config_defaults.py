@@ -980,6 +980,7 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "provider": "auto",
             "model": "",
+            "prefer_fast_model": False,  # opt in to provider fast tier; auto otherwise uses the main model
             "base_url": "",
             "api_key": "",
             "timeout": 30,
@@ -2546,6 +2547,10 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Optional named-profile allowlist for multiplex mode. None preserves
+        # the historical serve-all behavior; [] serves only the default.
+        "multiplex_profile_allowlist": None,
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored
