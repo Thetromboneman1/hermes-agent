@@ -1104,6 +1104,26 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
 _BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
 
 
+def _windows_marketing_version() -> str:
+    """Return the marketing Windows version ("10", "11", ...) for the prompt.
+
+    ``platform.release()`` reports the kernel version, which is ``10`` for
+    BOTH Windows 10 and Windows 11 — the prompt then claims "Windows (10)"
+    on Windows 11 hosts and misleads the model about the OS (#51755).
+    Windows 11 is distinguished by build number: >= 22000 is 11.
+    Falls back to ``platform.release()`` on any lookup failure.
+    """
+    try:
+        build = sys.getwindowsversion().build  # type: ignore[attr-defined]
+        if build >= 22000:
+            return "11"
+        return "10"
+    except Exception:
+        import platform
+
+        return platform.release()
+
+
 _WINDOWS_BASH_SHELL_HINT = (
     "Shell: on this Windows host your `terminal` tool runs commands through "
     "bash (git-bash / MSYS), NOT PowerShell or cmd.exe. Use POSIX shell "
@@ -1111,7 +1131,20 @@ _WINDOWS_BASH_SHELL_HINT = (
     "calls. MSYS-style paths like `/c/Users/<user>/...` work alongside "
     "native `C:\\Users\\<user>\\...` paths. PowerShell builtins "
     "(`Get-ChildItem`, `$env:FOO`, `Select-String`) will NOT work — use their "
-    "POSIX equivalents (`ls`, `$FOO`, `grep`)."
+    "POSIX equivalents (`ls`, `$FOO`, `grep`). Path arguments for NATIVE "
+    "Windows programs (git, rg, node, python, ...) are NOT translated: MSYS "
+    "path conversion is disabled here, so `git -C /c/Users/x` or "
+    "`node /tmp/a.js` fails with 'cannot change to'/'not found' even though "
+    "`cd /c/Users/x` (a bash builtin) works. Pass `C:/Users/x`-style "
+    "forward-slash native paths to native tools, and prefer "
+    "`$LOCALAPPDATA/Temp` over `/tmp` for scratch files a native tool must "
+    "read. When answering prompts in a "
+    "pty background process, use process(submit) — never process(write) "
+    "with a bare trailing newline: Enter on a Windows PTY is a carriage "
+    "return, and a lone `\\n` is not delivered as a line terminator, so the "
+    "child's prompt silently never returns. When a CLI offers a "
+    "non-interactive path (flags, `--with-token`, config files, an OAuth "
+    "device flow polled with curl), prefer it over driving prompts."
 )
 
 
@@ -1278,7 +1311,7 @@ def build_environment_hints() -> str:
         if is_wsl():
             host_lines.append("Host: WSL (Windows Subsystem for Linux)")
         elif sys.platform == "win32":
-            host_lines.append(f"Host: Windows ({platform.release()})")
+            host_lines.append(f"Host: Windows ({_windows_marketing_version()})")
         elif sys.platform == "darwin":
             mac_ver = platform.mac_ver()[0]
             host_lines.append(f"Host: macOS ({mac_ver or platform.release()})")

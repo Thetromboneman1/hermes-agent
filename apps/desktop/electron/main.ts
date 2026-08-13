@@ -46,7 +46,12 @@ import {
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
-import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
+import {
+  detectRemoteDisplay,
+  isWindowsBinaryPathInWsl,
+  isWslEnvironment,
+  resolveLinuxPasswordStore
+} from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
@@ -104,6 +109,7 @@ import {
   reviewCommitContext,
   reviewCreatePr,
   reviewDiff,
+  reviewFetchPrComment,
   reviewList,
   reviewPrList,
   reviewPush,
@@ -129,8 +135,10 @@ import {
   DATA_URL_READ_DEFAULT_MAX_MB,
   dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
+  enableBasicPasswordStoreEncryption,
   encryptDesktopSecret as encryptDesktopSecretStrict,
   readFileDataUrlForIpc,
+  resolvePersistedRemoteToken,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
@@ -330,6 +338,22 @@ if (IS_WSL && !REMOTE_DISPLAY_REASON && fs.existsSync('/dev/dxg')) {
   app.commandLine.appendSwitch('enable-gpu-rasterization')
   app.commandLine.appendSwitch('enable-zero-copy')
   console.log('[hermes] WSL GPU passthrough (/dev/dxg) detected; enabling GPU acceleration')
+}
+
+// Linux: point Chromium at the session's keychain backend so safeStorage can
+// encrypt remote gateway tokens (hardening.ts refuses to persist them without
+// it). The value arrives via HERMES_DESKTOP_PASSWORD_STORE, bridged by the
+// `hermes desktop` launcher from detection or `desktop.password_store` in
+// config.yaml. Must run before app `ready` — the switch only applies pre-launch.
+const PASSWORD_STORE = resolveLinuxPasswordStore()
+
+if (PASSWORD_STORE.warning) {
+  console.warn(`[hermes] ${PASSWORD_STORE.warning}`)
+}
+
+if (PASSWORD_STORE.store) {
+  app.commandLine.appendSwitch('password-store', PASSWORD_STORE.store)
+  console.log(`[hermes] using password-store backend: ${PASSWORD_STORE.store}`)
 }
 
 // Windows sandbox / GPU breakpoint crash recovery (#38216).
@@ -6637,8 +6661,8 @@ async function cloudAgentSilentSignIn(dashboardUrl) {
   return { baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
 }
 
-function encryptDesktopSecret(value) {
-  return encryptDesktopSecretStrict(value, safeStorage)
+function encryptDesktopSecret(value, options = {}) {
+  return encryptDesktopSecretStrict(value, safeStorage, options)
 }
 
 function decryptDesktopSecret(secret) {
@@ -6849,6 +6873,23 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
   const remoteUrl = envOverride ? String(process.env.HERMES_DESKTOP_REMOTE_URL || '') : String(block.url || '')
   const mode = envOverride ? 'remote' : savedMode === 'ssh' ? 'ssh' : modeIsRemoteLike(savedMode) ? savedMode : 'local'
 
+  // Whether the OS keyring (safeStorage) can encrypt the saved token. When
+  // false the renderer knows to offer the plain-text opt-in in Settings →
+  // Gateway. safeStorage.isEncryptionAvailable can throw on some platforms, so
+  // treat any failure as "not available".
+  let secureTokenStorage = false
+
+  try {
+    secureTokenStorage = Boolean(safeStorage.isEncryptionAvailable())
+  } catch {
+    secureTokenStorage = false
+  }
+
+  // Whether the currently saved token is stored in plain text (the keyring-less
+  // opt-in path). The env override supplies its token from the environment, not
+  // the saved block, so it never reports as plain text here.
+  const remoteTokenPlainText = !envOverride && block.token?.encoding === 'plain'
+
   let remoteOauthConnected = false
 
   if (authMode === 'oauth' && remoteUrl) {
@@ -6877,6 +6918,11 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     cloudOrg: mode === 'cloud' ? String(block.org || '') : '',
     remoteTokenPreview: tokenPreview(remoteToken),
     remoteTokenSet: Boolean(remoteToken),
+    // Whether the OS keyring can encrypt a token; drives the plain-text opt-in
+    // affordance in Settings → Gateway on keyring-less Linux.
+    secureTokenStorage,
+    // Whether the saved token is currently persisted in plain text.
+    remoteTokenPlainText,
     sshHost: (ssh || savedSsh)?.host || '',
     sshUser: (ssh || savedSsh)?.user || '',
     sshPort: (ssh || savedSsh)?.port || null,
@@ -6945,11 +6991,18 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   const cloudOrg = mode === 'cloud' ? String(input.cloudOrg ?? existingBlock.org ?? '').trim() : ''
   const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
 
-  const nextToken = incomingToken
-    ? persistToken
-      ? encryptDesktopSecret(incomingToken)
-      : { encoding: 'plain', value: incomingToken }
-    : existingBlock.token
+  // Persist decision lives in hardening.resolvePersistedRemoteToken so the
+  // IPC-propagation seam (allowPlainTextToken → encryptDesktopSecret opt-in) is
+  // covered by a focused regression test. Pass allowPlainText through RAW — the
+  // helper coerces with `=== true`, so a truthy-non-true value never enables
+  // plain-text storage, and that strictness is asserted in exactly one place.
+  const nextToken = resolvePersistedRemoteToken({
+    incomingToken,
+    persistToken,
+    existingToken: existingBlock.token,
+    allowPlainText: input.allowPlainTextToken,
+    encryptSecret: encryptDesktopSecret
+  })
 
   if (mode === 'ssh') {
     const sshBlock = buildSshBlock(input, savedProfileSsh(existing, key) || rawExistingBlock)
@@ -11755,6 +11808,9 @@ ipcMain.handle('hermes:git:review:shipInfo', async (_event, repoPath) => reviewS
 ipcMain.handle('hermes:git:review:prList', async (_event, repoPath, branches, numbers) =>
   reviewPrList(repoPath, resolveGhBinary(), branches, numbers)
 )
+ipcMain.handle('hermes:git:review:fetchPrComment', async (_event, repoPath, url) =>
+  reviewFetchPrComment(repoPath, resolveGhBinary(), url)
+)
 ipcMain.handle('hermes:git:review:createPr', async (_event, repoPath) =>
   reviewCreatePr(repoPath, resolveGitBinary(), resolveGhBinary())
 )
@@ -12318,6 +12374,15 @@ app.whenReady().then(() => {
   } else if (systemCa.error) {
     rememberLog(`[tls] could not load Windows system CA certificates: ${systemCa.error}`)
   }
+
+  // Keyring-less Linux `--password-store=basic` support. This must run before
+  // createWindow() and anything that could touch safeStorage; the narrow
+  // platform/switch/guard semantics live in the extracted helper.
+  enableBasicPasswordStoreEncryption({
+    platform: process.platform,
+    passwordStoreSwitch: app.commandLine.getSwitchValue('password-store'),
+    safeStorageApi: safeStorage
+  })
 
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())
