@@ -67,7 +67,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("openai/gpt-5.4-mini",                    ""),
     # Google
     ("google/gemini-3.1-pro-preview",          ""),
-    ("google/gemini-3.6-flash",                ""),
+    ("google/gemini-3.7-flash",                ""),
     # xAI
     ("x-ai/grok-4.6",                          ""),
     # DeepSeek
@@ -241,7 +241,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "openai/gpt-5.4-mini",
         # Google
         "google/gemini-3.1-pro-preview",
-        "google/gemini-3.6-flash",
+        "google/gemini-3.7-flash",
         # xAI
         "x-ai/grok-4.6",
         # DeepSeek
@@ -1125,7 +1125,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("novita",         "NovitaAI",                 "NovitaAI (Cloud: Model API, Agent Sandbox, GPU Cloud)"),
     ProviderEntry("lmstudio",       "LM Studio",                "LM Studio (Local desktop app with built-in model server)"),
     ProviderEntry("anthropic",      "Anthropic",                "Anthropic (Claude models via API key or Claude Code)"),
-    ProviderEntry("openai-codex",   "OpenAI Codex",             "OpenAI Codex (Codex CLI via ChatGPT subscription or API key)"),
+    ProviderEntry("openai-codex",   "ChatGPT or Codex Subscription", "ChatGPT or Codex Subscription (Sign in with your ChatGPT account, uses Codex models)"),
     ProviderEntry("openai-api",     "OpenAI API",               "OpenAI API (api.openai.com, API key)"),
     ProviderEntry("alibaba",        "Qwen Cloud",               "Qwen Cloud / DashScope (Qwen + multi-provider)"),
     ProviderEntry("xai-oauth",      "xAI Grok OAuth (SuperGrok / Premium+)", "xAI Grok OAuth (SuperGrok / Premium+ subscription)"),
@@ -1209,7 +1209,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "minimax":  ("MiniMax",         "Global, OAuth Coding Plan & China endpoints",     ["minimax", "minimax-oauth", "minimax-cn"]),
     "xai":      ("xAI Grok",        "Direct API or SuperGrok / Premium+ OAuth",        ["xai", "xai-oauth"]),
     "google":   ("Google Gemini",   "Google AI Studio (API key)",                     ["gemini"]),
-    "openai":   ("OpenAI",          "Codex CLI or direct OpenAI API",                  ["openai-codex", "openai-api"]),
+    "openai":   ("OpenAI",          "ChatGPT/Codex subscription or direct OpenAI API", ["openai-codex", "openai-api"]),
     "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go or Go subscription",            ["opencode-zen", "opencode-go"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
@@ -2872,7 +2872,13 @@ def _strip_vendor_prefix(model_id: str) -> str:
 
 def model_supports_fast_mode(model_id: Optional[str]) -> bool:
     """Return whether Hermes should expose the /fast toggle for this model."""
-    return _is_anthropic_fast_model(model_id) or _is_openai_fast_model(model_id)
+    from agent.model_metadata import is_grok_46_family
+
+    return (
+        _is_anthropic_fast_model(model_id)
+        or _is_openai_fast_model(model_id)
+        or is_grok_46_family(str(model_id or ""))
+    )
 
 
 def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
@@ -2900,6 +2906,7 @@ def resolve_fast_mode_overrides(model_id: Optional[str]) -> dict[str, Any] | Non
     Returns provider-appropriate overrides:
     - OpenAI models: ``{"service_tier": "priority"}`` (Priority Processing)
     - Anthropic models: ``{"speed": "fast"}`` (Anthropic Fast Mode beta)
+    - Grok 4.6: ``{"service_tier": "priority"}`` (xAI Priority Processing)
 
     The overrides are injected into the API request kwargs by
     ``_build_api_kwargs`` in run_agent.py — each API path handles its own

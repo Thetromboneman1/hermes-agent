@@ -58,6 +58,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from hermes_cli import __version__, __release_date__
 from hermes_cli.config import (
+    build_cron_model_impact,
     cfg_get,
     DEFAULT_CONFIG,
     OPTIONAL_ENV_VARS,
@@ -69,6 +70,7 @@ from hermes_cli.config import (
     load_config,
     load_env,
     read_raw_config,
+    resolve_cron_model_drift_defaults,
     save_config,
     save_env_value,
     remove_env_value,
@@ -1036,6 +1038,10 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "skills": "agent",
     "cron": "agent",
     "network": "agent",
+    # `models_dev.url` (mirror override) is the only schema-surfaced
+    # models_dev field — fold it in with the other network/agent plumbing
+    # rather than spawning a one-field orphan tab.
+    "models_dev": "agent",
     "checkpoints": "agent",
     "approvals": "security",
     "human_delay": "display",
@@ -3325,6 +3331,46 @@ async def get_status(profile: Optional[str] = None):
             if all(item.get("status") == "ok" for item in components.values())
             else "degraded"
         )
+
+        # Memory-pressure rollup (NS-656). Distilled from the gateway's
+        # 30s loop heartbeat + lifecycle sentinel — two small file reads,
+        # no gateway IPC. Coarse MB numbers/enums/booleans only: this
+        # endpoint is public (PUBLIC_API_PATHS), same disclosure class as
+        # nous_session_valid above. Deliberately NOT folded into
+        # components/overall — memory pressure is advisory (toast/notice
+        # material), not a liveness verdict, and flipping `overall` to
+        # "degraded" on it would page NAS's availability sweep for a
+        # condition the valve is already handling.
+        try:
+            from gateway.memory_status import collect_memory_status
+
+            status["memory"] = await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(
+                    collect_memory_status,
+                    profile_dir if profile_dir else get_hermes_home(),
+                ),
+            )
+        except Exception:
+            status["memory"] = {"pressure": "unknown"}
+
+        # Disk-usage rollup (NS-656, same lineage as OOF-2/OOF-107 fleet
+        # disk-exhaustion incidents). One statvfs call on HERMES_HOME's
+        # filesystem — coarse MB numbers + enum, same public disclosure
+        # class as the memory block, and equally advisory: not folded
+        # into components/overall.
+        try:
+            from gateway.disk_status import collect_disk_status
+
+            status["disk"] = await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(
+                    collect_disk_status,
+                    profile_dir if profile_dir else get_hermes_home(),
+                ),
+            )
+        except Exception:
+            status["disk"] = {"pressure": "unknown"}
 
         # Deferred FTS rebuild progress (schema v23): lets the desktop /
         # dashboard render a "search index rebuilding: N%" indicator instead
@@ -6804,6 +6850,20 @@ def _apply_model_assignment_sync(
                         "model": str(slot_cfg.get("model", "") or ""),
                     })
 
+        try:
+            effective_config = load_config()
+            effective_provider, effective_model = resolve_cron_model_drift_defaults(
+                effective_config
+            )
+            cron_model_impact = build_cron_model_impact(
+                current_provider=effective_provider or provider,
+                current_model=effective_model or model,
+                config=effective_config,
+            )
+        except Exception:
+            _log.debug("cron model impact inspection failed", exc_info=True)
+            cron_model_impact = build_cron_model_impact(config=cfg, jobs={})
+
         return {
             "ok": True,
             "scope": "main",
@@ -6812,6 +6872,7 @@ def _apply_model_assignment_sync(
             "base_url": model_cfg.get("base_url", ""),
             "gateway_tools": gateway_tools,
             "stale_aux": stale_aux,
+            "cron_model_impact": cron_model_impact,
         }
 
     # scope == "auxiliary"
@@ -9818,7 +9879,7 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
     },
     {
         "id": "openai-codex",
-        "name": "OpenAI OAuth (ChatGPT)",
+        "name": "ChatGPT or Codex Subscription",
         "flow": "device_code",
         "cli_command": "hermes auth add openai-codex",
         "docs_url": "https://platform.openai.com/docs",
