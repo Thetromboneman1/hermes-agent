@@ -197,10 +197,21 @@ SESSION_SEARCH_GUIDANCE = (
     "asking them to repeat themselves."
 )
 
+# NOTE (#82154): the opening sentence is worded deliberately. Anthropic's
+# server-side content filter rejects the previous phrasing ("After completing a
+# complex task (5+ tool calls), fixing a tricky error, or discovering a
+# non-trivial workflow, save the approach as a skill with skill_manage so you
+# can reuse it next time.") on subscription OAuth credentials, and surfaces that
+# rejection as a billing-shaped HTTP 400 ("You're out of extra usage"), which
+# sends users to buy quota they do not need. Bisected against the live API: that
+# sentence alone reproduces the 400 and removing it alone clears it; size and
+# the system[0] identity gate were both ruled out. The reword is empirically
+# validated, not understood — if you rewrite this sentence, re-verify against a
+# subscription OAuth token, not an sk-ant-api… key, which does not hit the
+# filter.
 SKILLS_GUIDANCE = (
-    "After completing a complex task (5+ tool calls), fixing a tricky error, "
-    "or discovering a non-trivial workflow, save the approach as a "
-    "skill with skill_manage so you can reuse it next time.\n"
+    "When you work out a non-trivial workflow, record it with skill_manage "
+    "for future reuse.\n"
     "When using a skill and finding it outdated, incomplete, or wrong, "
     "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
     "Skills that aren't maintained become liabilities.\n"
@@ -627,9 +638,12 @@ def computer_use_guidance(platform_name: Optional[str] = None) -> str:
         "browser chrome, OS permission prompts, native dialogs, and unsupported "
         "targets. Browser setup is a separately approved action; attaching an "
         "existing profile is enforced by cua-driver's immutable permission "
-        "mode: standard requires a certified protected host and fails closed "
-        "when Hermes has none; explicit Hermes YOLO uses a private unrestricted "
-        "daemon after the user's launch/session risk acceptance.\n\n"
+        "mode: in standard mode it requires the user's one-time config opt-in "
+        "`computer_use.grant_existing_profile: true` (if unset, report the "
+        "refusal and name that key — you can never grant it yourself); "
+        "bounded mode authorizes via the user's reviewed capability manifest; "
+        "explicit Hermes YOLO uses a private unrestricted daemon after the "
+        "user's launch/session risk acceptance.\n\n"
         "## Background mode rules\n"
         "- Do NOT use `raise_window=true` on `focus_app` unless the user "
         "explicitly asked you to bring a window to front. Input routing to "

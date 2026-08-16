@@ -29,6 +29,7 @@ import {
   reconcileResumeMessages,
   removeRepresentedLocalLiveProjection,
   resolveResumedBusy,
+  selectBranchMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
   toBranchMessages
@@ -250,6 +251,47 @@ describe('toBranchMessages', () => {
   })
 })
 
+describe('selectBranchMessages', () => {
+  it('uses the complete authoritative transcript for a whole-chat branch', () => {
+    const local = [msg('summary', 'assistant', 'compact summary'), msg('tail', 'assistant', 'latest answer')]
+
+    const authoritative = [
+      msg('old-user', 'user', 'first question', { rowId: 11 }),
+      msg('old-assistant', 'assistant', 'first answer', { rowId: 12 }),
+      msg('tail-user', 'user', 'latest question', { rowId: 13 }),
+      msg('tail-assistant', 'assistant', 'latest answer', { rowId: 14 })
+    ]
+
+    expect(selectBranchMessages(local, authoritative).map(message => message.content)).toEqual([
+      'first question',
+      'first answer',
+      'latest question',
+      'latest answer'
+    ])
+  })
+
+  it('maps a clicked local bubble to the authoritative row before slicing', () => {
+    const local = [
+      msg('tail-user', 'user', 'latest question', { rowId: 13 }),
+      msg('tail-assistant', 'assistant', 'latest answer', { rowId: 14 })
+    ]
+
+    const authoritative = [
+      msg('old-user', 'user', 'first question', { rowId: 11 }),
+      msg('old-assistant', 'assistant', 'first answer', { rowId: 12 }),
+      msg('tail-user', 'user', 'latest question', { rowId: 13 }),
+      msg('tail-assistant', 'assistant', 'latest answer', { rowId: 14 })
+    ]
+
+    expect(selectBranchMessages(local, authoritative, 'tail-assistant').map(message => message.content)).toEqual([
+      'first question',
+      'first answer',
+      'latest question',
+      'latest answer'
+    ])
+  })
+})
+
 describe('chatPartsEquivalent', () => {
   it('returns true for identical text parts', () => {
     const partA = { type: 'text' as const, text: 'Hello world' }
@@ -263,6 +305,13 @@ describe('chatPartsEquivalent', () => {
     const partB = { type: 'text' as const, text: 'World' }
 
     expect(chatPartsEquivalent(partA, partB)).toBe(false)
+  })
+
+  it('returns false when visible timeline boundaries change', () => {
+    const started = { type: 'text' as const, text: 'Hello', timestamp: 10 }
+    const completed = { ...started, completedAt: 11 }
+
+    expect(chatPartsEquivalent(started, completed)).toBe(false)
   })
 
   it('returns true for identical reasoning parts', () => {
@@ -348,6 +397,13 @@ describe('chatPartsEquivalent', () => {
 describe('chatMessagesEquivalent', () => {
   it('returns true for structurally identical messages', () => {
     expect(chatMessagesEquivalent(msg('1', 'user', 'Hello'), msg('1', 'user', 'Hello'))).toBe(true)
+  })
+
+  it('returns false when a visible message timestamp changes', () => {
+    const before = { ...msg('1', 'user', 'Hello'), timestamp: 10 }
+    const after = { ...before, timestamp: 11 }
+
+    expect(chatMessagesEquivalent(before, after)).toBe(false)
   })
 
   it('returns false when text part content differs', () => {
