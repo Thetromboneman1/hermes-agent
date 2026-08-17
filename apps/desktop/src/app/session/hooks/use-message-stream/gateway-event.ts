@@ -1,4 +1,5 @@
 import type { BillingBlock } from '@hermes/shared'
+import { registryBackendScopeKey } from '@hermes/shared'
 import type { HermesSkin } from '@hermes/shared/skin'
 import type { QueryClient } from '@tanstack/react-query'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
@@ -27,7 +28,7 @@ import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock
 import { clearClarifyRequest, normalizeChoices, setClarifyRequest, warnDroppedChoices } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
-import { $gateway } from '@/store/gateway'
+import { $gateway, activeGatewayConnectionId } from '@/store/gateway'
 import { applyGoalStatusText } from '@/store/goals'
 import {
   notifyCronChanged,
@@ -53,6 +54,7 @@ import {
   setSecretRequest,
   setSudoRequest
 } from '@/store/prompts'
+import { providerWaitText, setSessionProviderWait } from '@/store/provider-wait'
 import { recordAgentReaction } from '@/store/reactions-local'
 import {
   $currentCwd,
@@ -213,6 +215,20 @@ const COMPACTION_RESUME_EVENT_TYPES = new Set([
   'tool.complete'
 ])
 
+const PROVIDER_WAIT_SUPERSEDING_EVENT_TYPES = new Set([
+  'error',
+  'message.complete',
+  'message.delta',
+  'message.interim',
+  'message.start',
+  'reasoning.available',
+  'reasoning.delta',
+  'tool.complete',
+  'tool.generating',
+  'tool.progress',
+  'tool.start'
+])
+
 interface GatewayEventDeps {
   activeGatewayProfile: string
   activeSessionIdRef: MutableRefObject<string | null>
@@ -320,6 +336,17 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     (event: RpcEvent) => {
       const payload = event.payload as GatewayEventPayload | undefined
 
+      // "From the active profile" must mean "from the active SOURCE": every
+      // registered connection exposes a 'default' profile, so a bare profile
+      // comparison attributes gateway B's 'default' events to gateway A's
+      // 'default'. Compare the composite (connectionId, profile) scope with
+      // registryBackendScopeKey — untagged primary events keep the legacy
+      // bare-profile behavior byte-identical.
+      const fromActiveSource = (): boolean =>
+        (!event.profile || normalizeProfileKey(event.profile) === normalizeProfileKey($activeGatewayProfile.get())) &&
+        registryBackendScopeKey(event.connectionId ?? null, event.profile ?? null) ===
+          registryBackendScopeKey(activeGatewayConnectionId(), event.profile ?? null)
+
       const occurredAt =
         typeof payload?.timestamp === 'number' && Number.isFinite(payload.timestamp)
           ? payload.timestamp
@@ -387,6 +414,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         setSessionDraftingTool(sessionId, '')
       }
 
+      if (sessionId && PROVIDER_WAIT_SUPERSEDING_EVENT_TYPES.has(event.type)) {
+        setSessionProviderWait(sessionId, '')
+      }
+
       if (event.type === 'gateway.ready') {
         // Seed the active skin into the desktop theme registry without applying,
         // so a fresh connect never overrides the user's persisted desktop theme.
@@ -398,11 +429,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         return
       } else if (event.type === 'skin.changed') {
         // A runtime skin switch (Hermes activating an authored skin, or `/skin`
-        // on another surface). Only the active profile's change repaints.
-        const fromActiveProfile =
-          !event.profile || normalizeProfileKey(event.profile) === normalizeProfileKey($activeGatewayProfile.get())
-
-        if (fromActiveProfile) {
+        // on another surface). Only the active source+profile's change repaints.
+        if (fromActiveSource()) {
           ingestBackendSkin(payload as HermesSkin | undefined, { apply: true })
         }
 
@@ -416,12 +444,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       ) {
         // Change-watcher broadcasts (server._broadcast_watched_changes): the
         // backend's on-disk signature moved. Route to the live-sync ticks the
-        // former pollers now subscribe to. Only the active profile's changes
-        // apply — background profile sockets watch their own homes.
-        const fromActiveChangeProfile =
-          !event.profile || normalizeProfileKey(event.profile) === normalizeProfileKey($activeGatewayProfile.get())
-
-        if (fromActiveChangeProfile) {
+        // former pollers now subscribe to. Only the active source+profile's
+        // changes apply — background profile sockets (and other connections'
+        // gateways) watch their own homes.
+        if (fromActiveSource()) {
           if (event.type === 'pet.changed') {
             notifyPetChanged(payload as PetChangeMeta | undefined)
           } else if (event.type === 'cron.changed') {
@@ -481,12 +507,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // gateway may reconcile the foreground cache. Requiring the renderer's
         // source tag prevents an event queued before a profile swap from being
         // attributed to the newly active profile.
-        if (
-          isActiveEvent &&
-          typeof payload?.approval_mode === 'string' &&
-          event.profile &&
-          normalizeProfileKey(event.profile) === normalizeProfileKey($activeGatewayProfile.get())
-        ) {
+        if (isActiveEvent && typeof payload?.approval_mode === 'string' && event.profile && fromActiveSource()) {
           reconcileApprovalModeForProfile(event.profile, payload.approval_mode)
         }
 
@@ -807,10 +828,13 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
         }
       } else if (event.type === 'thinking.delta') {
-        // thinking.delta carries the kawaii spinner status (face + verb from
-        // KawaiiSpinner), not real reasoning. The bottom-of-thread loading
-        // indicator already covers that UX, so we ignore these events to
-        // avoid a duplicative "Thinking" disclosure showing spinner text.
+        // Most thinking.delta frames are kawaii spinner rewrites and stay out
+        // of the transcript. Explained provider waits are different: the core
+        // emits them after prolonged silence, so name that wait in the existing
+        // bottom-of-thread status row instead of leaving only an unlabeled timer.
+        if (sessionId) {
+          setSessionProviderWait(sessionId, providerWaitText(coerceGatewayText(payload?.text)))
+        }
       } else if (event.type === 'reaction') {
         // Core-detected affection (ily / <3 / good bot) on the user's message.
         // Play hearts only for the visible session so background turns stay quiet.

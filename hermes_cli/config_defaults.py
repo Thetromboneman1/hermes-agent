@@ -163,6 +163,9 @@ DEFAULT_CONFIG = {
         # (docker/modal/ssh — they have their own probe).  Set False to
         # disable entirely.
         "environment_probe": True,
+        # Bot Mode teammate-messaging protocol section (silent unless a
+        # profile is managed by the desktop's Bot Mode).
+        "bot_mode_protocol": True,
         # Embedder-supplied environment description appended to the system
         # prompt's environment-hints block. Lets a host that wraps Hermes
         # (sandbox runner, managed platform) explain the runtime environment
@@ -659,6 +662,17 @@ DEFAULT_CONFIG = {
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
+        "tail_mode": "legacy",        # tail retention policy (#87326):
+                                      #   "legacy" — 0.20×window verbatim tail (default)
+                                      #   "lean"   — clamped 2.5%-of-window tail
+                                      #              (10K floor / 25K cap) plus chunked
+                                      #              digests, a mechanical anchor index,
+                                      #              verbatim user messages, and
+                                      #              session_search recovery pointers in
+                                      #              the summary. ~3x fewer retained
+                                      #              tokens after compaction; costs a few
+                                      #              extra summarizer calls at the
+                                      #              compaction boundary.
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
                                       # survive in the uncompressed tail. 1 = existing
@@ -1129,6 +1143,9 @@ DEFAULT_CONFIG = {
         # replay; different model = digest. Quality holds (memory capture
         # identical, skill near-identical in benchmarks).
         "background_review": {
+            # Master switch for automatic post-turn memory/skill review forks.
+            # false = skip automatic spawns (manual /refine still works).
+            "enabled": True,
             "provider": "auto",
             "model": "",
             "base_url": "",
@@ -2177,6 +2194,16 @@ DEFAULT_CONFIG = {
     #   deny    — block the command and let the agent find another way (default, safe)
     #   approve — auto-approve all dangerous commands in cron jobs
     #
+    # single_query_mode — what to do when a single-query (-q) session hits a
+    # dangerous command. -q runs export HERMES_INTERACTIVE=1 (for interactive
+    # sudo prompts) but have NO user waiting to answer approval prompts — an
+    # unanswered prompt just waits the full timeout then fails closed, so the
+    # agent is forced to work around the block (often via execute_code). This
+    # setting makes that intent explicit:
+    #   deny    — block the command and let the agent find another way (default,
+    #             safe; mirrors cron_mode deny)
+    #   approve — auto-approve all dangerous commands in single-query mode
+    #
     # timeout — seconds to wait for the user's approve/deny before failing
     # closed (deny). Shared by the CLI prompt and gateway/messaging waits.
     # Messaging approvals arrive as a push notification the user may not see
@@ -2186,6 +2213,7 @@ DEFAULT_CONFIG = {
         "mode": "smart",
         "timeout": 300,
         "cron_mode": "deny",
+        "single_query_mode": "deny",
         # Operator-customizable policy text for smart approvals. When
         # non-empty, this is appended to the smart-approval guardian's
         # SYSTEM prompt (trusted channel) as additional rules — e.g.
@@ -2274,6 +2302,10 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        # Persisted acknowledgement for unattended model overrides whose tier
+        # lets the vendor train on prompts/completions. The startup guard still
+        # prints the full warning on every run and never bypasses cost guards.
+        "allow_data_training_tiers_noninteractive": False,
         # Human approval presentation transport. "builtin" preserves the
         # current CLI/TUI/gateway/ACP surfaces. A plugin transport is used only
         # when named explicitly here. Transport timeout/error/invalid response
@@ -3283,21 +3315,23 @@ DEFAULT_CONFIG = {
         #   True  = always disable the overlay
         #   False = always enable the overlay
         "no_overlay": None,
-        # cua-driver permission mode for this Hermes install.
+        # cua-driver permission mode for each Hermes computer-use runtime.
         #   standard (default) — cua-driver's own approval boundary. Protected
         #     operations (e.g. attaching to an existing signed-in browser
         #     profile) fail closed unless grant_existing_profile is enabled
         #     below.
         #   bounded — repeatable automation under a user-reviewed session
-        #     policy manifest (set capability_manifest below). No runtime
+        #     capability manifest (set capability_manifest below). No runtime
         #     prompts; anything outside the manifest fails closed inside
         #     cua-driver.
         # `unrestricted` is intentionally NOT accepted here: it stays bound to
         # the explicit per-session YOLO toggle so a config line can never
         # silently bypass approvals.
         "permission_mode": "standard",
-        # Absolute or ~ path to the reviewed cua-driver session-policy
-        # manifest YAML used when permission_mode is "bounded". See
+        # Absolute or ~ path to the reviewed cua-driver capability
+        # manifest used when permission_mode is "bounded". Hermes passes the
+        # canonical --capability-manifest and --approve-capability-manifest
+        # flags when it launches the runtime. See
         # https://cua.ai/docs/reference/cua-driver/permission-modes
         "capability_manifest": "",
         # Pre-authorize existing-profile browser attachment in standard mode
