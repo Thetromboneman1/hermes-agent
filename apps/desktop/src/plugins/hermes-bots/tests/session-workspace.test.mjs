@@ -122,15 +122,19 @@ test('sessions workspace: an in-flight open cannot restore selection after gatew
   assert.deepEqual(plain(runtime.__sessions.$botSelectedSessions.get()), {})
 })
 
-test('source contract: the primary bot click keeps canonical chat while Sessions is secondary', () => {
-  assert.match(pluginSource, /const open = async \(\) => \{[\s\S]*openBotCanonicalChat\(bot\.name, meta\?\.chat\)/)
+test('source contract: bot rows and Active now activate the owner before canonical chat', () => {
+  assert.match(pluginSource, /async function prepareBotSource\(bot, pinnedChat\)/)
+  assert.match(pluginSource, /await host\.ensureAgent\(bot\.connectionId, bot\.name\)/)
+  assert.match(pluginSource, /host\.request\('profiles\.list', \{\}\)/)
+  assert.match(pluginSource, /const open = async \(\) => \{[\s\S]*await prepareBotSource\(bot, pinnedChat\)[\s\S]*openBotCanonicalChat\(bot\.name, pinnedChat, bot\.last_session\)/)
+  assert.match(pluginSource, /onOpen: bot => \{[\s\S]*await prepareBotSource\(bot, pinnedChat\)[\s\S]*openBotCanonicalChat\(bot\.name, pinnedChat, bot\.last_session\)/)
   assert.match(pluginSource, /openBotSessionsWorkspace\(bot\)[\s\S]*children: 'Sessions'/)
 })
 
 test('source contract: workspaces disclose the bounded recent-session inventory', () => {
   assert.match(pluginSource, /queryKey: \[ID, 'profile-sessions', botName, gatewayGeneration\]/)
   assert.match(pluginSource, /enabled: Boolean\(botName\)/)
-  assert.match(pluginSource, /host\.request\('session\.list', \{ profile: botName, limit: PROFILE_SESSION_LIST_LIMIT \}\)/)
+  assert.match(pluginSource, /host\.request\('session\.list', \{ profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true \}\)/)
   assert.match(pluginSource, /Showing the \$\{PROFILE_SESSION_LIST_LIMIT\} most recent sessions\./)
   assert.match(pluginSource, /No matching sessions in the \$\{PROFILE_SESSION_LIST_LIMIT\} most recent\./)
   assert.doesNotMatch(pluginSource, /children: 'Activate profile'/)
@@ -141,4 +145,3 @@ test('source contract: session controls expose filter and selection state to ass
   assert.match(pluginSource, /'aria-label': 'Filter sessions'/)
   assert.match(pluginSource, /'aria-current': active \? 'page' : undefined/)
 })
-

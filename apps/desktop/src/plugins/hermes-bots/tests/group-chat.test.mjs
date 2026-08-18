@@ -62,11 +62,15 @@ function load(turnScript) {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, $groupChats, $groupNeedsYou, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
-  context.plugin.register({ storage: { get: () => null, set: () => undefined }, register: () => undefined })
-  return { ...context.__gc, calls }
+  const storageWrites = new Map()
+  context.plugin.register({
+    storage: { get: () => null, set: (key, value) => storageWrites.set(key, value) },
+    register: () => undefined
+  })
+  return { ...context.__gc, calls, storageWrites }
 }
 
 const MEMBERS = [{ name: 'research', title: '' }, { name: 'builder', title: '' }, { name: 'ops', title: 'The Ops' }]
@@ -237,9 +241,144 @@ test('log trimming keeps watermarks consistent', () => {
   assert.equal(watermarks.builder, 0)
 })
 
-test('source contract: workspace + header affordance + prompt rules are wired', () => {
+test('source contract: workspace + main-window door + prompt rules are wired', () => {
   assert.match(pluginSource, /function GroupChatWorkspace\(/)
-  assert.match(pluginSource, /Open chat/)
+  // Group rows open through the main-window door, feature-detected with the
+  // in-panel room as the older-desktop fallback.
+  assert.match(pluginSource, /function openGroupChat\(/)
+  assert.match(pluginSource, /typeof host\.openWorkspace === 'function'/)
+  assert.match(pluginSource, /\$groupChatWorkspace\.set\(group\)/)
   assert.match(pluginSource, /reply with exactly "\(pass\)"/i)
   assert.match(pluginSource, /\[Group chat: "\$\{groupName\}"\]/)
+})
+
+test('disband: clears grouping meta, room log, workspace, needs-you; keeps sessions in storage map only for other rooms', async () => {
+  const gc = load(() => '(pass)')
+
+  // Two rooms; disband one.
+  gc.sendToGroupChat('Keep', [{ name: 'research', title: '' }], 'hello keepers')
+  for (let i = 0; i < 200 && (gc.$groupChats.get().Keep || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  gc.sendToGroupChat('Gone', [{ name: 'builder', title: '' }], 'hello goners')
+  for (let i = 0; i < 200 && (gc.$groupChats.get().Gone || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  gc.$botMeta.set({ builder: { group: 'Gone' }, research: { group: 'Keep' } })
+  gc.$groupChatWorkspace.set('Gone')
+  gc.$groupNeedsYou.set({ Gone: true, Keep: true })
+
+  await gc.disbandGroupChat('Gone', ['builder'])
+
+  // Room state: gone from the atom (no running drive, so no tombstone).
+  assert.equal(gc.$groupChats.get().Gone, undefined)
+  assert.ok(gc.$groupChats.get().Keep, 'other rooms untouched')
+  // The open room view closed; needs-you cleared for the disbanded room only.
+  assert.equal(gc.$groupChatWorkspace.get(), null)
+  assert.equal(gc.$groupNeedsYou.get().Gone, undefined)
+  assert.equal(gc.$groupNeedsYou.get().Keep, true)
+  // Members ungrouped; other bots keep their group.
+  assert.equal(gc.$botMeta.get().builder.group, null)
+  assert.equal(gc.$botMeta.get().research.group, 'Keep')
+  // Persisted room map no longer carries the room.
+  const durable = gc.storageWrites.get('group-chats')
+  assert.ok(durable && !('Gone' in durable), 'disbanded room not persisted')
+  assert.ok('Keep' in durable, 'surviving room still persisted')
+})
+
+test('disband: a running room leaves an epoch-bumped empty tombstone so in-flight turns bail', async () => {
+  const gc = load(() => '(pass)')
+
+  gc.sendToGroupChat('Live', [{ name: 'research', title: '' }], 'kick off')
+  for (let i = 0; i < 200 && (gc.$groupChats.get().Live || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  // Simulate a drive still in flight at disband time.
+  const rooms = { ...gc.$groupChats.get() }
+  rooms.Live = { ...rooms.Live, running: true, epoch: 3 }
+  gc.$groupChats.set(rooms)
+
+  await gc.disbandGroupChat('Live', ['research'])
+
+  const tomb = gc.$groupChats.get().Live
+  assert.ok(tomb, 'tombstone present while a drive is mid-turn')
+  assert.equal(tomb.log.length, 0)
+  assert.equal(tomb.running, false)
+  assert.equal(tomb.epoch, 4, 'epoch bumped so the loop bails at its member boundary')
+  const durable = gc.storageWrites.get('group-chats')
+  assert.ok(!durable || !('Live' in (durable || {})), 'tombstone is never persisted')
+})
+
+test('source contract: workspace header offers disband behind a ConfirmDialog', () => {
+  assert.match(pluginSource, /function disbandGroupChat\(/)
+  assert.match(pluginSource, /Disband group chat\?/)
+  assert.match(pluginSource, /title: `Disband the \$\{group\} group chat`/)
+})
+
+test('default profile speaks as Hermes in room transcripts, not @default', () => {
+  const gc = load(() => '(pass)')
+  const line = gc.formatGroupChatLine({ from: { kind: 'member', name: 'default' }, text: 'hello room' }, 'builder')
+  assert.equal(line, 'Hermes: hello room')
+  assert.doesNotMatch(line, /default/)
+
+  // Other members keep their profile name; the (you) suffix survives.
+  const you = gc.formatGroupChatLine({ from: { kind: 'member', name: 'default' }, text: 'hi' }, 'default')
+  assert.equal(you, 'Hermes (you): hi')
+  const plain = gc.formatGroupChatLine({ from: { kind: 'member', name: 'builder' }, text: 'yo' }, 'research')
+  assert.equal(plain, 'builder: yo')
+})
+
+test('turn prompt addresses the default profile as @hermes', () => {
+  const gc = load(() => '(pass)')
+  const prompt = gc.buildGroupChatTurnPrompt({
+    groupName: 'Core',
+    members: [{ name: 'default', title: '' }, { name: 'builder', title: '' }],
+    viewer: { name: 'default', title: '' },
+    deltaLines: []
+  })
+  assert.match(prompt, /You are @hermes,/)
+  assert.doesNotMatch(prompt, /@default\b/)
+
+  const peerView = gc.buildGroupChatTurnPrompt({
+    groupName: 'Core',
+    members: [{ name: 'default', title: '' }, { name: 'builder', title: '' }],
+    viewer: { name: 'builder', title: '' },
+    deltaLines: []
+  })
+  assert.match(peerView, /group chat with @hermes/)
+})
+
+test('mention routing: @hermes resolves to the default member', () => {
+  const gc = load(() => '(pass)')
+  const members = [{ name: 'default', title: '' }, { name: 'builder', title: '' }]
+  const parsed = gc.parseGroupChatMentions('@hermes take a look', members)
+  assert.equal(parsed.mentioned.has('default'), true)
+  assert.equal(parsed.mentioned.size, 1)
+})
+
+test('source contract: workspace speaker labels use displayName with a click-to-reveal handle', () => {
+  // Speaker labels come from the roster displayName (default → Hermes)…
+  assert.match(pluginSource, /displayName\(member \|\| \{ name: entry\.from\.name \}, meta\)/)
+  // …and clicking a speaker reveals the full disambiguated handle, with the
+  // gateway/device name appended for cross-connection speakers.
+  assert.match(pluginSource, /setRevealedSpeaker\(revealed \? null : entryKey\)/)
+  assert.match(pluginSource, /\$\{display\}\$\{entry\.from\.source \? `-\$\{entry\.from\.source\}` : ''\} \(@\$\{botHandle\(entry\.from\.name, member \|\| undefined\)\}\)/)
+})
+
+test('source contract: room messages carry the speaker avatar via the roster appearance pipeline', () => {
+  const start = pluginSource.indexOf('function GroupChatWorkspace(')
+  const end = pluginSource.indexOf('function BotsPane(')
+  const workspace = pluginSource.slice(start, end === -1 ? undefined : end)
+
+  // Per-message avatar: appearance resolved the same way as BotRow (custom
+  // image/pet honored, backfilled PNG dropped so the math face animates).
+  assert.match(workspace, /botAppearance\(entry\.from\.name, meta\)/)
+  assert.match(workspace, /image && !isBackfilledFacePng\(image\)/)
+  assert.match(workspace, /jsx\(BotFace, \{\s*shape,\s*color,\s*image: photo \? image : null,\s*size: 24,\s*name: entry\.from\.name/)
+
+  // Header shows the member faces (capped) with a names tooltip.
+  assert.match(workspace, /members\.slice\(0, 6\)\.map\(/)
+  assert.match(workspace, /title: members\.map\(b => displayName\(b, botRosterMeta\(b, allMeta\)\)\)\.join\(', '\)/)
 })

@@ -19,19 +19,29 @@
  */
 
 import { atom, computed, type ReadableAtom } from 'nanostores'
+import type { ReactNode } from 'react'
 
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import type { ClientSessionState } from '@/app/types'
-import { $narrowViewport } from '@/components/pane-shell/tree/store'
+import {
+  $narrowViewport,
+  $paneVisible,
+  registerPaneCloser,
+  removeTreePane,
+  revealTreePane
+} from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
+import { registry } from '@/contrib/registry'
 import { deleteProfile, getLogs, getStatus, type HermesGateway } from '@/hermes'
 import {
   $gateway,
+  activeGatewayConnectionId,
   openGatewayForAgent,
   openGatewayForProfile,
   requestGatewayForAgent,
-  requestGatewayForProfile
+  requestGatewayForProfile,
+  retireLocalProfileGateways
 } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import {
@@ -46,7 +56,14 @@ import {
   setActiveProfile,
   setShowAllProfiles
 } from '@/store/profile'
-import { $activeSessionId, $currentCwd, $currentModel, $gatewayState, $selectedStoredSessionId } from '@/store/session'
+import {
+  $activeSessionId,
+  $connection,
+  $currentCwd,
+  $currentModel,
+  $gatewayState,
+  $selectedStoredSessionId
+} from '@/store/session'
 import {
   $focusedRuntimeId,
   $focusedSessionState,
@@ -162,6 +179,21 @@ if (typeof window !== 'undefined') {
  *  state — the same readout the core statusbar's context chip paints. */
 const $focusedUsage = computed($focusedSessionState, state => state?.usage ?? null)
 
+const $activeConnectionId = computed($connection, connection => {
+  if (!connection) {
+    return null
+  }
+
+  if (connection.connectionId) {
+    return connection.connectionId
+  }
+
+  // mode:'local' used to report null, which made Bot Mode fall back to the
+  // registry primary (often an SSH box) and treat Spark as the active source
+  // while this window was actually local.
+  return connection.mode === 'local' ? 'local' : null
+})
+
 export const host = {
   state: {
     /** Runtime id of the active chat session (null on a fresh draft). */
@@ -177,6 +209,8 @@ export const host = {
     busy: readonlyAtom<boolean>($focusedBusy),
     /** Runtime session id → mid-turn. Not socket state; see `gateway`. */
     busyBySession: readonlyAtom<Record<string, boolean>>($busyBySession),
+    /** Registry source that owns the active gateway, when source-scoped. */
+    connectionId: readonlyAtom<null | string>($activeConnectionId),
     /** Active workspace cwd ('' when detached). */
     cwd: readonlyAtom<string>($currentCwd),
     /** Runtime id of the FOCUSED chat session — the interacted tile, else the
@@ -269,7 +303,17 @@ export const host = {
     // backend can't clobber the pill back to the deleted profile).
     const wasActive = normalizeProfileKey(name) === normalizeProfileKey($activeGatewayProfile.get())
 
+    // A hover-warmed Bot Mode row owns a retained renderer socket. Retire it
+    // before Electron stops the profile backend so the socket closure cannot
+    // schedule a reconnect that resurrects the deleted profile.
+    retireLocalProfileGateways(name)
     await deleteProfile(name)
+
+    // The profile rail paints from the shared $profiles cache; without a
+    // refresh the deleted profile's badge survives and clicking it starts a
+    // doomed spawn-retry loop against Electron's deletion guard (#88769).
+    // Best-effort: the delete itself already succeeded.
+    await refreshProfiles().catch(() => undefined)
 
     if (wasActive) {
       selectProfile('default')
@@ -278,6 +322,15 @@ export const host = {
   },
 
   // ── Multi-source agents (the Bot Mode door) ───────────────────────────────
+
+  /** Registry connection id serving the gateway `host.request` currently hits
+   *  — null for the local/legacy primary path. Roster UIs need this to tell
+   *  "a row from the backend I'm already showing" apart from "a row from
+   *  another source": two connections can both expose a 'default' profile,
+   *  and matching by profile name alone duplicates every agent when the
+   *  active gateway is a registered remote. Re-read per use — it changes on
+   *  profile/agent swaps. */
+  activeConnectionId: (): null | string => activeGatewayConnectionId(),
 
   /** The registered connection list (labels, kinds, primary) — token bytes
    *  never included. Rejects on Desktop builds without the registry. */
@@ -349,6 +402,59 @@ export const host = {
     )
   },
 
+  /** Open (or re-front) a plugin-rendered MAIN-AREA workspace tile — the same
+   *  surface a session tile or a preview occupies: a closeable tab docked
+   *  beside the main workspace, taking over the chat area when active. This is
+   *  the generic main-view door for plugins whose surface is not a stored
+   *  session (`openSession` stays the door for those). Re-opening the same
+   *  `id` refreshes `render`/`title` in place and fronts the existing tab
+   *  instead of stacking a duplicate. Returns a disposer that closes the tab;
+   *  the tab's own Close (⌘W / strip ✕) routes through the same teardown and
+   *  fires `onClose`. Feature-detect on older desktops
+   *  (`typeof host.openWorkspace === 'function'`) and keep an in-panel
+   *  fallback. */
+  openWorkspace: (
+    id: string,
+    options: { minWidth?: string; onClose?: () => void; render: () => ReactNode; title?: string }
+  ): (() => void) => {
+    const key = (id ?? '').trim()
+
+    if (!key || typeof options?.render !== 'function') {
+      throw new Error('openWorkspace: an id and a render function are required')
+    }
+
+    const paneId = `plugin-workspace:${key}`
+
+    const dispose = registry.register({
+      area: 'panes',
+      data: {
+        // The session-tile shape: a full workspace surface docked beside main,
+        // closeable so it keeps its tab when it lands in a zone of its own.
+        dock: { pane: 'workspace', pos: 'center' },
+        minWidth: options.minWidth ?? '22rem',
+        placement: 'main'
+      },
+      id: paneId,
+      render: options.render,
+      title: options.title ?? key
+    })
+
+    const close = () => {
+      registerPaneCloser(paneId)
+      dispose()
+      removeTreePane(paneId)
+      options.onClose?.()
+    }
+
+    // Route the tab's Close through OUR teardown: without a closer, closing a
+    // core-sourced contributed pane only dismisses it and the registration
+    // would leak past the plugin surface that owns it.
+    registerPaneCloser(paneId, close)
+    revealTreePane(paneId)
+
+    return close
+  },
+
   /** Start a fresh chat draft, optionally pointed at another profile (its
    *  backend spins up in the background — same door the sidebar's per-profile
    *  "+" uses). */
@@ -356,6 +462,14 @@ export const host = {
     newSessionInProfile((profile ?? '').trim() || $activeGatewayProfile.get())
     window.location.hash = '#/'
   },
+
+  /** Reactive on-screen visibility of a contributed pane: true while it is in
+   *  the layout tree, not dismissed/hidden, its zone un-minimized, AND holding
+   *  its zone's active tab slot (a lone pane in its own zone counts). The
+   *  contribution-scoped pane id is `<pluginId>:<paneId>`. Memoized per id —
+   *  safe to call in render. Feature-detect on older desktops
+   *  (`typeof host.paneVisibility === 'function'`). */
+  paneVisibility: (paneId: string): ReadableAtom<boolean> => $paneVisible(paneId),
 
   /** HEAR the gateway stream (message deltas, session lifecycle, tool
    *  activity, …) by event type — `'*'` for everything. Returns a disposer.
@@ -425,7 +539,13 @@ export const host = {
 // Every contribution surface, plugin-reachable: register keybinds, palette
 // commands, routes, themes, panes, composer extensions, and bar items with
 // the same area ids + payload types core uses.
-export { COMPOSER_AREAS, type ComposerAttachmentProvider, type ComposerMiddleware } from '@/app/chat/composer/contrib'
+export {
+  COMPOSER_AREAS,
+  type ComposerAtCompletionItem,
+  type ComposerAtCompletionSource,
+  type ComposerAttachmentProvider,
+  type ComposerMiddleware
+} from '@/app/chat/composer/contrib'
 
 // -- ui: the design language --------------------------------------------------
 
@@ -449,8 +569,8 @@ export {
   type ModelMenuController
 } from '@/app/shell/model-catalog-menu'
 export type { StatusbarItem } from '@/app/shell/statusbar-controls'
-
 export type { TitlebarTool } from '@/app/shell/titlebar-controls'
+
 /** THE whole Capabilities surface (Skills / Tools / MCP tabs, installed
  *  lists, full-skill detail pane, embedded hub picker with one-click
  *  installs). For plugin dialogs pass `embedded` (tab state stays local —
@@ -531,15 +651,15 @@ export type {
   PluginRestOptions,
   PluginStorage
 } from '@/contrib/plugin'
-
-// -- contracts ----------------------------------------------------------------
-
 /** Mount-scoped contribution: while the rendering component is mounted, its
  *  children render in the target area's slot; unmount disposes it. Use for
  *  page-owned chrome (a page's titlebar control leaves with the page) —
  *  `ctx.register` stays the door for permanent contributions. Namespace the
  *  id with your plugin slug (`kanban:board-switcher`). */
 export { Contribute, type ContributeProps } from '@/contrib/react/contribute'
+
+// -- contracts ----------------------------------------------------------------
+
 export type { Contribution } from '@/contrib/types'
 /** The live gateway instance type — for typing the `gateway` prop `McpTab`
  *  takes; obtain the instance from `host.getGateway()`. */
@@ -560,6 +680,11 @@ export {
   useI18n,
   usePluginI18n
 } from '@/i18n'
+/** THE way to run a decorative rAF animation (avatars, shimmer, sprites):
+ *  fps budget + hidden/minimized/unfocused pause + idle dormancy + teardown.
+ *  Plugins must route animation clocks through this instead of raw rAF loops
+ *  so a disabled plugin or an empty roster costs zero frames. */
+export { type BudgetedLoop, type BudgetedLoopOptions, createBudgetedLoop } from '@/lib/budgeted-loop'
 /** THE compact-number formatter — every user-facing count/token figure goes
  *  through here (1230 → "1.2k", 1_500_000 → "1.5M"). Don't hand-roll `/1000`. */
 export { compactNumber } from '@/lib/format'
@@ -576,8 +701,6 @@ export { profileColor, profileColorSoft } from '@/lib/profile-color'
  *  `ctx.socket` frame invalidating a query). Inside components keep using
  *  `useQueryClient`. */
 export { queryClient } from '@/lib/query-client'
-
-export const PANES_AREA = 'panes'
 /** Hermes' reasoning levels + their compact labels, so a plugin surfacing a
  *  thinking depth uses the same scale and spelling as the rest of the app. */
 export {
@@ -587,14 +710,23 @@ export {
   type ReasoningEffort,
   reasoningEffortLabel
 } from '@/lib/reasoning-effort'
-export const STATUSBAR_AREAS = { left: 'statusBar.left', right: 'statusBar.right' } as const
-export const TITLEBAR_AREAS = { center: 'titleBar.center', left: 'titleBar.left', right: 'titleBar.right' } as const
 
+export const PANES_AREA = 'panes'
 /** The app's own gateway-readiness evaluation (setup.status +
  *  setup.runtime_check, reconciled) — pass `host.request`. Don't hand-roll
  *  readiness from raw RPC shapes. */
 export { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
+export const STATUSBAR_AREAS = { left: 'statusBar.left', right: 'statusBar.right' } as const
+export const TITLEBAR_AREAS = { center: 'titleBar.center', left: 'titleBar.left', right: 'titleBar.right' } as const
+
 export { coarseElapsed, fmtDateTime, fmtDayTime, relativeTime } from '@/lib/time'
+/** The transcript as a contribution area: register a named `::directive{...}`
+ *  and the model can render your component inline in assistant messages. */
+export {
+  TRANSCRIPT_DIRECTIVE_AREA,
+  type TranscriptDirectiveContribution,
+  type TranscriptDirectiveProps
+} from '@/lib/transcript-directives'
 export { cn } from '@/lib/utils'
 export { THEMES_AREA } from '@/themes/user-themes'
 export type { RpcEvent, StatusResponse } from '@/types/hermes'
@@ -607,3 +739,6 @@ export { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 /** Plugin-local reactive state (share between a trigger and its panel, poll
  *  loops, cross-component signals) — the same primitive `host.state` uses. */
 export { atom, computed } from 'nanostores'
+/** Markdown renderer (same pipeline core chat surfaces use) so plugins render
+ *  message text as a preview instead of raw Markdown source. */
+export { Streamdown } from 'streamdown'
