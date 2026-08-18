@@ -178,8 +178,30 @@ jobs:
           echo "backup_branch=$BACKUP_BRANCH" >> "$GITHUB_OUTPUT"
           git push origin "$ORIGINAL_SHA:refs/heads/$BACKUP_BRANCH"
 
+          # Generated documentation commits are derived, branch-specific
+          # snapshots. Drop them from the rebase todo and regenerate once from
+          # the final tree so repeated syncs cannot accumulate conflicts.
+          SEQUENCE_EDITOR="$RUNNER_TEMP/drop-generated-doc-commits.py"
+          cat > "$SEQUENCE_EDITOR" <<'PY'
+          import pathlib
+          import sys
+
+          todo = pathlib.Path(sys.argv[1])
+          lines = todo.read_text(encoding="utf-8").splitlines()
+          marker = "docs: refresh generated repository state [skip ci]"
+          retained = [line for line in lines if marker not in line]
+          commands = [line for line in retained if line and not line.startswith("#")]
+          if not commands:
+              retained.insert(0, "exec true")
+          todo.write_text(
+              "\n".join(retained) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
           REBASE_OK=false
-          if git rebase "refs/remotes/origin/main"; then
+          if GIT_SEQUENCE_EDITOR="python3 $SEQUENCE_EDITOR" \
+            git rebase -i "refs/remotes/origin/main"; then
             REBASE_OK=true
           else
             # Generated repository fingerprints are branch-specific and may
