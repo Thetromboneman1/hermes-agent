@@ -14,6 +14,7 @@ import {
   clipboard,
   dialog,
   net as electronNet,
+  webContents as electronWebContents,
   globalShortcut,
   ipcMain,
   Menu,
@@ -116,6 +117,8 @@ import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
+import { installDesktopPluginFromGit, probePluginRepo } from './desktop-plugin-install'
+import { resolveDesktopRemoteRoute } from './desktop-remote-route'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -203,7 +206,6 @@ import { cursorPointInWindow } from './hud-cursor'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
-import { imageContextMenuItems } from './image-context-menu'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
@@ -239,7 +241,12 @@ import { selectPoolEvictions } from './pool-eviction'
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
-import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
+import { PreviewReachRegistry } from './preview-reach'
+import {
+  createPrimaryRemoteConnection,
+  FirstRunSetupResetError,
+  runPrimaryBackendStartup
+} from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import {
   assertLocalProfileCanStart,
@@ -253,8 +260,11 @@ import { prepareProfileRenameLifecycle, profileRenameFromRequest } from './profi
 import {
   buildSidebarSessionSliceParams,
   fetchPrimaryProfileSessions,
+  fetchRegistrySessionRows,
   fetchRemoteProfileSessions,
-  mergeProfileSessionWindow
+  mergeProfileSessionWindow,
+  type RegistrySessionSource,
+  spliceRegistrySessionRows
 } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
@@ -288,6 +298,13 @@ import {
 } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
+import {
+  glassActive,
+  normalizeState as normalizeTranslucency,
+  vibrancyFor as vibrancyForTranslucency,
+  windowBackingOptions,
+  windowOpacityFor
+} from './translucency'
 import {
   compareApiUrl,
   parseCompareBehindCount,
@@ -871,54 +888,118 @@ function writePersistedThemeSource(mode) {
 nativeTheme.themeSource = readPersistedThemeSource()
 
 // Window translucency (see-through window). One lever, 0–100; 0 = off (the
-// default). Mapped to the native window opacity so the desktop shows through
-// the whole window. Persisted so a cold launch applies it at window creation,
-// before the renderer reports its value. macOS + Windows only; `setOpacity` is
-// a no-op on Linux. See store/translucency.
+// default). Two modes share the lever (see electron/translucency.ts and
+// store/translucency): 'clear' maps it to the native window opacity so the
+// desktop shows through the whole window; 'glass' (macOS) keeps the window
+// opaque and lets the renderer thin its surfaces over the vibrancy material
+// instead — a matte blur with full-contrast text. Persisted so a cold launch
+// applies it at window creation, before the renderer reports its value.
+// macOS + Windows only; `setOpacity` is a no-op on Linux.
 const TRANSLUCENCY_CONFIG_PATH = path.join(app.getPath('userData'), 'translucency.json')
-
-function clampIntensity(value) {
-  const n = Math.round(Number(value))
-
-  return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : 0
-}
 
 function readPersistedTranslucency() {
   try {
-    return clampIntensity(JSON.parse(fs.readFileSync(TRANSLUCENCY_CONFIG_PATH, 'utf8')).intensity)
+    return normalizeTranslucency(JSON.parse(fs.readFileSync(TRANSLUCENCY_CONFIG_PATH, 'utf8')), IS_MAC)
   } catch {
-    return 0
+    return normalizeTranslucency(null, IS_MAC)
   }
 }
 
-function writePersistedTranslucency(intensity) {
+function writePersistedTranslucency(state) {
   try {
     fs.mkdirSync(path.dirname(TRANSLUCENCY_CONFIG_PATH), { recursive: true })
-    fs.writeFileSync(TRANSLUCENCY_CONFIG_PATH, JSON.stringify({ intensity }, null, 2), 'utf8')
+    fs.writeFileSync(TRANSLUCENCY_CONFIG_PATH, JSON.stringify(state, null, 2), 'utf8')
   } catch (error) {
     rememberLog(`[translucency] write failed: ${error.message}`)
   }
 }
 
-let translucencyIntensity = readPersistedTranslucency()
+let translucencyState = readPersistedTranslucency()
 
-// Map the 0–100 lever to a window opacity. Floor at 0.3 so the most see-through
-// setting is still usable rather than nearly invisible. 0 → fully opaque.
+// Chat windows whose webContents backing follows translucency (primary,
+// instance peers, session windows). The HUD / pet overlay / quick entry /
+// wake indicator are `transparent: true` windows that own their backgrounds —
+// painting a themed backing onto them would turn them into opaque rectangles.
+const translucencyBackedWindows = new WeakSet()
+
 function windowOpacity() {
-  return 1 - (translucencyIntensity / 100) * 0.7
+  return windowOpacityFor(translucencyState)
 }
 
 // Re-apply translucency to a live window (runtime toggle, no recreation).
 // `setOpacity` is a no-op on Linux, which is fine — it just stays opaque there.
-function applyWindowTranslucency(win) {
-  if (!win || win.isDestroyed() || typeof win.setOpacity !== 'function') {
+// The backing swap is the glass half: Chromium composites the page against
+// the window backing BEFORE macOS composites the window, so glass needs the
+// backing dropped for the vibrancy material to reach a transparent page, and
+// every other state needs the opaque themed backing (anti-flash, and it is
+// what makes clear mode fade to the desktop instead of to black).
+//
+// `changed` says which native properties actually need touching. Dragging the
+// intensity slider emits ~100 updates, and in glass mode NONE of them change
+// anything native — the effect is painted by the renderer and windowOpacityFor
+// returns 1 throughout. Re-issuing setVibrancy on every tick restarts its
+// 150ms animation before macOS can settle the material, which reads as jank
+// and flattens the frost levels into each other.
+//
+// CAUTION (measured, macOS 26 / Electron 40): a runtime
+// setBackgroundColor('#00000000') is silently LOST on a window whose
+// compositor hasn't been up for a few seconds — including calls from
+// 'ready-to-show' and 'did-finish-load'. Cold launches therefore must not
+// rely on this path: windows are BORN with the right backing
+// (windowBackingOptions at each creation site). This path only has to cover
+// live toggles from Settings, where the window is long settled.
+function applyWindowTranslucency(win, changed = { backing: true, material: true, opacity: true }) {
+  if (!win || win.isDestroyed()) {
     return
   }
 
   try {
-    win.setOpacity(windowOpacity())
+    // Backing swap + material are scoped to registered chat windows (see
+    // translucencyBackedWindows above).
+    if (translucencyBackedWindows.has(win)) {
+      if (changed.backing && typeof win.setBackgroundColor === 'function') {
+        win.setBackgroundColor(glassActive(translucencyState) ? '#00000000' : getWindowBackgroundColor())
+      }
+
+      // Glass frost level = the vibrancy material (macOS has no blur-radius
+      // knob). Animate the hop so a deliberate frost switch feels continuous —
+      // which only works if we don't re-issue it on unrelated updates.
+      if (changed.material && IS_MAC && typeof win.setVibrancy === 'function') {
+        win.setVibrancy(vibrancyForTranslucency(translucencyState), { animationDuration: 150 })
+      }
+    }
+
+    if (changed.opacity && typeof win.setOpacity === 'function') {
+      win.setOpacity(windowOpacity())
+    }
   } catch (error) {
     rememberLog(`[translucency] apply failed: ${error.message}`)
+  }
+}
+
+// Constructor options every chat window shares for its translucency surface:
+// the vibrancy material, the native opacity, and the webContents backing under
+// the CURRENT state. Glass omits backgroundColor so vibrancy shows from the
+// first frame (a non-transparent window silently ignores constructor alpha,
+// and runtime swaps are lost early in a window's life — see
+// applyWindowTranslucency); otherwise the opaque themed anti-flash backing.
+//
+// Call sites also register the window in translucencyBackedWindows so a live
+// toggle can re-apply. The HUD, pet overlay, quick entry and wake indicator
+// are `transparent: true` windows that own their backgrounds and are
+// deliberately not chat windows.
+function chatWindowSurfaceOptions() {
+  return {
+    vibrancy: IS_MAC ? vibrancyForTranslucency(translucencyState) : undefined,
+    // Pin the material to its ACTIVE appearance: several NSVisualEffectView
+    // materials collapse to a shared inactive look when the window blurs
+    // (measured on macOS 26: sidebar, popover and under-window composited
+    // pixel-identically once unfocused), which would quietly erase the
+    // user's frost choice whenever they click elsewhere. Only observable
+    // under glass — everywhere else the page buries the material.
+    visualEffectState: IS_MAC ? ('active' as const) : undefined,
+    opacity: windowOpacity(),
+    ...windowBackingOptions(translucencyState, getWindowBackgroundColor())
   }
 }
 
@@ -5761,6 +5842,102 @@ function sendClosePreviewRequested() {
   webContents.send('hermes:close-preview-requested')
 }
 
+/**
+ * Run a browser gesture on the guest page the user is actually in, if any.
+ *
+ * A `<webview>` guest is its own out-of-process webContents: pointer and focus
+ * events inside the page never reach the host document, so NOTHING in the
+ * renderer — not `document.activeElement`, not the layout tree's hover/focus
+ * ladder — can see that the user is in there. Main can: Electron tracks the
+ * focused webContents across processes, which is the definition of a runtime
+ * fact it owns.
+ *
+ * Returns false when focus is in the app's own chrome, where the renderer is
+ * the one that knows which pane is active.
+ */
+function commandFocusedGuest(command: 'back' | 'forward' | 'reload'): boolean {
+  const focused = electronWebContents.getFocusedWebContents()
+
+  if (!focused || focused.isDestroyed() || focused.getType() !== 'webview') {
+    return false
+  }
+
+  const history = focused.navigationHistory
+
+  if (command === 'reload') {
+    focused.reload()
+  } else if (command === 'back') {
+    if (!history.canGoBack()) {
+      return true
+    }
+
+    history.goBack()
+  } else {
+    if (!history.canGoForward()) {
+      return true
+    }
+
+    history.goForward()
+  }
+
+  return true
+}
+
+/**
+ * Ask the renderer to run a browser-navigation gesture on its focused preview
+ * pane. `reload` also has an app-level fallback (reload the window); `back` and
+ * `forward` mean nothing outside the browser, so the renderer just ignores them.
+ */
+function sendPreviewNavCommand(command: 'back' | 'forward' | 'reload') {
+  // The user is inside the page itself — main is the only party that can see
+  // that, so act here and never round-trip.
+  if (commandFocusedGuest(command)) {
+    return
+  }
+
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+
+  const { webContents } = mainWindow
+
+  if (!webContents || webContents.isDestroyed()) {
+    return
+  }
+
+  webContents.send('hermes:preview-nav', command)
+}
+
+/**
+ * The native back/forward gestures, which never reach the renderer on their own.
+ *
+ * - macOS: a two/three-finger swipe. Chromium's own overscroll navigation is
+ *   off in an Electron window, so the OS gesture surfaces as this event and
+ *   nothing consumes it. Requires "Swipe between pages" in System Settings.
+ * - Windows/Linux: the dedicated back/forward buttons on a mouse, delivered as
+ *   `WM_APPCOMMAND`.
+ */
+function installBrowserNavGestures(window) {
+  window.on('swipe', (_event, direction) => {
+    if (direction === 'left' || direction === 'right') {
+      // Swipe LEFT moves the page left, revealing what's behind it — that's
+      // back. Matches Safari, Chrome, and Finder.
+      sendPreviewNavCommand(direction === 'left' ? 'back' : 'forward')
+    }
+  })
+
+  window.on('app-command', (event, command) => {
+    if (command !== 'browser-backward' && command !== 'browser-forward') {
+      return
+    }
+
+    // Claim it either way: unhandled, Chromium walks the HOST document's
+    // history, which would navigate the app shell itself.
+    event.preventDefault()
+    sendPreviewNavCommand(command === 'browser-backward' ? 'back' : 'forward')
+  })
+}
+
 function sendOpenFolderRequested() {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
@@ -5961,7 +6138,15 @@ function buildApplicationMenu() {
   template.push({
     label: 'View',
     submenu: [
-      { role: 'reload' },
+      // Not `role: 'reload'`: that hard-reloads the RENDERER (every pane, the
+      // whole shell) and a focused in-app browser needs ⌘R to mean "reload
+      // this page", the way it does in every other browser. ⇧⌘R
+      // (`forceReload`) below stays the unconditional escape hatch.
+      //
+      // No accelerator: ⌘R is claimed in `installPreviewShortcut`, which works
+      // on every platform (this menu exists only on macOS). Declaring it here
+      // too would fire the item and the input hook for one keypress.
+      { click: () => sendPreviewNavCommand('reload'), label: 'Reload' },
       { role: 'forceReload' },
       {
         label: 'Toggle Developer Tools',
@@ -6060,17 +6245,28 @@ function installDevToolsShortcut(window) {
 function installPreviewShortcut(window) {
   window.webContents.on('before-input-event', (event, input) => {
     const key = String(input.key || '').toLowerCase()
-    const isCloseTabShortcut = key === 'w' && (IS_MAC ? input.meta : input.control) && !input.alt && !input.shift
+    const accel = (IS_MAC ? input.meta : input.control) && !input.alt
+    const isCloseTabShortcut = key === 'w' && accel && !input.shift
 
     // Always claim ⌘W here (the File>Close item deliberately has no
     // accelerator, so nothing else does). The renderer decides tab-vs-window
     // — no `previewShortcutActive` gate, so it works for every closeable tab.
-    if (!isCloseTabShortcut) {
+    if (isCloseTabShortcut) {
+      event.preventDefault()
+      sendClosePreviewRequested()
+
       return
     }
 
-    event.preventDefault()
-    sendClosePreviewRequested()
+    // ⌘R rides here rather than on the View menu item for the same reason:
+    // the application menu only exists on macOS (it is set to null elsewhere,
+    // see #77845), so a menu accelerator would leave Windows and Linux with no
+    // way to reload a page at all. ⇧⌘R is left alone — that is `forceReload`,
+    // the unconditional whole-window escape hatch.
+    if (key === 'r' && accel && !input.shift) {
+      event.preventDefault()
+      sendPreviewNavCommand('reload')
+    }
   })
 }
 
@@ -6200,92 +6396,30 @@ function installZoomShortcuts(window) {
   })
 }
 
-function installContextMenu(window) {
+/**
+ * The custom (renderer) context menu's main-process half.
+ *
+ * The app popups no native menus: the renderer owns the menu UI so labels
+ * are translated with the rest of the app. Main keeps only what Chromium
+ * reports here and the renderer cannot see:
+ *  - spell-check facts (misspelled word + suggestions) — forwarded so the
+ *    renderer appends them to its already-open menu,
+ *  - the gesture coordinates — kept for copyImageAt, which needs them.
+ */
+const lastContextMenuPoint = new Map<number, { x: number; y: number }>()
+
+function installContextMenuBridge(window: BrowserWindow) {
   window.webContents.on('context-menu', (_event, params) => {
-    const template = []
-    const hasSelection = Boolean(params.selectionText?.trim())
-    const hasLink = Boolean(params.linkURL)
-    const isEditable = Boolean(params.isEditable)
+    lastContextMenuPoint.set(window.webContents.id, { x: params.x, y: params.y })
 
-    template.push(
-      ...imageContextMenuItems(params, {
-        copyImageAt: (x, y) => window.webContents.copyImageAt(x, y),
-        openImage: openExternalUrl,
-        copyImageAddress: url => clipboard.writeText(url),
-        saveImage: url => {
-          void saveImageFromUrl(url).catch(error => rememberLog(`Save image failed: ${error.message}`))
-        }
-      })
-    )
-
-    if (hasLink) {
-      if (template.length) {
-        template.push({ type: 'separator' })
-      }
-
-      template.push(
-        {
-          label: 'Open Link',
-          click: () => openExternalUrl(params.linkURL)
-        },
-        {
-          label: 'Copy Link',
-          click: () => clipboard.writeText(params.linkURL)
-        }
-      )
-    }
-
-    // Spell-check suggestions for the misspelled word under the caret.
-    // Chromium surfaces them on `params.dictionarySuggestions`; we offer the
-    // top 5 plus a "Add to dictionary" affordance.
     const suggestions = Array.isArray(params.dictionarySuggestions) ? params.dictionarySuggestions : []
 
-    if (isEditable && params.misspelledWord && suggestions.length > 0) {
-      if (template.length) {
-        template.push({ type: 'separator' })
-      }
-
-      for (const suggestion of suggestions.slice(0, 5)) {
-        template.push({
-          label: suggestion,
-          click: () => window.webContents.replaceMisspelling(suggestion)
-        })
-      }
-
-      template.push({ type: 'separator' })
-      template.push({
-        label: 'Add to dictionary',
-        click: () => window.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord)
+    if (params.isEditable && params.misspelledWord) {
+      window.webContents.send('hermes:context-menu-spellcheck', {
+        misspelledWord: params.misspelledWord,
+        suggestions
       })
     }
-
-    if (hasSelection || isEditable) {
-      if (template.length) {
-        template.push({ type: 'separator' })
-      }
-
-      if (isEditable) {
-        template.push(
-          { role: 'cut', enabled: params.editFlags.canCut },
-          { role: 'copy', enabled: params.editFlags.canCopy },
-          { role: 'paste', enabled: params.editFlags.canPaste },
-          { type: 'separator' },
-          { role: 'selectAll', enabled: params.editFlags.canSelectAll }
-        )
-      } else {
-        template.push({ role: 'copy', enabled: params.editFlags.canCopy })
-      }
-    }
-
-    // Bare right-click on non-editable, non-selected, non-media content (a pane
-    // body, the sidebar, chrome): the renderer's own context menus own those
-    // surfaces, and anywhere without one shows nothing — not a lone, useless
-    // "Select All" from the native fallback.
-    if (!template.length) {
-      return
-    }
-
-    Menu.buildFromTemplate(template).popup({ window })
   })
 }
 
@@ -8776,6 +8910,61 @@ function activeSshTerminalTarget() {
   return null
 }
 
+// Loopback reach for the browser pane. Scoped to the SSH connection that
+// authorized it: a different host (or none) must never inherit live forwards
+// into somebody else's machine.
+const previewReach = new PreviewReachRegistry()
+let previewReachScope: null | string = null
+
+async function resetPreviewReach() {
+  previewReachScope = null
+  await previewReach.closeAll()
+}
+
+/**
+ * Rewrite a gateway-loopback URL into one this machine can actually load.
+ *
+ * Returns the URL unchanged when no rewrite is needed or possible — a local
+ * backend (the address is already true), a non-loopback host, or a url/cloud
+ * remote with no tunnel to borrow. Callers must not treat an unchanged URL as
+ * failure; the pane explains an unreachable one on its own.
+ */
+async function reachablePreviewUrl(rawUrl: string): Promise<string> {
+  const target = activeSshTerminalTarget()
+
+  if (!target || target === 'pending') {
+    // No SSH transport behind this gateway; nothing to forward through.
+    await resetPreviewReach()
+
+    return rawUrl
+  }
+
+  const { scope, ssh } = target as { scope: string; ssh: any }
+
+  if (previewReachScope !== scope) {
+    await resetPreviewReach()
+    previewReachScope = scope
+  }
+
+  try {
+    const rewritten = await previewReach.resolve(rawUrl, {
+      cancel: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
+      forward: (localPort, remotePort, remoteHost) => ssh.forward(localPort, remotePort, remoteHost),
+      isCurrent: () => sshConnections.get(scope)?.ssh === ssh,
+      // pickLocalPort predates the typed surface here and infers `unknown`.
+      pickLocalPort: () => pickLocalPort() as Promise<number>
+    })
+
+    return rewritten || rawUrl
+  } catch (error: any) {
+    // A failed forward is a preview problem, not a session problem: log it and
+    // let the original URL through so the pane shows its own explanation.
+    sshRememberLog(`preview reach failed for ${rawUrl}: ${error?.message || error}`)
+
+    return rawUrl
+  }
+}
+
 function effectiveSshConfigFingerprint(sshConfig) {
   const ssh =
     process.platform === 'win32'
@@ -8990,80 +9179,46 @@ function persistSshConnectionToken(profile, source, token) {
 async function resolveRemoteBackend(profile) {
   const config = readDesktopConnectionConfig()
 
-  // 1. Per-profile override — "a profile with its own remote host". Wins even
-  //    over the env override so an explicitly-configured profile always
-  //    reaches its intended backend.
-  const sshOverride = profileSshOverride(config, profile)
+  const route = resolveDesktopRemoteRoute({
+    config,
+    env: {
+      token: process.env.HERMES_DESKTOP_REMOTE_TOKEN,
+      url: process.env.HERMES_DESKTOP_REMOTE_URL
+    },
+    profile,
+    registry: readDesktopConnectionsRegistry()
+  })
 
-  if (sshOverride) {
-    const reuseToken = decryptDesktopSecret(config.profiles?.[connectionScopeKey(profile)]?.token)
-
-    return bootstrapSshConnection(profile, sshOverride, reuseToken, 'profile')
-  }
-
-  const override = profileRemoteOverride(config, profile)
-
-  if (override) {
-    const token = override.authMode === 'oauth' ? null : decryptDesktopSecret(override.token)
-
-    return buildRemoteConnection(
-      override.url,
-      override.authMode,
-      token,
-      'profile',
-      undefined,
-      config.profiles?.[connectionScopeKey(profile)]?.mode === 'cloud' ? 'cloud' : 'url',
-      undefined,
-      override.headers
-    )
-  }
-
-  // 2. Env override (global, token-auth only).
-  const rawEnvUrl = process.env.HERMES_DESKTOP_REMOTE_URL
-  const rawEnvToken = process.env.HERMES_DESKTOP_REMOTE_TOKEN
-
-  if (rawEnvUrl) {
-    if (!rawEnvToken) {
-      throw new Error(
-        'HERMES_DESKTOP_REMOTE_URL is set but HERMES_DESKTOP_REMOTE_TOKEN is not. ' +
-          'Both must be provided to connect to a remote Hermes backend.'
-      )
-    }
-
-    return buildRemoteConnection(rawEnvUrl, 'token', rawEnvToken, 'env')
-  }
-
-  // 3. Global remote.
-  if (config.mode === 'ssh') {
-    const ssh = normalizeSshConfig({ mode: 'ssh', ...(config.remote || {}) })
-
-    if (!ssh) {
-      throw new Error('SSH remote mode is selected but no host is configured.')
-    }
-
-    const reuseToken = decryptDesktopSecret(config.remote?.token)
-
-    return bootstrapSshConnection(null, ssh, reuseToken, 'settings')
-  }
-
-  // Cloud resolves through the existing URL/OAuth path.
-  if (!modeIsRemoteLike(config.mode)) {
+  if (!route) {
     return null
   }
 
-  const authMode = normAuthMode(config.remote?.authMode)
-  const token = authMode === 'oauth' ? null : decryptDesktopSecret(config.remote?.token)
+  let connection
 
-  return buildRemoteConnection(
-    config.remote?.url,
-    authMode,
-    token,
-    'settings',
-    undefined,
-    config.mode === 'cloud' ? 'cloud' : 'url',
-    undefined,
-    config.remote?.headers
-  )
+  if (route.kind === 'ssh') {
+    connection = await bootstrapSshConnection(
+      route.source === 'profile' ? profile : null,
+      route.ssh,
+      decryptDesktopSecret(route.token),
+      route.source
+    )
+  } else {
+    const token =
+      route.authMode === 'oauth' ? null : route.source === 'env' ? route.token : decryptDesktopSecret(route.token)
+
+    connection = await buildRemoteConnection(
+      route.url,
+      route.authMode,
+      token,
+      route.source,
+      undefined,
+      route.kind === 'cloud' ? 'cloud' : 'url',
+      undefined,
+      route.headers
+    )
+  }
+
+  return route.connectionId ? { ...connection, connectionId: route.connectionId } : connection
 }
 
 // A remote profile's sessions live on its remote host's state.db, not on a local
@@ -10222,19 +10377,7 @@ async function startHermes() {
         error: null
       })
 
-      return {
-        baseUrl: remote.baseUrl,
-        mode: 'remote',
-        source: remote.source,
-        authMode: remote.authMode || 'token',
-        remoteHost: remote.remoteHost,
-        remoteKind: remote.remoteKind,
-        remoteHermesVersion: remote.remoteHermesVersion,
-        token: remote.token,
-        wsUrl: remote.wsUrl,
-        logs: hermesLog.slice(-80),
-        ...getWindowState()
-      }
+      return createPrimaryRemoteConnection(remote, hermesLog.slice(-80), getWindowState())
     }
 
     await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
@@ -10546,6 +10689,7 @@ async function startHermes() {
 function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {}) {
   installPreviewShortcut(win)
   installDevToolsShortcut(win)
+  installBrowserNavGestures(win)
 
   // Claim Ctrl/Cmd+F in the main process — on Pop!_OS / GNOME-based Linux
   // distros the Ctrl+F keydown does not reach the renderer's `view.findInPage`
@@ -10569,7 +10713,7 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
     win.webContents.on('did-finish-load', () => restorePersistedZoomLevel(win))
   }
 
-  installContextMenu(win)
+  installContextMenuBridge(win)
   win.webContents.setWindowOpenHandler(details => {
     openExternalUrl(details.url)
 
@@ -10645,8 +10789,7 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
-    vibrancy: IS_MAC ? 'sidebar' : undefined,
-    opacity: windowOpacity(),
+    ...chatWindowSurfaceOptions(),
     icon,
     // Don't show until the renderer's first themed paint is ready. macOS
     // `vibrancy` ignores `backgroundColor` and paints a translucent OS
@@ -10655,9 +10798,12 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     // covers it. ready-to-show fires after the boot-time paint in
     // themes/context.tsx, so the window appears already themed.
     show: false,
-    backgroundColor: getWindowBackgroundColor(),
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
+
+  // Chat-surface registration: applyWindowTranslucency swaps this window's
+  // backing between opaque-themed and alpha-0 when glass toggles.
+  translucencyBackedWindows.add(win)
 
   if (IS_MAC) {
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
@@ -10745,15 +10891,16 @@ function createInstanceWindow() {
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
-    vibrancy: IS_MAC ? 'sidebar' : undefined,
-    opacity: windowOpacity(),
+    ...chatWindowSurfaceOptions(),
     icon,
     show: false,
-    backgroundColor: getWindowBackgroundColor(),
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
   instanceWindows.add(win)
+
+  // Chat-surface registration: see applyWindowTranslucency.
+  translucencyBackedWindows.add(win)
 
   if (IS_MAC) {
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
@@ -11606,14 +11753,12 @@ function createWindow() {
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
-    vibrancy: IS_MAC ? 'sidebar' : undefined,
-    opacity: windowOpacity(),
+    ...chatWindowSurfaceOptions(),
     icon,
     // Hidden until the first themed paint so macOS `vibrancy` (which ignores
     // `backgroundColor` and follows the OS appearance) can't flash a light
     // material before the renderer paints the app theme. See createSessionWindow.
     show: false,
-    backgroundColor: getWindowBackgroundColor(),
     // Shared with the secondary session windows (chatWindowWebPreferences);
     // stream-aware throttling is applied per-window via streamThrottle so a
     // live answer keeps painting while the window is blurred or minimized,
@@ -11623,6 +11768,9 @@ function createWindow() {
   })
 
   const createdMainWindow = mainWindow
+
+  // Chat-surface registration: see applyWindowTranslucency.
+  translucencyBackedWindows.add(mainWindow)
 
   if (IS_MAC) {
     mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
@@ -12791,29 +12939,16 @@ ipcMain.handle('hermes:connections:update-all', async () => {
   return { ok: true, results }
 })
 
-// POST helper against a resolved backend descriptor. Token-auth descriptors
-// use the session-token header; OAuth descriptors have token: null and
-// authenticate via the OAuth partition's cookies (same split as the rest of
-// the REST surface).
+// Convenience wrappers around the bearer-aware descriptor request path.
+// Native OAuth sessions are cookieless, so these must not bypass
+// fetchJsonForBackend and fall straight through to the cookie partition.
 async function postJsonForBackend(descriptor, path, body, opts: any = {}) {
-  const url = `${descriptor.baseUrl}${path}`
-
-  if (descriptor.authMode === 'oauth') {
-    return fetchJsonViaOauthSession(url, { ...opts, body: body ?? {}, method: 'POST' })
-  }
-
-  return fetchJson(url, descriptor.token, { ...opts, body: body ?? {}, method: 'POST' })
+  return fetchJsonForBackend(descriptor, path, { ...opts, body: body ?? {}, method: 'POST' })
 }
 
-// GET twin of postJsonForBackend — same token/cookie auth split.
+// GET twin of postJsonForBackend.
 async function getJsonForBackend(descriptor, path, opts: any = {}) {
-  const url = `${descriptor.baseUrl}${path}`
-
-  if (descriptor.authMode === 'oauth') {
-    return fetchJsonViaOauthSession(url, requestOptionsWithHeaders(opts, descriptor.headers || {}))
-  }
-
-  return fetchJson(url, descriptor.token, requestOptionsWithHeaders(opts, descriptor.headers || {}))
+  return fetchJsonForBackend(descriptor, path, opts)
 }
 
 // Any-method REST call against a resolved backend descriptor — the descriptor
@@ -13081,9 +13216,10 @@ async function interceptSessionRequestForRemote(request) {
 
   if (method === 'GET' && pathname === '/api/profiles/sessions') {
     const remoteProfiles = configuredRemoteProfileNames()
+    const registrySources = await pooledRegistrySessionSources()
 
-    if (remoteProfiles.length === 0) {
-      return undefined // no remote profiles → local fast path
+    if (remoteProfiles.length === 0 && registrySources.length === 0) {
+      return undefined // no remote profiles and no connected registry gateways → local fast path
     }
 
     const requested = (searchParams.get('profile') || 'all').trim() || 'all'
@@ -13103,8 +13239,9 @@ async function interceptSessionRequestForRemote(request) {
   // remote correctness is preserved.
   if (method === 'GET' && pathname === '/api/profiles/sessions/sidebar') {
     const remoteProfiles = configuredRemoteProfileNames()
+    const registrySources = await pooledRegistrySessionSources()
 
-    if (remoteProfiles.length === 0) {
+    if (remoteProfiles.length === 0 && registrySources.length === 0) {
       return undefined // local fast path → batched endpoint's single DB open
     }
 
@@ -13222,7 +13359,9 @@ async function fetchProfilesSessionSlice(searchParams, remoteProfiles) {
 // Unified list: primary's local aggregate, with each remote profile's stale local
 // rows/totals swapped for the remote's real ones, re-sorted by recency and
 // re-windowed to the requested page. A dead remote contributes nothing rather
-// than breaking the sidebar.
+// than breaking the sidebar. Connected registry gateways' sessions are spliced
+// in too (#88880) — the unified Sessions list shows EVERY connected gateway's
+// chats, tagged with connection_id + profile so opens route correctly.
 async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   const limit = Math.max(1, Number(searchParams.get('limit')) || 20)
   const offset = Math.max(0, Number(searchParams.get('offset')) || 0)
@@ -13259,6 +13398,22 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
     })
   )
 
+  // Registry gateways (v2 connections): splice every CONNECTED gateway's rows
+  // into the unified list. Only already-pooled backends are read — a sidebar
+  // refresh must never dial or spawn a backend (the Bot Mode roster-respawn
+  // trap). Reads omit include_hidden, so Bot Mode's hidden canonical chats
+  // stay out of the global list, same as local sessions.
+  const registrySources = await pooledRegistrySessionSources()
+
+  if (registrySources.length) {
+    const registryRows = await fetchRegistrySessionRows(registrySources, remoteParams, (descriptor, path) =>
+      getJsonForBackend(descriptor, path, { timeoutMs: 10_000 })
+    )
+
+    const { added } = spliceRegistrySessionRows(merged, registryRows, profileTotals)
+    total += added
+  }
+
   const recency = s => s?.[order] ?? s?.started_at ?? 0
   merged.sort((a, b) => recency(b) - recency(a))
 
@@ -13268,6 +13423,59 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
     total,
     profile_totals: profileTotals
   }
+}
+
+// Every CONNECTED registry gateway as a session source: resolved descriptors
+// straight from the backend pool, never dialing. SSH sources contribute one
+// backend per pooled (connection, profile) scope; remote/cloud sources are one
+// shared host (any pooled scope's descriptor serves the cross-profile read).
+// The primary local connection is excluded — the primary aggregate already
+// carries local rows.
+async function pooledRegistrySessionSources(): Promise<RegistrySessionSource[]> {
+  const registry = readDesktopConnectionsRegistry()
+  const sources: RegistrySessionSource[] = []
+
+  for (const connection of registry.connections) {
+    if (connection.kind === 'local') {
+      continue
+    }
+
+    const prefix = backendScopePrefix(connection.id)
+
+    const pooled = [...backendPool.entries()].filter(
+      ([key, entry]) => key.startsWith(prefix) && entry.connectionPromise
+    )
+
+    if (pooled.length === 0) {
+      continue
+    }
+
+    const backends: Array<{ descriptor: unknown; profileLabel: null | string }> = []
+
+    for (const [key, entry] of connection.kind === 'ssh' ? pooled : pooled.slice(0, 1)) {
+      try {
+        // Already-resolved for a connected backend; a still-dialing entry is
+        // skipped via the timeout guard rather than blocking the sidebar.
+        const descriptor = await Promise.race([
+          entry.connectionPromise,
+          new Promise((_, reject) => setTimeout(() => reject(new Error('pending')), 2_000))
+        ])
+
+        backends.push({
+          descriptor,
+          profileLabel: connection.kind === 'ssh' ? key.slice(prefix.length) || 'default' : null
+        })
+      } catch {
+        // Dead or still-connecting backend — contributes nothing this refresh.
+      }
+    }
+
+    if (backends.length) {
+      sources.push({ backends, connectionId: connection.id, kind: connection.kind })
+    }
+  }
+
+  return sources
 }
 
 async function handleHermesApiRequest(request) {
@@ -13442,11 +13650,13 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   // Action buttons render only on signed macOS builds; elsewhere they're dropped
   // and the body click still works.
   const actions = Array.isArray(payload?.actions) ? payload.actions : []
+  const icon = typeof payload?.icon === 'string' && payload.icon.trim() ? payload.icon.trim() : undefined
 
   const notification = new Notification({
     title: payload?.title || 'Hermes',
     body: payload?.body || '',
     silent: Boolean(payload?.silent),
+    ...(icon ? { icon } : {}),
     actions: actions.map(action => ({ type: 'button', text: String(action?.text || '') }))
   })
 
@@ -13460,6 +13670,16 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
     if (payload?.sessionId) {
       mainWindow.webContents.send('hermes:focus-session', payload.sessionId)
     }
+
+    // Plugin / session-less activation — serializable path (+ optional notifyId
+    // for renderer callbacks). Same vocabulary as hermes://index-network/….
+    if (payload?.activate || payload?.notifyId) {
+      mainWindow.webContents.send('hermes:notification-activate', {
+        activate: payload?.activate,
+        notifyId: payload?.notifyId,
+        tag: payload?.tag
+      })
+    }
   })
   notification.on('action', (_actionEvent, index) => {
     if (!mainWindow || mainWindow.isDestroyed()) {
@@ -13468,9 +13688,24 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
 
     const action = actions[index]
 
-    if (action?.id) {
-      mainWindow.webContents.send('hermes:notification-action', { sessionId: payload?.sessionId, actionId: action.id })
+    if (!action?.id) {
+      return
     }
+
+    // Approvals keep the existing session-scoped channel.
+    if (payload?.sessionId && !payload?.notifyId && !payload?.activate) {
+      mainWindow.webContents.send('hermes:notification-action', { sessionId: payload.sessionId, actionId: action.id })
+
+      return
+    }
+
+    focusWindow(mainWindow)
+    mainWindow.webContents.send('hermes:notification-activate', {
+      actionId: action.id,
+      activate: action.activate || payload?.activate,
+      notifyId: payload?.notifyId,
+      tag: payload?.tag
+    })
   })
   notification.show()
 
@@ -13638,6 +13873,58 @@ ipcMain.handle('hermes:saveGatewayFile', (_event, payload) => saveGatewayFile(pa
 
 ipcMain.handle('hermes:saveImageFromUrl', (_event, url) => saveImageFromUrl(String(url || '')))
 
+// The custom context menu's edit verbs. They act on the SENDER's focused
+// element, so the renderer restores focus to the editable before invoking.
+ipcMain.handle('hermes:context-menu:edit', (event, command) => {
+  const contents = event.sender
+
+  if (command === 'copy') {
+    contents.copy()
+  } else if (command === 'cut') {
+    contents.cut()
+  } else if (command === 'paste') {
+    contents.paste()
+  } else if (command === 'selectAll') {
+    contents.selectAll()
+  }
+})
+
+// Copy the image under the sender's LAST context-menu gesture. Chromium only
+// exposes image bytes through copyImageAt, and only main saw the coordinates.
+ipcMain.handle('hermes:context-menu:copy-image', event => {
+  const point = lastContextMenuPoint.get(event.sender.id)
+
+  if (point) {
+    event.sender.copyImageAt(point.x, point.y)
+  }
+})
+
+ipcMain.handle('hermes:context-menu:spellcheck', (event, action) => {
+  const kind = action?.kind
+  const word = String(action?.word || '')
+
+  if (!word) {
+    return
+  }
+
+  if (kind === 'replace') {
+    event.sender.replaceMisspelling(word)
+  } else if (kind === 'add') {
+    event.sender.session.addWordToSpellCheckerDictionary(word)
+  }
+})
+
+// Guest dictionary add: the webview TAG exposes replaceMisspelling but no
+// session API, so the renderer names the guest by webContents id.
+ipcMain.handle('hermes:context-menu:guest-add-word', (_event, payload) => {
+  const word = String(payload?.word || '')
+  const guest = electronWebContents.fromId(Number(payload?.webContentsId))
+
+  if (word && guest && !guest.isDestroyed()) {
+    guest.session.addWordToSpellCheckerDictionary(word)
+  }
+})
+
 ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
   const data = payload?.data
 
@@ -13738,20 +14025,69 @@ ipcMain.on('hermes:native-theme', (_event, mode) => {
   }
 })
 
-// See-through window translucency. Persist + re-apply opacity to every open
-// window at runtime (no recreation, so caching/sessions are untouched).
-ipcMain.on('hermes:translucency', (_event, payload) => {
-  const next = clampIntensity(payload && payload.intensity)
+// See-through window translucency. Persist + re-apply to every open window at
+// runtime (no recreation, so caching/sessions are untouched).
+//
+// The intensity slider is a HOT path: ~100 updates per drag. Two things make
+// that cheap. Native work is diffed, so an intensity-only change under glass
+// touches nothing (it's painted by the renderer). And the disk write is
+// coalesced onto a trailing timer, because writePersistedTranslucency is a
+// synchronous writeFileSync and doing one per tick blocks the main process
+// mid-drag. Only a cold launch reads that file, so it just has to be correct
+// once the hand comes off the slider.
+let translucencyWriteTimer = null
 
-  if (next === translucencyIntensity) {
+function scheduleTranslucencyWrite() {
+  if (translucencyWriteTimer) {
+    clearTimeout(translucencyWriteTimer)
+  }
+
+  translucencyWriteTimer = setTimeout(() => {
+    translucencyWriteTimer = null
+    writePersistedTranslucency(translucencyState)
+  }, 250)
+}
+
+// Flush a pending write before the process can exit, so a quit landing inside
+// the debounce window doesn't lose the setting.
+app.on('before-quit', () => {
+  if (translucencyWriteTimer) {
+    clearTimeout(translucencyWriteTimer)
+    translucencyWriteTimer = null
+    writePersistedTranslucency(translucencyState)
+  }
+})
+
+ipcMain.on('hermes:translucency', (_event, payload) => {
+  const next = normalizeTranslucency(payload, IS_MAC)
+  const previous = translucencyState
+
+  if (
+    next.intensity === previous.intensity &&
+    next.mode === previous.mode &&
+    next.material === previous.material &&
+    next.scope === previous.scope
+  ) {
     return
   }
 
-  translucencyIntensity = next
-  writePersistedTranslucency(next)
+  translucencyState = next
 
-  for (const win of BrowserWindow.getAllWindows()) {
-    applyWindowTranslucency(win)
+  // Which native properties actually moved. `scope` is renderer-only (which
+  // surfaces thin), so it never appears here.
+  const changed = {
+    // The backing follows whether glass is ON, not the intensity behind it.
+    backing: glassActive(previous) !== glassActive(next),
+    material: vibrancyForTranslucency(previous) !== vibrancyForTranslucency(next),
+    opacity: windowOpacityFor(previous) !== windowOpacityFor(next)
+  }
+
+  scheduleTranslucencyWrite()
+
+  if (changed.backing || changed.material || changed.opacity) {
+    for (const win of BrowserWindow.getAllWindows()) {
+      applyWindowTranslucency(win, changed)
+    }
   }
 })
 
@@ -13937,6 +14273,10 @@ ipcMain.handle('hermes:stop-find-in-page', event => {
 
   stopFind(win.webContents)
 })
+
+// The renderer can't know whether a loopback URL is reachable — only main
+// knows which transport backs this gateway. Ask before loading one.
+ipcMain.handle('hermes:preview:reach', async (_event, url) => reachablePreviewUrl(String(url || '')))
 
 ipcMain.handle('hermes:openPreviewInBrowser', async (_event, url) => {
   if (!(await openPreviewInBrowser(url))) {
@@ -14288,6 +14628,28 @@ ipcMain.handle('hermes:fs:desktopPluginsRoot', async () => localPluginsRoot('des
 // same shape as `dashboard/manifest.json`), and the renderer's disk door scans
 // this root for it — one installable folder serving both SDKs.
 ipcMain.handle('hermes:fs:agentPluginsRoot', async () => localPluginsRoot('plugins'))
+
+ipcMain.handle('hermes:plugin:probe', async (_event, payload) => {
+  const identifier = String(payload?.identifier || payload?.repo || '').trim()
+
+  if (!identifier) {
+    return { ok: false, error: 'identifier is required', agent: false, desktop: false, warnings: [] }
+  }
+
+  return probePluginRepo(resolveGitBinary(), identifier)
+})
+
+ipcMain.handle('hermes:plugin:installDesktop', async (_event, payload) => {
+  const identifier = String(payload?.identifier || payload?.repo || '').trim()
+
+  if (!identifier) {
+    return { ok: false, error: 'identifier is required' }
+  }
+
+  const desktopPluginsRoot = await localPluginsRoot('desktop-plugins')
+
+  return installDesktopPluginFromGit(resolveGitBinary(), identifier, desktopPluginsRoot, Boolean(payload?.force))
+})
 
 // Rename a file/folder in place. The renderer passes the existing path + a new
 // base name; the destination is resolved in the SAME parent dir so a rename can
@@ -14874,15 +15236,20 @@ ipcMain.handle('hermes:vscode-theme:fetch', async (_event, id) => fetchMarketpla
 ipcMain.handle('hermes:vscode-theme:search', async (_event, query) => searchMarketplaceThemes(String(query || ''), 20))
 
 // ---------------------------------------------------------------------------
-// hermes:// deep links (e.g. hermes://blueprint/morning-brief?time=08:00, or
+// hermes:// deep links (e.g. hermes://blueprint/morning-brief?time=08:00,
 // hermes://mcp/install?name=NAME&config=B64 — the vendor "Add to Hermes"
-// button). Parsing is generic ({kind, name, params}); the renderer routes per
-// kind and anything install-shaped requires explicit user confirmation there.
+// button, or hermes://plugin/install?repo=owner/repo). Dev
+// (`HERMES_DESKTOP_DEV_SERVER`) registers hermes-dev:// instead — bare
+// Electron or a stale OS handler often owns hermes:// on dev machines.
+// Parsing is generic ({kind, name, params}); the renderer routes per kind
+// and anything install-shaped requires explicit user confirmation there.
 // A docs/dashboard "Send to App" button opens this URL; we route it into the
 // running app. Three delivery paths: macOS 'open-url',
 // Win/Linux running-app 'second-instance' (argv), Win/Linux cold-start argv.
 // ---------------------------------------------------------------------------
-const HERMES_PROTOCOL = 'hermes'
+const HERMES_PROTOCOL = DEV_SERVER ? 'hermes-dev' : 'hermes'
+/** Schemes accepted when parsing inbound URLs (dev accepts both). */
+const DEEPLINK_SCHEMES = DEV_SERVER ? ['hermes-dev', 'hermes'] : ['hermes']
 let _pendingDeepLink = null
 let _rendererReadyForDeepLink = false
 
@@ -14891,7 +15258,7 @@ function _extractDeepLink(argv) {
     return null
   }
 
-  return argv.find(a => typeof a === 'string' && a.startsWith(`${HERMES_PROTOCOL}://`)) || null
+  return argv.find(a => typeof a === 'string' && DEEPLINK_SCHEMES.some(s => a.startsWith(`${s}://`))) || null
 }
 
 function handleDeepLink(url) {
@@ -14905,6 +15272,14 @@ function handleDeepLink(url) {
     parsed = new URL(url)
   } catch {
     rememberLog(`[deeplink] ignoring malformed url: ${url}`)
+
+    return
+  }
+
+  const scheme = parsed.protocol.replace(/:$/, '')
+
+  if (!DEEPLINK_SCHEMES.includes(scheme)) {
+    rememberLog(`[deeplink] ignoring scheme ${scheme} (expected ${DEEPLINK_SCHEMES.join(' or ')})`)
 
     return
   }
@@ -14958,11 +15333,15 @@ function registerDeepLinkProtocol() {
   try {
     if (process.defaultApp && process.argv.length >= 2) {
       // Dev: register with the electron exec path + entry script so the OS can
-      // relaunch us with the URL.
-      app.setAsDefaultProtocolClient(HERMES_PROTOCOL, process.execPath, [path.resolve(process.argv[1])])
+      // relaunch us with the URL. argv[1] is usually "." when launched via
+      // `electron .` from apps/desktop — resolve against cwd.
+      const entry = path.resolve(process.argv[1])
+      app.setAsDefaultProtocolClient(HERMES_PROTOCOL, process.execPath, [entry])
     } else {
       app.setAsDefaultProtocolClient(HERMES_PROTOCOL)
     }
+
+    rememberLog(`[deeplink] registered ${HERMES_PROTOCOL}:// handler`)
   } catch (err) {
     rememberLog(`[deeplink] protocol registration failed: ${err.message}`)
   }
@@ -15044,6 +15423,7 @@ app.whenReady().then(() => {
   installEmbedReferer()
   installRemoteHeaderRules()
   registerDeepLinkProtocol()
+
   ensureWslWindowsFonts()
   configureSpellChecker()
   registerPowerResumeListeners()

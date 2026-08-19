@@ -49,7 +49,7 @@ With a single connection (the common case) the picker is hidden and the Bot is c
 Remote-creation notes:
 
 - **Clone source** is a profile of the *target* machine (its `default`) — a remote box doesn't have your local profiles to clone.
-- The live Capabilities tab binds to your active gateway, so a remote-target draft uses the staged Skills/Tools/MCP checklists instead; both read the target machine's catalog.
+- The live Capabilities tab pins to the target machine's backend, so skills, tools, and MCP servers you configure during creation land on the machine the Bot will live on. (Older desktop builds fall back to staged Skills/Tools/MCP checklists for remote targets; both read the target machine's catalog.)
 - Cancelling the dialog discards the draft profile on whichever machine it was created.
 
 **Edit Profile** (right-click a Bot) reopens the same surface on the live profile any time: avatar, title, description, model pin, skills, toolsets, MCP servers, and the full SOUL.md.
@@ -60,7 +60,8 @@ Remote-creation notes:
 
 Every Bot gets a face:
 
-- **Geometric faces** — 7 shapes × 10 colors, with blinking eyes that scan while the Bot works.
+- **Blob faces** (default) — a deterministic soft-body face drawn from the Bot's name: same name, same face, forever. While you type a name in New Agent the face follows it live; hit **Randomize** to re-roll, **Lock face** to keep the one you like even if the name changes, or pin one of the six silhouettes (round, organic, boxy, nub, cloud, sun) while everything else still comes from the name.
+- **Geometric faces** — the classic 7 shapes × 10 colors, with blinking eyes that scan while the Bot works.
 - **An uploaded image** — any picture you like.
 - **An AI-generated portrait** — when an image backend is configured, generated in place (this rides the standard `image.generate` RPC and works over both local and remote gateways).
 - **A pixel pet** — a companion from the [petdex gallery](./features/pets.md) that bounces beside the avatar while the Bot is busy. Run `hermes pets` in a terminal to explore the gallery.
@@ -75,12 +76,14 @@ Routines are plain [Hermes cron jobs](./features/cron.md) namespaced `[bot:<name
 
 ## Groups and group chats
 
-Right-click a Bot → **Move to group** to organize the roster into labeled sections — pick an existing group or create one inline. Ungrouped Bots stay on top; groups follow alphabetically, and a group disappears when its last member leaves.
+Right-click a local Bot → **Manage groups** to add or remove it from any number of group chats. Pick existing groups independently or create one inline. Local membership is stored in the Bot's backend-synced profile metadata, so it follows that profile across desktops; older profiles with one legacy group continue to work. Connections Bots join through the New Group Chat picker and remain source-qualified in that room's local Desktop state.
 
-**Open chat** on any group header (2–6 Bots) opens a shared room where the whole group coordinates:
+Groups are standalone rows in the same activity-ordered roster as Bot DMs. A Bot keeps one DM row even when it belongs to several groups, while every group gets its own room row with member count, latest-message preview, timestamp, and needs-you state.
+
+**Open chat** on any group row (2–6 Bots) opens a shared room where the whole group coordinates:
 
 - Your message triggers up to **three serial rounds** of member turns. @-mentioned Bots respond (everyone responds when nobody is mentioned); each Bot replies briefly or passes, and the room settles when a full round stays silent.
-- Bots pull each other in with `@name`, and escalate real judgment calls to you with `@user` — the group header shows a **needs you** badge when that happens.
+- Bots pull each other in with `@name`, and escalate real judgment calls to you with `@user` — the group row shows a **needs you** badge when that happens.
 - Hard caps (10 messages per send, 3 rounds) keep rooms from spinning.
 - Each member keeps its own persistent `Group: <name>` session, so room context survives like any other conversation.
 - **Not every Bot replies to every message.** Speaking is each member's own choice — a Bot replies only when it has something new to add and passes otherwise, and @-mentioning specific members scopes the round to them. Expect the members you addressed (or whoever has something to say) to speak, and the rest to stay quiet.

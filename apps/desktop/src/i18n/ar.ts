@@ -240,6 +240,7 @@ export const ar = defineLocale({
       'view.toggleRightSidebar': 'تبديل متصفح الملفات',
       'view.toggleReview': 'تبديل لوحة المراجعة',
       'view.showFiles': 'إظهار متصفح الملفات',
+      'view.showBrowser': 'فتح المتصفح',
       'view.showTerminal': 'إظهار الطرفية',
       'view.closeTab': 'إغلاق علامة التبويب',
       'view.reopenTab': 'إعادة فتح علامة التبويب المغلقة',
@@ -410,6 +411,21 @@ export const ar = defineLocale({
       reasoningCollapsedDesc: 'أبقِ التفكير المتدفق متاحًا دون توسيعه حتى تفتحه.',
       translucencyTitle: 'شفافية النافذة',
       translucencyDesc: 'إظهار سطح المكتب من خلال النافذة بالكامل. متاح على macOS وWindows فقط.',
+      translucencyGlassDesc: 'زجاج غير لامع: يظهر سطح المكتب كضبابية ناعمة بينما يبقى النص واضحًا. متاح على macOS فقط.',
+      translucencyModeClear: 'شفاف',
+      translucencyModeGlass: 'زجاج',
+      translucencyFrostTitle: 'نوع الضبابية',
+      translucencyFrost: {
+        'under-window': 'عميق',
+        popover: 'ناعم',
+        titlebar: 'ساطع',
+        header: 'متوهج'
+      },
+      translucencyScopeTitle: 'النطاق',
+      translucencyScope: {
+        window: 'النافذة كاملة',
+        sidebar: 'الشريط الجانبي فقط'
+      },
       backdropTitle: 'خلفية النافذة',
       backdropDesc: 'اختيار مقدار مزج خلفية سطح المكتب مع سطح Hermes.',
       reactionsTitle: 'تفاعلات الرسائل',
@@ -1116,8 +1132,10 @@ export const ar = defineLocale({
     gatewayStopped: 'البوابة متوقفة',
     hermesActiveSessions: (version, count) => `Hermes ${version} لديه ${count} جلسة نشطة`,
     restartGateway: 'إعادة تشغيل البوابة',
+    openBrowser: 'فتح المتصفح',
     gatewayRestartFailed: 'فشل إعادة تشغيل البوابة.',
     updateHermes: 'تحديث Hermes',
+    reloadWindow: 'إعادة تحميل النافذة',
     actionRunning: 'الإجراء قيد التشغيل',
     actionDone: 'اكتمل الإجراء',
     actionFailed: 'فشل الإجراء',
@@ -2264,6 +2282,8 @@ export const ar = defineLocale({
     web: {
       appFailedToBoot: 'فشل إقلاع تطبيق المعاينة',
       serverNotFound: 'الخادم غير موجود',
+      remoteLoopback:
+        'يشير هذا العنوان إلى الجهاز الذي يشغّل الوكيل، وليس هذا الجهاز. تحمّل لوحة المتصفح الصفحات محليًا، لذا يحتاج خادم التطوير البعيد إلى إعادة توجيه منفذ أو اسم مضيف يمكن الوصول إليه.',
       failedToLoad: 'فشل تحميل المعاينة',
       tryAgain: 'إعادة المحاولة',
       restarting: 'جار إعادة تشغيل Hermes...',
@@ -2277,6 +2297,12 @@ export const ar = defineLocale({
       showConsole: 'إظهار كونسول المعاينة',
       hideDevTools: 'إخفاء DevTools المعاينة',
       openDevTools: 'فتح DevTools المعاينة',
+      goBack: 'رجوع',
+      goForward: 'تقدم',
+      reload: 'إعادة تحميل الصفحة',
+      address: 'العنوان',
+      addressPlaceholder: 'أدخل العنوان',
+      blankPageBody: 'اكتب عنوانًا في الأعلى للتصفح، أو اطلب من Hermes فتح صفحة.',
       finishedRestarting: message => `أنهى Hermes إعادة تشغيل خادم المعاينة${message ? `: ${message}` : ''}`,
       failedRestarting: message => `فشلت إعادة تشغيل الخادم: ${message}`,
       unknownError: 'خطأ غير معروف',
@@ -2301,6 +2327,12 @@ export const ar = defineLocale({
   zones: {
     showHeader: 'إظهار الرأس',
     hideHeader: 'إخفاء الرأس',
+    showStripTab: title => `إظهار ${title}`,
+    hideStripTab: title => `إخفاء ${title}`,
+    lastTabKeptTitle: 'يبقى آخر تبويب',
+    lastTabKeptBody:
+      'تحتاج هذه المنطقة إلى تبويب مرئي واحد على الأقل. أظهر تبويبا آخر أولا، أو اطو الشريط الجانبي بأكمله.',
+    toggleStripTab: title => `تبديل تبويب ${title}`,
     minimize: 'تصغير',
     restore: 'استعادة',
     closeRunningTitle: 'إغلاق تبويب يعمل؟',
@@ -2338,6 +2370,29 @@ export const ar = defineLocale({
     notExpressible: 'هذا الترتيب متشابك — لا يمكن تمثيله كتقسيمات متداخلة بعد',
     zoneCount: count => `${count} مناطق`,
     tabCount: count => `${count} تبويبات`
+  },
+  contextMenu: {
+    link: {
+      openInApp: 'فتح في متصفح التطبيق',
+      openExternal: 'فتح في المتصفح الخارجي',
+      copyUrl: 'نسخ الرابط',
+      copyResolvedUrl: 'نسخ الرابط المُحلَّل'
+    },
+    image: {
+      copyImage: 'نسخ الصورة',
+      copyImageAddress: 'نسخ عنوان الصورة',
+      saveImageAs: 'حفظ الصورة باسم…'
+    },
+    edit: {
+      cut: 'قص',
+      paste: 'لصق',
+      selectAll: 'تحديد الكل',
+      addToDictionary: 'إضافة إلى القاموس'
+    },
+    page: {
+      copyPageUrl: 'نسخ رابط الصفحة',
+      inspectElement: 'فحص العنصر'
+    }
   },
   assistant: {
     thread: {
@@ -2401,7 +2456,10 @@ export const ar = defineLocale({
       other: 'غير ذلك',
       placeholder: 'اكتب إجابتك...',
       skip: 'تخطي',
-      continueLabel: 'متابعة'
+      continueLabel: 'متابعة',
+      confirmAndContinueLabel: 'تأكيد ومتابعة',
+      answeredBadge: 'تمت الإجابة',
+      questionProgress: (answered, total) => `تمت الإجابة على ${answered} من ${total}`
     },
     tool: {
       copyCode: 'نسخ الكود',

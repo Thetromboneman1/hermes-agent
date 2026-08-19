@@ -273,6 +273,7 @@ export const en: Translations = {
       'view.toggleReview': 'Toggle review pane',
       'view.toggleStatusbar': 'Toggle status bar',
       'view.showFiles': 'Show file browser',
+      'view.showBrowser': 'Open browser',
       'view.toggleHud': 'Toggle HUD mode',
       'hud.snapToPointer': 'Move HUD to pointer (global, while HUD is open)',
       'view.showTerminal': 'Toggle terminal',
@@ -391,6 +392,39 @@ export const en: Translations = {
         toggleFailed: (name: string) => `Could not toggle ${name}`,
         updateBackendToManage: 'Update the Hermes backend to manage this plugin from Desktop.',
         sources: { bundled: 'bundled', user: 'user', git: 'git', project: 'project', entrypoint: 'pip' }
+      },
+      installModal: {
+        title: 'Install plugin',
+        description: 'Review what this repository contains before installing anything.',
+        repoLabel: 'Repository',
+        includesHeading: 'This package includes',
+        agentLabel: 'Agent plugin',
+        desktopLabel: 'Desktop UI',
+        agentTargetLocal: profile => `Installs into the ${profile} backend (~/.hermes/plugins/)`,
+        agentTargetRemote: profile => `Installs into the connected ${profile} backend`,
+        desktopTarget: "Installs into this app's local desktop-plugins folder",
+        desktopOnlyNote: 'Desktop-only packages do not install a backend agent plugin.',
+        insecureWarning: 'This URL uses an insecure or local scheme. Prefer https:// or git@ for production installs.',
+        securityHeading: 'Before you install',
+        securityIntro:
+          'Install only from sources you trust — review the repository below if you want to see what will be added.',
+        sourceHeading: 'Source code',
+        viewRepository: 'View repository',
+        viewPluginFiles: 'View plugin files',
+        gitCloneLabel: 'Git clone URL',
+        enableAgent: 'Enable agent plugin after install',
+        forceReinstall: 'Force reinstall (replace if already installed)',
+        install: 'Install',
+        installing: 'Installing…',
+        probing: 'Inspecting repository…',
+        probeUnavailable: 'Plugin inspection is unavailable in this environment.',
+        desktopUnavailable: 'Desktop plugin install is unavailable in this environment.',
+        selectComponent: 'Select at least one component to install.',
+        agentSuccess: name => `Agent plugin ${name} installed`,
+        desktopSuccess: name => `Desktop plugin ${name} installed`,
+        agentFailed: 'Agent plugin install failed',
+        desktopFailed: 'Desktop plugin install failed',
+        missingEnv: vars => `Missing env vars: ${vars}. Add them in Settings → Keys.`
       }
     },
     notifications: {
@@ -486,6 +520,22 @@ export const en: Translations = {
       terminalFontReset: 'Use default',
       translucencyTitle: 'Window Translucency',
       translucencyDesc: 'See your desktop through the whole window. macOS and Windows only.',
+      translucencyGlassDesc:
+        'Matte glass: the desktop shows through as a smooth blur while text stays sharp. macOS only.',
+      translucencyModeClear: 'Clear',
+      translucencyModeGlass: 'Glass',
+      translucencyFrostTitle: 'Frost',
+      translucencyFrost: {
+        'under-window': 'Deep',
+        popover: 'Soft',
+        titlebar: 'Bright',
+        header: 'Glare'
+      },
+      translucencyScopeTitle: 'Area',
+      translucencyScope: {
+        window: 'Whole window',
+        sidebar: 'Sidebar only'
+      },
       backdropTitle: 'Chat Backdrop',
       backdropDesc: 'The faint statue image behind the conversation.',
       reactionsTitle: 'Message Reactions',
@@ -850,6 +900,10 @@ export const en: Translations = {
       loading: 'Loading API keys and credentials...',
       failedLoad: 'API keys failed to load',
       empty: 'Nothing configured in this category yet.'
+    },
+    search: {
+      placeholder: 'Search all settings…',
+      pill: 'Search'
     },
     profileScope: {
       appliesTo: 'Applies to',
@@ -1397,8 +1451,10 @@ export const en: Translations = {
     gatewayStopped: 'Messaging gateway stopped',
     hermesActiveSessions: (version, count) => `Hermes ${version} · Active sessions ${count}`,
     restartGateway: 'Restart gateway',
+    openBrowser: 'Open browser',
     gatewayRestartFailed: 'Gateway restart failed.',
     updateHermes: 'Update Hermes',
+    reloadWindow: 'Reload window',
     actionRunning: 'running',
     actionDone: 'done',
     actionFailed: 'failed',
@@ -1758,6 +1814,9 @@ export const en: Translations = {
     renameTitle: 'Rename profile',
     renameDescPrefix: 'Renaming updates the profile directory and any wrapper scripts in ',
     renameDescSuffix: '.',
+    displayNameTitle: 'Name this agent',
+    displayNameDesc: 'Sets a display name shown across the app. The internal profile ID stays "default".',
+    displayNameLabel: 'Display name',
     newNameLabel: 'New name',
     renaming: 'Renaming...',
     created: 'Profile created',
@@ -2853,6 +2912,8 @@ export const en: Translations = {
     web: {
       appFailedToBoot: 'Preview app failed to boot',
       serverNotFound: 'Server not found',
+      remoteLoopback:
+        'This address points at the machine running your agent, not this one. The browser pane loads pages locally, so a remote dev server needs a port forward or a reachable hostname.',
       failedToLoad: 'Preview failed to load',
       tryAgain: 'Try again',
       restarting: 'Hermes is restarting...',
@@ -2866,6 +2927,12 @@ export const en: Translations = {
       showConsole: 'Show preview console',
       hideDevTools: 'Hide preview DevTools',
       openDevTools: 'Open preview DevTools',
+      goBack: 'Back',
+      goForward: 'Forward',
+      reload: 'Reload page',
+      address: 'Address',
+      addressPlaceholder: 'Enter address',
+      blankPageBody: 'Type an address above to browse, or ask Hermes to open a page.',
       finishedRestarting: message => `Hermes finished restarting the preview server${message ? `: ${message}` : ''}`,
       failedRestarting: message => `Server restart failed: ${message}`,
       unknownError: 'unknown error',
@@ -2891,6 +2958,11 @@ export const en: Translations = {
   zones: {
     showHeader: 'Show header',
     hideHeader: 'Hide header',
+    showStripTab: title => `Show ${title}`,
+    hideStripTab: title => `Hide ${title}`,
+    lastTabKeptTitle: 'Last tab stays',
+    lastTabKeptBody: 'This zone needs at least one visible tab. Show another tab first, or collapse the whole sidebar.',
+    toggleStripTab: title => `Toggle ${title} tab`,
     minimize: 'Minimize',
     restore: 'Restore',
     closeRunningTitle: 'Close running tab?',
@@ -2929,6 +3001,30 @@ export const en: Translations = {
     notExpressible: 'this arrangement interlocks (pinwheel) — not expressible as nested splits yet',
     zoneCount: count => `${count} zones`,
     tabCount: count => `${count} tabs`
+  },
+
+  contextMenu: {
+    link: {
+      openInApp: 'Open in in-app browser',
+      openExternal: 'Open in external browser',
+      copyUrl: 'Copy URL',
+      copyResolvedUrl: 'Copy resolved URL'
+    },
+    image: {
+      copyImage: 'Copy image',
+      copyImageAddress: 'Copy image address',
+      saveImageAs: 'Save image as…'
+    },
+    edit: {
+      cut: 'Cut',
+      paste: 'Paste',
+      selectAll: 'Select all',
+      addToDictionary: 'Add to dictionary'
+    },
+    page: {
+      copyPageUrl: 'Copy page URL',
+      inspectElement: 'Inspect element'
+    }
   },
 
   assistant: {
@@ -3000,6 +3096,9 @@ export const en: Translations = {
       skip: 'Skip',
       skipped: 'Skipped',
       continueLabel: 'Continue',
+      confirmAndContinueLabel: 'Confirm and continue',
+      answeredBadge: 'Answered',
+      questionProgress: (answered, total) => `${answered} of ${total} answered`,
       lateAnswer: (question, choice) => `Re: "${question}" — my answer: ${choice}`,
       lateAnswerTip: 'Draft this answer as a follow-up message',
       lateAnswerHint: 'This prompt is no longer waiting. Pick an option to draft it as a follow-up message.'

@@ -1,4 +1,5 @@
 import type { GatewayWsUrlResult } from '@hermes/shared'
+import type { TranslucencyState } from '@hermes/shared/translucency'
 
 import type { WakeIndicatorState } from './lib/wake-indicator'
 import type {
@@ -213,6 +214,22 @@ declare global {
         saved: boolean
       }>
       saveImageFromUrl: (url: string) => Promise<boolean>
+      /** Edit verb against the window's focused element (the custom context
+       *  menu's Cut/Copy/Paste/Select all). */
+      contextMenuEdit?: (command: 'copy' | 'cut' | 'paste' | 'selectAll') => Promise<void>
+      /** Copy the image under the LAST context-menu gesture (Chromium tracks
+       *  its coordinates on the main-process context-menu event). */
+      contextMenuCopyImage?: () => Promise<void>
+      /** Replace the misspelled word or add it to the dictionary. */
+      contextMenuSpellcheck?: (action: { kind: 'add' | 'replace'; word: string }) => Promise<void>
+      /** Add a word to the spell-check dictionary of a webview guest's
+       *  session (the tag exposes no session API). */
+      contextMenuGuestAddWord?: (payload: { webContentsId: number; word: string }) => Promise<void>
+      /** Spell-check facts for the gesture that opened the current menu;
+       *  fires shortly after the DOM contextmenu event. */
+      onContextMenuSpellcheck?: (
+        callback: (payload: { misspelledWord: string; suggestions: string[] }) => void
+      ) => () => void
       saveImageBuffer: (data: ArrayBuffer | Uint8Array, ext: string) => Promise<string>
       saveClipboardImage: () => Promise<string>
       getPathForFile: (file: File) => string
@@ -226,7 +243,7 @@ declare global {
       setActiveWork?: (payload: HermesActiveWork) => void
       setTitleBarTheme?: (payload: HermesTitleBarTheme) => void
       setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void
-      setTranslucency?: (payload: { intensity: number }) => void
+      setTranslucency?: (payload: TranslucencyState) => void
       setKeepAwake?: (on: boolean) => void
       setDisableF12?: (blocked: boolean) => void
       setPreviewShortcutActive?: (active: boolean) => void
@@ -241,6 +258,8 @@ declare global {
       }
       zoom?: {
         get: () => Promise<{ level: number; percent: number }>
+        /** Synchronous zoom factor of this window (1 = 100%). */
+        factor?: () => number
         setPercent: (percent: number) => void
         onChanged: (callback: (payload: { level: number; percent: number }) => void) => () => void
       }
@@ -349,16 +368,37 @@ declare global {
         start: (options?: { cols?: number; cwd?: string; rows?: number }) => Promise<HermesTerminalSession>
         write: (id: string, data: string) => Promise<boolean>
       }
+      reachPreviewUrl?: (url: string) => Promise<string>
       onClosePreviewRequested?: (callback: () => void) => () => void
+      onPreviewNav?: (callback: (command: 'back' | 'forward' | 'reload') => void) => () => void
       onOpenFolderRequested?: (callback: () => void) => () => void
       onOpenUpdatesRequested?: (callback: () => void) => () => void
       onDeepLink?: (
         callback: (payload: { kind: string; name: string; params: Record<string, string> }) => void
       ) => () => void
       signalDeepLinkReady?: () => Promise<{ ok: boolean }>
+      probePluginRepo?: (payload: { identifier?: string; repo?: string }) => Promise<{
+        ok: boolean
+        agent: boolean
+        desktop: boolean
+        agentName?: string | null
+        desktopName?: string | null
+        warnings?: string[]
+        insecure?: boolean
+        error?: string
+      }>
+      installDesktopPlugin?: (payload: {
+        identifier?: string
+        repo?: string
+        force?: boolean
+      }) => Promise<{ ok: boolean; pluginName?: string; path?: string; error?: string }>
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
+      /** Plugin (and other session-less) notification body/action activation. */
+      onNotificationActivate?: (
+        callback: (payload: { actionId?: string; activate?: string; notifyId?: string; tag?: string }) => void
+      ) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
       // Soft gateway-mode apply: primary backend was torn down without a window
@@ -617,8 +657,9 @@ export interface HermesConnection {
   // Set for pool (non-primary) backends so the renderer knows which profile a
   // connection belongs to.
   profile?: string
-  // The registry connection this descriptor was resolved through (absent on
-  // legacy v1/primary paths). Set by getConnectionFor.
+  // The registry connection this descriptor resolves to. Registry-scoped
+  // secondaries carry it directly; legacy primary remotes preserve it from
+  // their selected stored route before dialing.
   connectionId?: string
   // True only when `profile` is a request scope on the shared primary backend.
   // A pooled backend also carries `profile`, so presence alone cannot identify
@@ -1048,7 +1089,13 @@ export interface HermesNotification {
   sessionId?: string
   /** Dedupe discriminator for session-less notifications (e.g. plugin id). */
   tag?: string
-  actions?: { id: string; text: string }[]
+  /** Absolute icon path for Electron `Notification`. */
+  icon?: string
+  /** Resolved hash-router path opened on body click (plugin / deeplink-compatible). */
+  activate?: string
+  /** Renderer handle for onActivate / onAction callbacks. */
+  notifyId?: string
+  actions?: { id: string; text: string; activate?: string }[]
 }
 
 export interface HermesPreviewTarget {
