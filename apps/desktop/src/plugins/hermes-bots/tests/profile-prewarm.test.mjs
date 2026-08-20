@@ -15,6 +15,12 @@ function sourceBetween(start, end) {
   return source.slice(from, to)
 }
 
+// BotRow's activity resolver — extract the REAL helper so the harness can't
+// drift from production behavior.
+function activitySessionSource() {
+  return sourceBetween('function botActivitySession(', '/** Bots that are working')
+}
+
 function renderBotRow(input = 'alpha') {
   const bot = typeof input === 'string' ? { name: input } : input
   const name = bot.name
@@ -42,6 +48,7 @@ function renderBotRow(input = 'alpha') {
     $botMeta: atom({}),
     $botUnread: atom({}),
     $focusedBotProfile: atom('default'),
+    $groupChatWorkspace: atom(null),
     $lastRoster: atom([]),
     $selectedBot: atom('default'),
     botAppearance: () => ({ shape: 'round', color: '#000', image: null }),
@@ -92,7 +99,7 @@ function renderBotRow(input = 'alpha') {
     useValue: store => store.get()
   }
 
-  vm.runInNewContext(`${prepareSource}\n${botRowSource}\nglobalThis.BotRow = BotRow`, context)
+  vm.runInNewContext(`${activitySessionSource()}\n${prepareSource}\n${botRowSource}\nglobalThis.BotRow = BotRow`, context)
 
   const tree = context.BotRow({ bot, onEdit: context.onEdit })
   const row = tree.type === 'button' ? tree : tree.props.children[0].props.children
@@ -170,6 +177,7 @@ test('behavior: remote default does not open this-device chat when the source di
     $botMeta: atom({ default: { chat: 'this-device-chat' } }),
     $botUnread: atom({}),
     $focusedBotProfile: atom('default'),
+    $groupChatWorkspace: atom(null),
     $lastRoster: atom([]),
     $selectedBot: atom('default'),
     botAppearance: () => ({ shape: 'round', color: '#000', image: null }),
@@ -213,7 +221,7 @@ test('behavior: remote default does not open this-device chat when the source di
     useValue: store => store.get()
   }
 
-  vm.runInNewContext(`${prepareSource}\n${botRowSource}\nglobalThis.BotRow = BotRow`, context)
+  vm.runInNewContext(`${activitySessionSource()}\n${prepareSource}\n${botRowSource}\nglobalThis.BotRow = BotRow`, context)
   const tree = context.BotRow({ bot, onEdit: context.onEdit })
   const row = tree.type === 'button' ? tree : tree.props.children[0].props.children
 

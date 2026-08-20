@@ -96,7 +96,7 @@ declare global {
         setIgnoreMouse: (ignore: boolean) => void
         moveBy: (delta: { x: number; y: number; width: number; height: number }) => void
         setBounds: (bounds: { x: number; y: number; width: number; height: number }) => void
-        setVibrancy: (on: boolean) => Promise<{ ok: boolean }>
+        setFrost: (showing: boolean) => Promise<{ ok: boolean }>
         setSession: (sessionId: null | string) => void
         onGoto: (callback: (sessionId: string) => void) => () => void
         onChanged: (callback: (state: { open: boolean; sessionId: null | string }) => void) => () => void
@@ -144,6 +144,10 @@ declare global {
         ) => Promise<{ ok: boolean; connection: DesktopRegistryConnection; registry: DesktopConnectionsRegistry }>
         remove: (id: string) => Promise<{ ok: boolean; registry: DesktopConnectionsRegistry }>
         setPrimary: (id: string) => Promise<{ ok: boolean; registry: DesktopConnectionsRegistry }>
+        setLaunchMode?: (
+          mode: 'last-used' | 'primary'
+        ) => Promise<{ ok: boolean; registry: DesktopConnectionsRegistry }>
+        setLastUsed?: (id: string) => Promise<{ ok: boolean; registry: DesktopConnectionsRegistry }>
         test: (id: string) => Promise<DesktopConnectionTestResult>
         // Fan out `hermes update` to every eligible registered connection;
         // cloud entries are skipped (platform-managed), each row independent.
@@ -243,6 +247,10 @@ declare global {
       setActiveWork?: (payload: HermesActiveWork) => void
       setTitleBarTheme?: (payload: HermesTitleBarTheme) => void
       setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void
+      /** Main-process fact: this OS can back glass with a native material. */
+      glassSupported?: boolean
+      /** Main-process fact: this OS can do any translucency at all (not Linux). */
+      translucencySupported?: boolean
       setTranslucency?: (payload: TranslucencyState) => void
       setKeepAwake?: (on: boolean) => void
       setDisableF12?: (blocked: boolean) => void
@@ -661,6 +669,10 @@ export interface HermesConnection {
   // secondaries carry it directly; legacy primary remotes preserve it from
   // their selected stored route before dialing.
   connectionId?: string
+  // True only when getConnectionFor explicitly resolved a v2 registry route.
+  // An inferred connectionId identifies the visible source but its v1 profile
+  // name may still be a client-side routing alias rather than a backend profile.
+  registryScoped?: boolean
   // True only when `profile` is a request scope on the shared primary backend.
   // A pooled backend also carries `profile`, so presence alone cannot identify
   // the shared-primary routing case.
@@ -815,6 +827,12 @@ export interface DesktopConnectionsRegistry {
   version: number
   // id of the connection that owns the window/primary backend.
   primary: string
+  // Preserve old installs by defaulting to the explicit primary; users may
+  // instead resume the last successfully opened source.
+  launchMode?: 'last-used' | 'primary'
+  // Last source the Sessions workspace opened successfully. Optional for
+  // compatibility with an older Electron main during a rolling app update.
+  lastUsed?: string
   // Whether OS-keychain-backed encryption (Electron safeStorage) is available;
   // false drives the plain-text token opt-in on keyring-less Linux.
   secureTokenStorage: boolean
@@ -1076,8 +1094,8 @@ export interface HermesApiRequest {
   // Route this REST call to a specific REGISTERED gateway connection (v2
   // registry). Data owned by a remote gateway — cron jobs and their run
   // sessions — lives in that host's state.db, so requests for it must resolve
-  // through the owning connection, not the local profile pool. Omit / '' /
-  // 'local' keep the legacy profile-routed path.
+  // through the owning connection, not the local profile pool. Omit / '' to
+  // keep the legacy profile-routed path; explicit 'local' forces this device.
   connectionId?: string | null
 }
 

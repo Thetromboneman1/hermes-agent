@@ -3551,6 +3551,7 @@ def _block(
         "preview.read.request",
         "window.read.request",
         "mcp.setup.request",
+        "tour.request",
     }:
         _emit(
             f"{event.removesuffix('.request')}.expire",
@@ -3615,6 +3616,74 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
         ),
         timeout=_clarify_timeout_seconds(),
     )
+
+
+# A tour action is a DOM operation the renderer performs and answers straight
+# back, so a client that implements the bridge replies in milliseconds. The
+# generous deadline exists for one case only: a preview tour's first action
+# injects the engine into a live page.
+_TOUR_TIMEOUT_S = 45
+# Until a session's client has proven it answers at all, hold it to a deadline
+# a working renderer cannot miss. See _tour_request.
+_TOUR_PROBE_TIMEOUT_S = 10
+
+_TOUR_BRIDGE_UNAVAILABLE = json.dumps(
+    {
+        "success": False,
+        "error": (
+            "No Hermes Desktop window answered the tour request. The tour is "
+            "driven by the desktop app's renderer, which updates separately "
+            "from this backend, so an app build older than the tour tool has "
+            "nothing listening. Update the Hermes Desktop app and start a new "
+            "session. Do not retry tour in this session."
+        ),
+    }
+)
+
+
+def _tour_request(sid: str, payload: dict) -> str:
+    """Bridge the tour tool callback onto _block, without paying for a client
+    that cannot answer it.
+
+    The renderer's ``tour.request`` handler ships in the desktop bundle, but
+    the tool is offered by this backend — and the two update on different
+    clocks. Against an app older than the tool the event lands in a renderer
+    with no branch for it, nobody ever calls ``tour.respond``, and the agent
+    blocks for the full deadline. The model then does what the schema tells it
+    to and tries the next action, so a single "give me a tour" turn stacks
+    those waits (the timeouts reported against #89620).
+
+    A session's first action therefore gets the probe deadline, and an
+    unanswered probe marks the bridge unavailable for that session: every later
+    call returns immediately, telling the user what to actually fix instead of
+    stalling again. Once a client has answered, real actions get the full
+    deadline back and a single slow one no longer condemns it. The verdict
+    lives on the session record, so it dies with the session and a new one
+    re-probes.
+    """
+    # A detached caller has no session record; the throwaway keeps it on the
+    # plain bridge, unprobed.
+    session = _sessions.get(sid)
+    if session is None:
+        session = {}
+    state = session.get("tour_bridge")
+
+    if state == "unanswered":
+        return _TOUR_BRIDGE_UNAVAILABLE
+
+    answer = _block(
+        "tour.request",
+        sid,
+        dict(payload),
+        timeout=_TOUR_TIMEOUT_S if state == "answered" else _TOUR_PROBE_TIMEOUT_S,
+    )
+
+    if answer:
+        session["tour_bridge"] = "answered"
+    elif state != "answered":
+        session["tour_bridge"] = "unanswered"
+
+    return answer or _TOUR_BRIDGE_UNAVAILABLE
 
 
 def _clear_pending(sid: str | None = None) -> None:
@@ -5775,6 +5844,20 @@ def _emit_session_info_for_session(sid: str, session: dict) -> None:
         pass
 
 
+def broadcast_session_info() -> None:
+    """Re-emit ``session.info`` to every live session.
+
+    For approvals-config writers that bypass the ``config.set`` RPC (which
+    re-emits itself): the REST config saves and the ``/approvals`` slash
+    mirror. Only reaches sessions in THIS process; a spawned
+    ``tui_gateway.entry`` child gateway has its own ``_sessions``.
+    """
+    with _sessions_lock:
+        sessions = list(_sessions.items())
+    for sid, sess in sessions:
+        _emit_session_info_for_session(sid, sess)
+
+
 # Tool Args/Result text shipped to the TUI for the verbose trail line. The TUI
 # renders only a small persisted preview (ui-tui VERBOSE_TRAIL_MAX_CHARS), kept
 # all session and expanded by default — so shipping more than that is pure pipe
@@ -6307,6 +6390,11 @@ def _agent_cbs(sid: str) -> dict:
             {"server": server, "action": action, "reason": reason},
             timeout=600,
         ),
+        # tour tool (desktop GUI): the renderer drives driver.js — highlighting
+        # elements in the app's own DOM or injecting the engine into the
+        # preview pane's webview — and answers tour.respond with the outcome
+        # (did the selector match, which step is active).
+        "tour_callback": lambda payload: _tour_request(sid, payload),
     }
 
     # Interim assistant commentary (text alongside tool calls, or the attempted
@@ -10311,7 +10399,7 @@ _desktop_ui_wired = False
 
 
 def _wire_desktop_ui() -> None:
-    """Bridge desktop-only tools (open_preview, focus_pane) to renderer events.
+    """Bridge desktop-only tools (open_preview, close_preview, focus_pane) to renderer events.
 
     Idempotent. The tool hands back the turn's ``HERMES_UI_SESSION_ID`` as
     ``sid`` so the event routes to the window that asked (``_emit`` /
@@ -13927,6 +14015,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         if name == "model" and arg and agent:
             result = _apply_model_switch(sid, session, arg)
             return result.get("warning", "")
+        elif name == "approvals" and arg:
+            # The slash worker already persisted the new approvals.mode; the
+            # bare (read-only) form has no arg and needs no repaint.
+            broadcast_session_info()
         elif name == "personality" and arg and agent:
             pname, new_prompt = _validate_personality(arg, _load_cfg())
             # Persist through the single owner so this surface can never
