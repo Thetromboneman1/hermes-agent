@@ -520,7 +520,7 @@ def init_agent(
     command: str = None,
     args: list[str] | None = None,
     model: str = "",
-    max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+    max_iterations: int = sys.maxsize,  # Default: unlimited tool-calling iterations (shared with subagents)
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     save_trajectories: bool = False,
@@ -546,6 +546,7 @@ def init_agent(
     clarify_callback: callable = None,
     read_terminal_callback: callable = None,
     read_preview_callback: callable = None,
+    drive_preview_callback: callable = None,
     read_window_below_callback: callable = None,
     setup_mcp_callback: callable = None,
     tour_callback: callable = None,
@@ -843,6 +844,7 @@ def init_agent(
     agent.clarify_callback = clarify_callback
     agent.read_terminal_callback = read_terminal_callback
     agent.read_preview_callback = read_preview_callback
+    agent.drive_preview_callback = drive_preview_callback
     agent.read_window_below_callback = read_window_below_callback
     agent.setup_mcp_callback = setup_mcp_callback
     agent.tour_callback = tour_callback
@@ -1809,15 +1811,23 @@ def init_agent(
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
     if not skip_memory or _memory_toolset_requested:
         try:
-            mem_config = _agent_cfg.get("memory", {})
-            agent._memory_enabled = mem_config.get("memory_enabled", False)
-            agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+            from tools.memory_tool import (
+                get_builtin_memory_config,
+                get_builtin_memory_store_flags,
+            )
+
+            mem_config = get_builtin_memory_config(_agent_cfg)
+            agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
+                _agent_cfg
+            )
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    memory_enabled=agent._memory_enabled,
+                    user_profile_enabled=agent._user_profile_enabled,
                 )
                 agent._memory_store.load_from_disk()
         except Exception:

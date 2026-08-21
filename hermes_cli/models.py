@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 from hermes_cli import __version__ as _HERMES_VERSION
 from hermes_cli.urllib_security import open_credentialed_url, url_origin
-from utils import base_url_host_matches
+from utils import atomic_json_write, base_url_host_matches
 
 logger = logging.getLogger(__name__)
 
@@ -484,9 +484,18 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "anthropic/claude-sonnet-4.6",
         "openai/gpt-5.4",
     ],
+    # Synced against https://opencode.ai/docs/zen/ + live GET /zen/v1/models
+    # (2026-08-20). Zen/Go are _LIVE_FIRST_PICKER_PROVIDERS, so this list is a
+    # discovery floor — live entries lead in the picker and stale curated
+    # names never pollute the top.
     "opencode-zen": [
+        "x-preview-f-free",  # "Ox Alpha" stealth model — free, 1M ctx, ZDR
+        "kimi-k3",
         "kimi-k2.5",
         "kimi-k2.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
         "gpt-5.5",
         "gpt-5.5-pro",
         "gpt-5.4-pro",
@@ -505,6 +514,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-5-codex",
         "gpt-5-nano",
         "claude-fable-5",
+        "claude-opus-5",
         "claude-sonnet-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
@@ -515,9 +525,16 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-sonnet-4-5",
         "claude-sonnet-4",
         "claude-haiku-4-5",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
         "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
         "gemini-3.1-pro",
         "gemini-3-flash",
+        "grok-4.6",
+        "grok-4.5",
+        "grok-build-0.1",
+        "muse-spark-1.2",
         "minimax-m3",
         "minimax-m2.7",
         "minimax-m2.5",
@@ -528,20 +545,28 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek-v4-pro",
         "deepseek-v4-flash",
         "deepseek-v4-flash-free",
+        "qwen3.7-max",
         "qwen3.7-plus",
         "qwen3.6-plus",
         "qwen3.5-plus",
-        "grok-build-0.1",
         "big-pickle",
         "mimo-v2.5-free",
-        "north-mini-code-free",
+        "hy3-free",
+        "laguna-s-2.1-free",
         "nemotron-3-ultra-free",
+        "nemotron-3.5-lightning-free",
+        "muse-spark-1.2-contributor-free",
     ],
+    # Synced against https://opencode.ai/docs/go/ + live GET /zen/go/v1/models
+    # (2026-08-20).
     "opencode-go": [
         "kimi-k3",
         "kimi-k2.7-code",
         "kimi-k2.6",
         "kimi-k2.5",
+        "gpt-5.6-luna",
+        "grok-4.5",
+        "glm-5.3",
         "glm-5.2",
         "glm-5.1",
         "glm-5",
@@ -554,10 +579,14 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "minimax-m2.5",
         "deepseek-v4-pro",
         "deepseek-v4-flash",
+        "qwen3.8-max",
         "qwen3.7-max",
         "qwen3.7-plus",
         "qwen3.6-plus",
         "qwen3.5-plus",
+        "hy3",
+        "hy3-preview",
+        "muse-spark-1.2-contributor",
     ],
     "kilocode": [
         "anthropic/claude-opus-4.6",
@@ -1602,6 +1631,124 @@ _openrouter_reasoning_caps_cache: dict[str, Optional[dict[str, Any]]] | None = N
 _openrouter_reasoning_caps_failed_at: float | None = None
 
 
+# ── Disk mirror ────────────────────────────────────────────────────────
+#
+# The in-process caches are always cold in a short-lived process, and every
+# consumer is on a hot path that must never block on HTTP — so without a disk
+# copy, `hermes -p`, a cron job, or a freshly booted gateway answers
+# "capability unknown" for its whole first turn and falls back to the
+# conservative wire shape. Persisting the parsed catalog makes every run after
+# the first correct from its first turn.
+#
+# One file holds every catalog, keyed by the URL it came from: OpenRouter and
+# the Nous Portal list different models, and a staging Portal must not answer
+# for production.
+_REASONING_CAPS_DISK_TTL_SECONDS = 24 * 3600
+
+
+def _reasoning_caps_disk_path() -> Path:
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "cache" / "reasoning_caps.json"
+
+
+def _read_reasoning_caps_disk() -> dict[str, Any]:
+    try:
+        with _reasoning_caps_disk_path().open(encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_reasoning_caps_disk(
+    url: str,
+) -> tuple[Optional[dict[str, Optional[dict[str, Any]]]], float]:
+    """Return ``(caps, age_seconds)`` for *url*, or ``(None, 0.0)``."""
+    entry = _read_reasoning_caps_disk().get(url)
+    if not isinstance(entry, dict):
+        return None, 0.0
+    caps = entry.get("caps")
+    if not isinstance(caps, dict) or not caps:
+        return None, 0.0
+    try:
+        age = max(0.0, time.time() - float(entry.get("ts") or 0))
+    except (TypeError, ValueError):
+        age = float(_REASONING_CAPS_DISK_TTL_SECONDS)
+    return {str(mid): model_caps for mid, model_caps in caps.items()}, age
+
+
+def _save_reasoning_caps_disk(
+    url: str, caps: dict[str, Optional[dict[str, Any]]]
+) -> None:
+    """Merge *url*'s catalog into the shared disk mirror, atomically."""
+    try:
+        data = _read_reasoning_caps_disk()
+        data[url] = {"ts": time.time(), "caps": caps}
+        path = _reasoning_caps_disk_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json_write(path, data, indent=0, separators=(",", ":"))
+    except Exception as exc:
+        logger.debug("Failed to save reasoning-caps disk cache: %s", exc)
+
+
+def _warm_reasoning_caps_async(refresh) -> None:
+    """Run *refresh* in a background thread. Fire-and-forget.
+
+    Called from hot paths that found the cache cold or the disk copy stale, so
+    the next call — or, via the disk mirror, the next process — benefits
+    without this turn ever blocking on HTTP. Callers own the once-per-process
+    guard; the fetch keeps its own failure TTL. Skipped under pytest, where a
+    mid-suite background fetch would make cache state, and therefore test
+    behavior, timing-dependent.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    threading.Thread(
+        target=refresh, name="reasoning-caps-warm", daemon=True
+    ).start()
+
+
+def _hydrate_reasoning_caps_from_disk(url: str, refresh):
+    """The disk copy of *url*'s catalog, queueing *refresh* when it's stale.
+
+    A copy past its TTL is still returned — a stale verdict beats no verdict,
+    and reasoning capabilities change rarely — with a background refresh so
+    the next run is current.
+    """
+    caps, age = _load_reasoning_caps_disk(url)
+    if caps is None:
+        return None
+    if age >= _REASONING_CAPS_DISK_TTL_SECONDS:
+        _warm_reasoning_caps_async(refresh)
+    return caps
+
+
+def _seed_reasoning_caps(
+    url: str, items: Any
+) -> Optional[dict[str, Optional[dict[str, Any]]]]:
+    """Parse a ``/v1/models`` ``data`` array and mirror it for *url*.
+
+    Takes the payload rather than fetching it, so the picker and pricing
+    fetches — which pull the same document a capability fetch would — leave the
+    mirror warm at no network cost. None when the array has no usable entries,
+    which callers remember as a failure rather than caching as empty.
+    """
+    if not isinstance(items, list):
+        return None
+    caps_by_id: dict[str, Optional[dict[str, Any]]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("id") or "").strip()
+        if not mid:
+            continue
+        caps_by_id[mid] = parse_openrouter_reasoning_capabilities(item)
+    if not caps_by_id:
+        return None
+    _save_reasoning_caps_disk(url, caps_by_id)
+    return caps_by_id
+
+
 def _fetch_reasoning_caps_catalog(
     url: str, timeout: float
 ) -> Optional[dict[str, Optional[dict[str, Any]]]]:
@@ -1621,44 +1768,41 @@ def _fetch_reasoning_caps_catalog(
             payload = json.loads(resp.read().decode())
     except Exception:
         return None
-    items = payload.get("data")
-    if not isinstance(items, list):
-        return None
-    caps_by_id: dict[str, Optional[dict[str, Any]]] = {}
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        mid = str(item.get("id") or "").strip()
-        if not mid:
-            continue
-        caps_by_id[mid] = parse_openrouter_reasoning_capabilities(item)
-    return caps_by_id or None
+    return _seed_reasoning_caps(url, payload.get("data"))
 
 
-def _fetch_openrouter_reasoning_caps(timeout: float = 6.0) -> Optional[dict[str, Optional[dict[str, Any]]]]:
+_OPENROUTER_CATALOG_URL = "https://openrouter.ai/api/v1/models"
+
+
+def _fetch_openrouter_reasoning_caps(
+    timeout: float = 6.0, *, force: bool = False
+) -> Optional[dict[str, Optional[dict[str, Any]]]]:
     """Fetch + cache per-model reasoning capabilities from the live catalog.
 
     Returns None (without poisoning the cache) when the catalog is
     unreachable so callers can retry later and fall back in the meantime.
     Failed fetches are remembered for 60 seconds so hot per-turn callers
-    don't pay an HTTP round-trip on every call while offline.
+    don't pay an HTTP round-trip on every call while offline. *force* refetches
+    past a cache populated from the disk mirror.
     """
     global _openrouter_reasoning_caps_cache, _openrouter_reasoning_caps_failed_at
-    if _openrouter_reasoning_caps_cache is not None:
+    if _openrouter_reasoning_caps_cache is not None and not force:
         return _openrouter_reasoning_caps_cache
     if (
         _openrouter_reasoning_caps_failed_at is not None
         and (time.monotonic() - _openrouter_reasoning_caps_failed_at) < 60
     ):
         return None
-    caps_by_id = _fetch_reasoning_caps_catalog(
-        "https://openrouter.ai/api/v1/models", timeout
-    )
+    caps_by_id = _fetch_reasoning_caps_catalog(_OPENROUTER_CATALOG_URL, timeout)
     if caps_by_id is None:
         _openrouter_reasoning_caps_failed_at = time.monotonic()
         return None
     _openrouter_reasoning_caps_cache = caps_by_id
     return caps_by_id
+
+
+def _refresh_openrouter_reasoning_caps() -> None:
+    _fetch_openrouter_reasoning_caps(force=True)
 
 
 def openrouter_model_reasoning_capabilities(
@@ -1681,14 +1825,15 @@ def openrouter_model_reasoning_capabilities(
 
     By default this is a CACHE-ONLY lookup — safe on per-request hot paths
     (never blocks on HTTP). The cache is populated for free whenever
-    ``fetch_openrouter_models()`` runs (model picker, setup), by the
-    non-blocking ``warm_openrouter_reasoning_caps_async()`` warmer, or by
-    passing ``allow_fetch=True`` from non-latency-sensitive callers.
+    ``fetch_openrouter_models()`` runs (model picker, setup), from the disk
+    mirror a previous run left behind, by the non-blocking
+    ``warm_openrouter_reasoning_caps_async()`` warmer, or by passing
+    ``allow_fetch=True`` from non-latency-sensitive callers.
     """
     model = str(model_id or "").strip()
     if not model:
         return None
-    caps_by_id = _openrouter_reasoning_caps_cache
+    caps_by_id = _openrouter_caps_cached()
     if caps_by_id is None and allow_fetch:
         caps_by_id = _fetch_openrouter_reasoning_caps(timeout=timeout)
     if caps_by_id is None:
@@ -1696,29 +1841,28 @@ def openrouter_model_reasoning_capabilities(
     return caps_by_id.get(model)
 
 
+_openrouter_caps_disk_checked = False
 _openrouter_caps_warm_started = False
 
 
-def warm_openrouter_reasoning_caps_async() -> None:
-    """Warm the reasoning-capability cache in a background thread.
+def _openrouter_caps_cached() -> Optional[dict[str, Optional[dict[str, Any]]]]:
+    """Cache-only OpenRouter caps: memory, else the disk mirror. Never HTTP."""
+    global _openrouter_reasoning_caps_cache, _openrouter_caps_disk_checked
+    if _openrouter_reasoning_caps_cache is None and not _openrouter_caps_disk_checked:
+        _openrouter_caps_disk_checked = True
+        _openrouter_reasoning_caps_cache = _hydrate_reasoning_caps_from_disk(
+            _OPENROUTER_CATALOG_URL, _refresh_openrouter_reasoning_caps
+        )
+    return _openrouter_reasoning_caps_cache
 
-    Fire-and-forget: called from hot paths that found the cache cold so the
-    NEXT call benefits, without ever blocking a turn on HTTP. One warm
-    attempt per process (the fetch has its own 60s failure TTL). Skipped
-    under pytest — a mid-suite background fetch would make cache state, and
-    therefore test behavior, timing-dependent.
-    """
+
+def warm_openrouter_reasoning_caps_async() -> None:
+    """Warm the OpenRouter reasoning-capability cache in the background."""
     global _openrouter_caps_warm_started
-    if _openrouter_caps_warm_started or _openrouter_reasoning_caps_cache is not None:
-        return
-    if os.environ.get("PYTEST_CURRENT_TEST"):
+    if _openrouter_caps_warm_started or _openrouter_caps_cached() is not None:
         return
     _openrouter_caps_warm_started = True
-    threading.Thread(
-        target=_fetch_openrouter_reasoning_caps,
-        name="openrouter-reasoning-caps-warm",
-        daemon=True,
-    ).start()
+    _warm_reasoning_caps_async(_refresh_openrouter_reasoning_caps)
 
 
 # Nous Portal serves OpenRouter's catalog schema, so the same parser and
@@ -1726,27 +1870,41 @@ def warm_openrouter_reasoning_caps_async() -> None:
 # list different models (and different capabilities for shared ids).
 _nous_reasoning_caps_cache: dict[str, Optional[dict[str, Any]]] | None = None
 _nous_reasoning_caps_failed_at: float | None = None
-_nous_caps_warm_started = False
 
 
-def _fetch_nous_reasoning_caps(timeout: float = 6.0) -> Optional[dict[str, Optional[dict[str, Any]]]]:
+def nous_catalog_url() -> str:
+    """The Portal ``/v1/models`` URL for the endpoint we actually talk to.
+
+    Resolved through the documented ladder rather than pinned to production —
+    ``NOUS_INFERENCE_BASE_URL`` → resolved credential base → prod — so a
+    staging profile reads staging's capabilities. Reading prod's would answer
+    the reasoning-mandatory question for the wrong deployment.
+    """
+    return f"{_resolve_nous_pricing_credentials()[1]}/v1/models"
+
+
+def _fetch_nous_reasoning_caps(
+    timeout: float = 6.0, *, force: bool = False
+) -> Optional[dict[str, Optional[dict[str, Any]]]]:
     """Nous Portal counterpart of :func:`_fetch_openrouter_reasoning_caps`."""
     global _nous_reasoning_caps_cache, _nous_reasoning_caps_failed_at
-    if _nous_reasoning_caps_cache is not None:
+    if _nous_reasoning_caps_cache is not None and not force:
         return _nous_reasoning_caps_cache
     if (
         _nous_reasoning_caps_failed_at is not None
         and (time.monotonic() - _nous_reasoning_caps_failed_at) < 60
     ):
         return None
-    caps_by_id = _fetch_reasoning_caps_catalog(
-        f"{_DEFAULT_NOUS_INFERENCE_BASE}/v1/models", timeout
-    )
+    caps_by_id = _fetch_reasoning_caps_catalog(nous_catalog_url(), timeout)
     if caps_by_id is None:
         _nous_reasoning_caps_failed_at = time.monotonic()
         return None
     _nous_reasoning_caps_cache = caps_by_id
     return caps_by_id
+
+
+def _refresh_nous_reasoning_caps() -> None:
+    _fetch_nous_reasoning_caps(force=True)
 
 
 def nous_model_reasoning_capabilities(
@@ -1764,7 +1922,7 @@ def nous_model_reasoning_capabilities(
     model = str(model_id or "").strip()
     if not model:
         return None
-    caps_by_id = _nous_reasoning_caps_cache
+    caps_by_id = _nous_caps_cached()
     if caps_by_id is None and allow_fetch:
         caps_by_id = _fetch_nous_reasoning_caps(timeout=timeout)
     if caps_by_id is None:
@@ -1772,19 +1930,33 @@ def nous_model_reasoning_capabilities(
     return caps_by_id.get(model)
 
 
+_nous_caps_disk_checked = False
+_nous_caps_warm_started = False
+
+
+def _nous_caps_cached() -> Optional[dict[str, Optional[dict[str, Any]]]]:
+    """Cache-only Portal caps: memory, else the disk mirror. Never HTTP.
+
+    Guarded to one attempt per process because naming the catalog means
+    resolving Portal credentials, which can itself reach the network to
+    refresh a token — far too expensive for a caller that runs every turn.
+    """
+    global _nous_reasoning_caps_cache, _nous_caps_disk_checked
+    if _nous_reasoning_caps_cache is None and not _nous_caps_disk_checked:
+        _nous_caps_disk_checked = True
+        _nous_reasoning_caps_cache = _hydrate_reasoning_caps_from_disk(
+            nous_catalog_url(), _refresh_nous_reasoning_caps
+        )
+    return _nous_reasoning_caps_cache
+
+
 def warm_nous_reasoning_caps_async() -> None:
     """Nous Portal counterpart of :func:`warm_openrouter_reasoning_caps_async`."""
     global _nous_caps_warm_started
-    if _nous_caps_warm_started or _nous_reasoning_caps_cache is not None:
-        return
-    if os.environ.get("PYTEST_CURRENT_TEST"):
+    if _nous_caps_warm_started or _nous_caps_cached() is not None:
         return
     _nous_caps_warm_started = True
-    threading.Thread(
-        target=_fetch_nous_reasoning_caps,
-        name="nous-reasoning-caps-warm",
-        daemon=True,
-    ).start()
+    _warm_reasoning_caps_async(_refresh_nous_reasoning_caps)
 
 
 # Canonical low→high ordering used for nearest-level clamping. Kept as an
@@ -1837,7 +2009,7 @@ def fetch_openrouter_models(
 
     try:
         req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/models",
+            _OPENROUTER_CATALOG_URL,
             headers={"Accept": "application/json"},
         )
         with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
@@ -1858,16 +2030,14 @@ def fetch_openrouter_models(
             continue
         live_by_id[mid] = item
 
-    # Free warm-up for the reasoning-capability cache: this is the same
-    # payload _fetch_openrouter_reasoning_caps would fetch, so parse it once
-    # here and hot-path callers (openrouter_model_reasoning_capabilities)
-    # never need their own HTTP round-trip.
+    # Free warm-up for the reasoning-capability cache: this is the same payload
+    # _fetch_openrouter_reasoning_caps would fetch, so parse it once here and
+    # hot-path callers (openrouter_model_reasoning_capabilities) never need
+    # their own HTTP round-trip.
     global _openrouter_reasoning_caps_cache
-    if _openrouter_reasoning_caps_cache is None and live_by_id:
-        _openrouter_reasoning_caps_cache = {
-            mid: parse_openrouter_reasoning_capabilities(item)
-            for mid, item in live_by_id.items()
-        }
+    seeded = _seed_reasoning_caps(_OPENROUTER_CATALOG_URL, live_items)
+    if _openrouter_reasoning_caps_cache is None and seeded is not None:
+        _openrouter_reasoning_caps_cache = seeded
 
     curated: list[tuple[str, str]] = []
     silent_default = get_preferred_silent_default_model("openrouter")
@@ -2210,6 +2380,11 @@ def fetch_models_with_pricing(
     except Exception:
         return _cache_catalog(cache_key, {})
 
+    # Same document the reasoning-capability fetch would pull, and every
+    # picker/pricing surface goes through here — mirror it so a later hot-path
+    # lookup (and the next process) has an answer without its own round-trip.
+    _seed_reasoning_caps(url, payload.get("data"))
+
     result: dict[str, dict[str, Any]] = {}
     for item in payload.get("data", []):
         mid = item.get("id")
@@ -2344,6 +2519,10 @@ def _resolve_nous_pricing_credentials() -> tuple[str, str]:
         pass
 
     base_url = (env_base or creds_base or _DEFAULT_NOUS_INFERENCE_BASE).rstrip("/")
+    # Credential bases arrive with or without the ``/v1`` suffix. Callers
+    # append their own path, so hand back the bare origin.
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
     return (api_key, base_url)
 
 
@@ -2367,14 +2546,9 @@ def get_pricing_for_provider(provider: str, *, force_refresh: bool = False) -> d
     if normalized == "nous":
         api_key, base_url = _resolve_nous_pricing_credentials()
         if base_url:
-            # Nous base_url typically looks like https://inference-api.nousresearch.com/v1
-            # We need the part before /v1 for our fetch function
-            stripped = base_url.rstrip("/")
-            if stripped.endswith("/v1"):
-                stripped = stripped[:-3]
             return fetch_models_with_pricing(
                 api_key=api_key,
-                base_url=stripped,
+                base_url=base_url,
                 force_refresh=force_refresh,
                 # Sale chrome (pricing.original) is Nous Portal-only.
                 include_sale_original=True,
@@ -5099,16 +5273,46 @@ def azure_foundry_model_api_mode(model_name: Optional[str]) -> Optional[str]:
     return None
 
 
+def opencode_provider_family(provider_id: Optional[str]) -> Optional[str]:
+    """Resolve a provider id to its OpenCode family, or None.
+
+    Returns ``"opencode-zen"`` or ``"opencode-go"`` for the built-in
+    providers AND for custom providers whose name extends a family slug
+    (e.g. ``opencode-go-bridge`` pointing at ``https://opencode.ai/zen/go/v1``,
+    issue #85589). Matching is case-insensitive. Custom family providers
+    need the same per-model api_mode routing and /v1 base-url normalization
+    as the built-ins — this predicate is the single owner of that
+    family-membership question; do not re-implement it inline.
+
+    ``opencode-go`` is checked before ``opencode-zen`` but the two slugs are
+    not prefixes of each other, so order is cosmetic.
+    """
+    raw = str(provider_id or "").strip().lower()
+    if not raw:
+        return None
+    canonical = normalize_provider(provider_id)
+    if canonical in {"opencode-zen", "opencode-go"}:
+        return canonical
+    if raw.startswith("opencode-go"):
+        return "opencode-go"
+    if raw.startswith("opencode-zen"):
+        return "opencode-zen"
+    return None
+
+
 def normalize_opencode_model_id(provider_id: Optional[str], model_id: Optional[str]) -> str:
     """Normalize OpenCode config IDs to the bare model slug used in API requests."""
-    provider = normalize_provider(provider_id)
+    family = opencode_provider_family(provider_id)
     current = str(model_id or "").strip()
-    if not current or provider not in {"opencode-zen", "opencode-go"}:
+    if not current or family is None:
         return current
 
-    prefix = f"{provider}/"
-    if current.lower().startswith(prefix):
+    prefix = f"{provider_id}/" if provider_id else f"{family}/"
+    if current.lower().startswith(prefix.lower()):
         return current[len(prefix):]
+    fallback_prefix = f"{family}/"
+    if current.lower().startswith(fallback_prefix.lower()):
+        return current[len(fallback_prefix):]
     return current
 
 
@@ -5117,8 +5321,9 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
 
     OpenCode routes different models behind different API surfaces:
 
-    - GPT-5 / Codex models on Zen use ``/v1/responses``
-    - GPT models on Go (gpt-5.6-luna) use ``/v1/responses``
+    - GPT-5 / Codex / Grok models on Zen use ``/v1/responses``
+    - GPT / Grok models on Go (gpt-5.6-luna, grok-4.5) use ``/v1/responses``
+    - Muse Spark on Go and Zen uses ``/v1/responses`` (chat/completions 503s)
     - Claude models on Zen use ``/v1/messages``
     - MiniMax and Qwen models on Go use ``/v1/messages``
     - GLM / Kimi / DeepSeek / MiMo on Go use ``/v1/chat/completions``
@@ -5129,16 +5334,21 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
     This follows the published OpenCode docs for Zen and Go endpoints
     (https://opencode.ai/docs/zen/ and https://opencode.ai/docs/go/).
     """
-    provider = normalize_provider(provider_id)
+    family = opencode_provider_family(provider_id)
     normalized = normalize_opencode_model_id(provider_id, model_id).lower()
     if not normalized:
         return "chat_completions"
 
-    if provider == "opencode-go":
-        if normalized.startswith("gpt-"):
-            # GPT models on Go (gpt-5.6-luna) are served via /v1/responses
-            # per the published Go endpoint table, same as GPT on Zen:
-            # https://opencode.ai/docs/go/#endpoints
+    if family == "opencode-go":
+        if normalized.startswith("gpt-") or normalized.startswith("grok-"):
+            # GPT and Grok models on Go (gpt-5.6-luna, grok-4.5) are served
+            # via /v1/responses per the published Go endpoint table, same as
+            # GPT/Grok on Zen: https://opencode.ai/docs/go/#endpoints
+            return "codex_responses"
+        if normalized.startswith("muse-spark"):
+            # Muse Spark (standard + contributor) is Responses-only on Go.
+            # /v1/chat/completions returns HTTP 503 with an empty assistant
+            # message; /v1/responses completes. See opencode.ai/docs/go.
             return "codex_responses"
         if normalized.startswith("minimax-"):
             return "anthropic_messages"
@@ -5148,10 +5358,17 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
             return "anthropic_messages"
         return "chat_completions"
 
-    if provider == "opencode-zen":
+    if family == "opencode-zen":
         if normalized.startswith("claude-"):
             return "anthropic_messages"
-        if normalized.startswith("gpt-"):
+        if normalized.startswith("gpt-") or normalized.startswith("grok-"):
+            # GPT-5/Codex and all Grok models on Zen (grok-4.6, grok-4.5,
+            # grok-build-0.1) are served via /v1/responses per the Zen
+            # endpoint table.
+            return "codex_responses"
+        if normalized.startswith("muse-spark"):
+            # Standard Muse Spark on Zen is served via /v1/responses:
+            # https://opencode.ai/docs/zen/#endpoints
             return "codex_responses"
         if normalized.startswith("qwen"):
             # Qwen models on Zen moved to /v1/messages per the published
@@ -5186,8 +5403,7 @@ def normalize_opencode_base_url(
     url = str(base_url or "").strip().rstrip("/")
     if not url:
         return url
-    provider = normalize_provider(provider_id)
-    if provider not in {"opencode-zen", "opencode-go"}:
+    if opencode_provider_family(provider_id) is None:
         return url
 
     import re as _re
