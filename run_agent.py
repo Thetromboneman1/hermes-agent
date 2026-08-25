@@ -162,6 +162,7 @@ from agent.usage_pricing import normalize_usage
 from agent.context_compressor import (  # noqa: F401
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
+    user_originated_turn_view,
 )
 from agent.retry_utils import jittered_backoff  # noqa: F401
 from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.<name>") / from run_agent import <name>
@@ -2372,6 +2373,7 @@ class AIAgent:
                         "hidden"
                         if (
                             msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                            and user_originated_turn_view(msg) is None
                             and (
                                 ContextCompressor.classify_summary_content(
                                     msg.get("content")
@@ -6410,7 +6412,7 @@ class AIAgent:
         elif base_url_host_matches(base_url, "chatgpt.com"):
             from agent.auxiliary_client import _codex_cloudflare_headers
             self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
-                self._client_kwargs.get("api_key", "")
+                self._client_kwargs.get("api_key", ""), base_url=base_url,
             )
         elif base_url_host_matches(base_url, "x.ai"):
             # Cover both provider=xai and provider=xai-oauth (api.x.ai).
