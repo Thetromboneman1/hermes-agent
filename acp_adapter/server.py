@@ -978,6 +978,9 @@ class HermesACPAgent(acp.Agent):
                     available_models.append(info)
                 seen_ids.add(choice_id)
 
+            if prioritized_models:
+                available_models = prioritized_models + available_models
+
             # Named user-defined endpoints (providers: / custom_providers:)
             # are invisible to canonical provider enumeration — append them
             # so editor clients can select them like the TUI /model picker.
@@ -1076,7 +1079,7 @@ class HermesACPAgent(acp.Agent):
             ):
                 provider_name = provider_label(normalized_provider)
                 available_models.insert(
-                    0,
+                    len(prioritized_models),
                     ModelInfo(
                         model_id=current_model_id,
                         name=f"{provider_name} · {model}",
