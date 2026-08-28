@@ -117,6 +117,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("minimax/minimax-m3",                     ""),
     # Z-AI
     ("z-ai/glm-5.3",                           ""),
+    ("z-ai/glm-5.3-flash",                     ""),
     ("z-ai/glm-5.2",                           "default"),
     # Xiaomi
     ("xiaomi/mimo-v2.5-pro",                   ""),
@@ -133,8 +134,9 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # OpenRouter routers
     ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
     # Free tier
-    ("stealth/ox-alpha",                       "free"),  # "Ox Alpha" stealth reasoning model — 1M ctx
-    ("openrouter/elephant-alpha",              "free"),
+    ("thinkingmachines/inkling:free",          "free"),
+    ("thinkingmachines/inkling-small:free",    "free"),
+    ("minimax/minimax-m3:free",                "free"),
     ("z-ai/glm-5.2:free",                      "free"),
     ("poolside/laguna-s-2.1:free",             "free"),
     ("poolside/laguna-xs-2.1:free",            "free"),
@@ -295,6 +297,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "minimax/minimax-m3",
         # Z-AI
         "z-ai/glm-5.3",
+        "z-ai/glm-5.3-flash",
         "z-ai/glm-5.2",
         # Xiaomi
         "xiaomi/mimo-v2.5-pro",
@@ -306,11 +309,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "nvidia/nemotron-3-super-120b-a12b",
         # Sakana
         "sakana/fugu-ultra",
-        # Stealth — "Ox Alpha" reasoning model, free ($0/$0 on the portal),
-        # 1M ctx / 131K max output. Same model as OpenCode Zen's
-        # x-preview-f-free; metadata entries live under the bare "ox-alpha"
-        # slug (model_metadata.py / reasoning_timeouts.py).
-        "stealth/ox-alpha",
     ],
     # Native OpenAI Chat Completions (api.openai.com). Used by /model counts and
     # provider_model_ids fallback when /v1/models is unavailable.
@@ -376,6 +374,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "zai": [
         "glm-5.3",
+        "glm-5.3-flash",
         "glm-5.2",
         "glm-5.1",
         "glm-5",
@@ -547,6 +546,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "minimax-m2.7",
         "minimax-m2.5",
         "glm-5.3",
+        "glm-5.3-flash",
         "glm-5.2",
         "glm-5.1",
         "glm-5",
@@ -589,6 +589,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-5.6-luna",
         "grok-4.5",
         "glm-5.3",
+        "glm-5.3-flash",
         "glm-5.2",
         "glm-5.1",
         "glm-5",

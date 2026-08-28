@@ -469,6 +469,12 @@ export const ar = defineLocale({
       introSplashDesc: 'الشعار النصي والعبارة التمهيدية في محادثة فارغة.',
       reactionsTitle: 'تفاعلات الرسائل',
       reactionsDesc: 'تفاعلات إيموجي بأسلوب iMessage — تفاعل مع الرسائل، ويمكن لـ Hermes التفاعل مع رسائلك.',
+      tipsTitle: 'نصائح داخل التطبيق',
+      tipsDesc:
+        'فقاعة صغيرة تشير إلى جزء من التطبيق، تظهر أحيانًا أثناء الخمول ومن Hermes عند الحاجة. إغلاق نصيحة يزيلها نهائيًا.',
+      tipsReset: count => `استعادة ${count} نصيحة مغلقة`,
+      toursTitle: 'جولات إرشادية',
+      toursDesc: 'دع Hermes يرشدك في التطبيق، مع تعتيم الشاشة وإبراز كل خطوة.',
       composerPopoutTitle: 'محرر عائم',
       composerPopoutDesc: 'السماح بسحب محرر الرسائل خارج موضعه. عطّل هذا الخيار لإبقائه مثبتًا في الأسفل.',
       vibeHeartsTitle: 'قلوب المزاج',
@@ -1502,7 +1508,11 @@ export const ar = defineLocale({
       message: count => `سيتم تخطي ${count} من المهام المجدولة حتى تراجع إعدادات النموذج الخاصة بها.`,
       detailMore: (names, remaining) => `${names} و${remaining} أخرى`,
       review: 'مراجعة المهام المجدولة',
-      saveFailed: 'لم يحفظ Hermes تغيير النموذج هذا.'
+      saveFailed: 'لم يحفظ Hermes تغيير النموذج هذا.',
+      confirmTitle: 'تحذير اختيار النموذج',
+      confirmDetail: 'أكّد فقط إذا كنت تقبل هذه المقايضة.',
+      confirmAction: 'تأكيد',
+      declined: 'أُلغي تغيير النموذج — رفضت تحذير طبقة تدريب البيانات.'
     },
     search: 'بحث',
     loading: 'جار التحميل...',
@@ -2775,6 +2785,10 @@ export const ar = defineLocale({
     editFailed: 'فشل التحرير',
     editTurnUnavailable: 'هذه الجولة لم تعد في سجل الخادم (ربما أزيلت بالضغط).',
     resumeFailed: 'فشل الاستئناف',
+    readOnlyTranscriptTitle: 'فُتحت للقراءة فقط',
+    readOnlyTranscriptBody:
+      'لا يوجد بعد خادم متصل يملك هذه المحادثة القديمة، لذا فُتحت كنصّ محفوظ للقراءة فقط. السجل سليم؛ الإرسال معطّل حتى يتبنّاها خادم.',
+    readOnlyTranscriptSendBlocked: 'هذه المحادثة مفتوحة كنصّ محفوظ للقراءة فقط — الإرسال معطّل.',
     resumeStrandedTitle: 'تعذّر تحميل هذه الجلسة',
     resumeStrandedBody:
       'فشل الاتصال بهذه الجلسة وتوقفت إعادة المحاولة التلقائية. تأكد من تشغيل البوابة، ثم حاول مجددا.',
@@ -2793,6 +2807,7 @@ export const ar = defineLocale({
     cwdStagedTitle: 'تم تجهيز مجلد العمل',
     cwdStagedMessage: 'سيطبق مجلد العمل على الرسالة التالية.',
     modelSwitchFailed: 'فشل تبديل النموذج',
+    hydrationSyncing: (profile: string) => `جارٍ مزامنة ${profile}\u2026`,
     sessionExported: 'تم تصدير الجلسة',
     sessionExportFailed: 'فشل تصدير الجلسة',
     imageSaved: 'تم حفظ الصورة',
@@ -2826,6 +2841,51 @@ export const ar = defineLocale({
     boundaryDesc: 'يمكنك إعادة تحميل النافذة أو فتح السجلات لمعرفة التفاصيل.',
     reloadWindow: 'إعادة تحميل النافذة',
     openLogs: 'فتح السجلات'
+  },
+  tips: {
+    close: 'لا تعرض هذه النصيحة مرة أخرى',
+    items: {
+      'new-session': {
+        title: 'ابدأ من جديد',
+        text: 'كل محادثة جديدة لها سياقها وطرفيتها ومجلد عملها الخاص.'
+      },
+      skills: {
+        title: 'علّمه مرة واحدة',
+        text: 'المهارات مجلدات من التعليمات يحمّلها Hermes عندما يقتضي العمل ذلك.'
+      },
+      messaging: {
+        title: 'Hermes بعيدًا عن مكتبك',
+        text: 'اربطه بـ Telegram وDiscord وSlack وغيرها — الوكيل نفسه والذاكرة نفسها.'
+      },
+      artifacts: {
+        title: 'كل ما صنعه Hermes',
+        text: 'الصور والملفات والروابط من كل الجلسات، مفهرسة في مكان واحد.'
+      },
+      cron: {
+        title: 'عمل يجري من تلقاء نفسه',
+        text: 'جدوِل موجّهًا كل ساعة أو كل ليلة أو وفق تعبير cron.'
+      },
+      'command-palette': {
+        title: 'صندوق واحد لكل شيء',
+        text: 'الجلسات والإعدادات والمهارات والأوامر كلها تستجيب للوحة الأوامر.'
+      },
+      profiles: {
+        title: 'الملفات الشخصية منفصلة',
+        text: 'كل واحد منها Hermes مستقل — مفاتيحه وذاكرته وجلساته الخاصة.'
+      },
+      'composer-mentions': {
+        title: 'المرفقات والأوامر',
+        text: 'اكتب @ لإحضار ملف إلى المحادثة، و / لتشغيل أمر.'
+      },
+      'model-switch': {
+        title: 'بدّل النموذج أثناء المحادثة',
+        text: 'اسم النموذج زر. غيّره كلما تغيّرت طبيعة العمل.'
+      },
+      'right-pane': {
+        title: 'لوحة العمل',
+        text: 'الملفات والطرفية والمراجعة والمتصفح المدمج تتشارك اللوحة الجانبية.'
+      }
+    }
   },
   ui: {
     search: {

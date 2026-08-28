@@ -622,6 +622,7 @@ class ProcessRegistry:
                 self.completion_queue.put({
                     "session_id": session.id,
                     "session_key": session.session_key,
+                    "task_id": session.task_id,
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
@@ -685,6 +686,7 @@ class ProcessRegistry:
         self.completion_queue.put({
             "session_id": session.id,
             "session_key": session.session_key,
+            "task_id": session.task_id,
             "command": session.command,
             "type": "watch_disabled",
             "suppressed": 0,
@@ -1076,6 +1078,11 @@ class ProcessRegistry:
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
+                # PTY mode is a real TTY, so pager-happy tools (git log/diff,
+                # man) WILL page and hang waiting for `q` — default them to
+                # cat, honoring any pager the user already exported.
+                pty_env.setdefault("GIT_PAGER", "cat")
+                pty_env.setdefault("PAGER", "cat")
                 pty_argv = [user_shell, "-lic", f"set +m; {safe_command}"]
 
                 # Cgroup isolation for PTY mode (#70716, reviewer gap #1):
@@ -1837,6 +1844,26 @@ class ProcessRegistry:
             skip_poll_observed and session_id in self._poll_observed
         )
 
+    @staticmethod
+    def _surface_child_process_notifications() -> bool:
+        """Whether subagent-owned process notifications surface in the parent.
+
+        Read from ``delegation.surface_child_process_notifications`` in
+        config.yaml (default false = suppress). On any config read error the
+        DEFAULT applies (suppress) — never crash the drain loop.
+        """
+        try:
+            from hermes_cli.config import DEFAULT_CONFIG, cfg_get, read_raw_config
+            cfg = read_raw_config()
+            val = cfg_get(cfg, "delegation", "surface_child_process_notifications")
+            if val is None:
+                val = DEFAULT_CONFIG["delegation"][
+                    "surface_child_process_notifications"
+                ]
+            return bool(val)
+        except Exception:
+            return False
+
     def drain_notifications(
         self,
         session_key: str = "",
@@ -1875,6 +1902,10 @@ class ProcessRegistry:
         """
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
+        # Lazily-read flag for subagent-owned process notifications
+        # (delegation.surface_child_process_notifications, default false).
+        # Read at most once per drain, and only when an sa- event shows up.
+        surface_child: "bool | None" = None
         while not self.completion_queue.empty():
             try:
                 evt = self.completion_queue.get_nowait()
@@ -1916,6 +1947,28 @@ class ProcessRegistry:
                 _evt_sid, skip_poll_observed=skip_poll_observed
             ):
                 continue
+
+            # Subagent-owned process notifications (task_id "sa-...") are
+            # suppressed from the parent conversation by default — the
+            # child's consolidated delegation result is the deliverable;
+            # "npm ci finished" walls mid-chat are noise. Dropped, NOT
+            # requeued (children never drain notify events, so requeueing
+            # would pin them in the queue forever). Type 'async_delegation'
+            # is the delegation result itself and is NEVER suppressed.
+            _evt_task_id = str(evt.get("task_id") or "")
+            if not is_async_delegation and _evt_task_id.startswith("sa-"):
+                if surface_child is None:
+                    surface_child = self._surface_child_process_notifications()
+                if not surface_child:
+                    logger.debug(
+                        "Suppressed subagent-owned process notification "
+                        "(delegation.surface_child_process_notifications=false): "
+                        "type=%s session_id=%s task_id=%s",
+                        evt.get("type", "completion"),
+                        _evt_sid,
+                        _evt_task_id,
+                    )
+                    continue
 
             text = format_process_notification(evt)
             if text:
