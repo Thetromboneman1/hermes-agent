@@ -187,9 +187,14 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         self.assertEqual(result["exit_code"], 0)
         self.assertFalse(result["stdout_truncated"])
         self.assertEqual(result["stdout_bytes_total"], len("hello\n".encode("utf-8")))
-        mkdir_cmd = env.commands[1][0]
+        # The session-kernel path runs first and fails open on this fake env
+        # (no PID from nohup), so search for the per-call sandbox commands
+        # rather than pinning positions.
+        mkdir_cmd = next(cmd for cmd, _, _ in env.commands
+                         if "mkdir -p" in cmd and "hermes_exec_" in cmd)
         run_cmd = next(cmd for cmd, _, _ in env.commands if "python3 script.py" in cmd)
-        cleanup_cmd = env.commands[-1][0]
+        cleanup_cmd = next(cmd for cmd, _, _ in env.commands
+                           if "rm -rf" in cmd and "hermes_exec_" in cmd)
         self.assertIn("mkdir -p /data/data/com.termux/files/usr/tmp/hermes_exec_", mkdir_cmd)
         self.assertIn("HERMES_RPC_DIR=/data/data/com.termux/files/usr/tmp/hermes_exec_", run_cmd)
         self.assertIn("rm -rf /data/data/com.termux/files/usr/tmp/hermes_exec_", cleanup_cmd)
@@ -805,7 +810,15 @@ class TestHeadTailTruncation(unittest.TestCase):
         self.assertIn("TAIL", result["output"])
         self.assertGreater(result["stdout_bytes_total"], result["stdout_bytes_captured"])
         self.assertGreater(result["stdout_bytes_omitted"], 0)
+        # Spillover (#96997-adjacent): the warning now points at the saved
+        # full-output file instead of advising a narrower re-run.
         self.assertIn("execute_code stdout was truncated", result["warning"])
+        self.assertIn("read_file", result["warning"])
+        self.assertIn("stdout_spill_path", result)
+        with open(result["stdout_spill_path"], encoding="utf-8") as f:
+            body = f.read()
+        self.assertIn("HEAD", body)
+        self.assertIn("TAIL", body)
 
 
 class TestRpcTokenAuthorization(unittest.TestCase):
