@@ -1112,9 +1112,26 @@ def _patch_skill(
     Requires a unique match unless replace_all is True.
     """
     if not old_string:
-        return {"success": False, "error": "old_string is required for 'patch'."}
+        # A bare "required" error is a dead end: the model cannot tell whether it
+        # omitted the arg or supplied it wrongly, so it retries blindly and often
+        # escapes to action='write_file', clobbering the whole skill file. Tell it
+        # how to recover. Upstream: NousResearch/hermes-agent#33064.
+        return {
+            "success": False,
+            "error": (
+                "old_string is required for 'patch' and must be the EXACT text currently in the "
+                "file. Read the target file first (read_file on the skill's SKILL.md, or the file "
+                "named by file_path) and copy the snippet verbatim, then retry 'patch'. "
+                "Do NOT fall back to action='write_file' — that rewrites the entire file and "
+                "destroys unrelated content."
+            ),
+        }
     if new_string is None:
         return {"success": False, "error": "new_string is required for 'patch'. Use an empty string to delete matched text."}
+    # No old_string == new_string guard here: fuzzy_find_and_replace already
+    # rejects that with "old_string and new_string are identical"
+    # (tools/fuzzy_match.py), and its error carries a file_preview this layer
+    # cannot produce. Duplicating it here would only shadow the richer message.
 
     existing = _find_skill(name)
     if not existing:
@@ -1682,6 +1699,8 @@ def _skill_manage_batch(
                 return tool_error(f"Could not snapshot '{nm}' for atomic batch: {exc}", success=False)
         snapshots[nm] = (pre_dir, snap)
 
+    rollback_failed = False
+
     def _rollback() -> str:
         notes = []
         for nm, (pre_dir, snap) in snapshots.items():
@@ -1690,13 +1709,38 @@ def _skill_manage_batch(
                 post_dir = Path(post["path"]) if post else None
                 if snap is not None:
                     if post_dir is not None and post_dir.is_dir():
-                        shutil.rmtree(post_dir)
-                    shutil.copytree(snap, pre_dir)
+                        # Never destroy the only other copy before the
+                        # restore lands. Deleting first turned a failed
+                        # copytree (disk full, locked file) into total
+                        # skill loss once the finally below removed the
+                        # snapshot too. Move the broken state aside, and
+                        # delete it only after the snapshot is back.
+                        aside = post_dir.with_name(post_dir.name + ".rollback-broken")
+                        shutil.rmtree(aside, ignore_errors=True)
+                        post_dir.rename(aside)
+                        try:
+                            shutil.copytree(snap, pre_dir)
+                        except Exception:
+                            # Restore failed: put the broken state back so
+                            # the skill survives (half applied) rather than
+                            # leaving nothing.
+                            shutil.rmtree(pre_dir, ignore_errors=True)
+                            aside.rename(pre_dir)
+                            raise
+                        shutil.rmtree(aside, ignore_errors=True)
+                    else:
+                        shutil.copytree(snap, pre_dir)
                 elif post_dir is not None and post_dir.is_dir():
                     # Batch created this skill: remove the partial result.
                     shutil.rmtree(post_dir)
             except Exception as exc:  # noqa: BLE001
-                notes.append(f"ROLLBACK FAILED for '{nm}' ({exc})")
+                notes.append(
+                    f"ROLLBACK FAILED for '{nm}' ({exc}); snapshot preserved at '{snap}'"
+                    if snap is not None
+                    else f"ROLLBACK FAILED for '{nm}' ({exc})"
+                )
+        nonlocal rollback_failed
+        rollback_failed = bool(notes)
         return "; ".join(notes) if notes else "all touched skills rolled back"
 
     # --- execute ops through the normal single-op path (gate bypassed:
@@ -1748,7 +1792,16 @@ def _skill_manage_batch(
                             "success": True})
     finally:
         _skill_gate_bypass.reset(token)
-        shutil.rmtree(snap_root, ignore_errors=True)
+        if rollback_failed:
+            # Keep the snapshots so the operator can still recover by
+            # hand. Deleting them here is what turned one failed restore
+            # into permanent skill loss.
+            logger.warning(
+                "skill_manage batch rollback failed, snapshots kept at %s",
+                snap_root,
+            )
+        else:
+            shutil.rmtree(snap_root, ignore_errors=True)
 
     return json.dumps(
         {"success": True, "operations_applied": len(results),
@@ -1892,15 +1945,10 @@ def skill_manage(
         if content:
             result = _edit_skill(name, content)
         else:
-            if not old_string:
-                return tool_error(
-                    "patch needs old_string/new_string for a targeted "
-                    "replacement, or content for a full SKILL.md rewrite "
-                    "(read it first with skill_view()).",
-                    success=False,
-                )
-            if new_string is None:
-                return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
+            # Targeted-replacement validation lives in _patch_skill so the
+            # public tool and the helper return the same actionable guidance.
+            # A bare "required" error here would shadow it and leave the
+            # model with nowhere to go but action='write_file'. #33064.
             result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
     elif action == "delete":
