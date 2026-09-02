@@ -119,6 +119,82 @@ def _(rid, params: dict) -> dict:
     # behind for every launch the user never typed into. The row is now created
     # lazily on the first prompt (see _ensure_session_db_row + prompt.submit),
     # and the AIAgent's own INSERT-OR-IGNORE persists it on the first turn too.
+    #
+    # EXCEPTION — seeded branch children (#93959): a desktop branch carries
+    # parent_session_id AND a seeded transcript, which is explicit user intent,
+    # not an abandoned draft. The row MUST exist immediately: the renderer's
+    # post-create resume re-fetches the child through REST + defer_history
+    # hydration, both of which read the DB — an unpersisted child 404s, the
+    # fail-latch then refuses to bind a "transcript-less" session, and the user
+    # sees an infinite spinner whose optimistic row vanishes on restart.
+    # Persisting up front also means a restart keeps the branch (both reports
+    # lost it) and the title lands in the parent's lineage instead of falling
+    # back to a message-preview name. Title mirrors the TUI /branch naming.
+    if parent_session_id and history:
+        try:
+            with _session_db(_sessions[sid]) as db:
+                if db is not None:
+                    parent_key = parent_session_id
+                    current = db.get_session_title(parent_key) or "branch"
+                    branch_title = (
+                        db.get_next_title_in_lineage(current)
+                        if hasattr(db, "get_next_title_in_lineage")
+                        else f"{current} (branch)"
+                    )
+                    db.create_session(
+                        key,
+                        source=source,
+                        model=_resolve_model(),
+                        model_config={"_branched_from": parent_key},
+                        parent_session_id=parent_key,
+                        cwd=_sessions[sid]["cwd"],
+                        profile_name=(
+                            Path(profile_home).name if profile_home else None
+                        ),
+                    )
+                    # Compensation guard (#93959 review): if the transcript
+                    # copy or title write fails AFTER the row committed, the
+                    # durable-but-empty row would defeat the lazy first-prompt
+                    # fallback (_ensure_session_db_row is INSERT OR IGNORE —
+                    # the row exists, so the seed never lands and the renderer
+                    # fail-latches on a "transcript-less" session again).
+                    # Roll back just this child so the seed path can retry
+                    # cleanly on first submit.
+                    try:
+                        db.append_messages_batch(
+                            key,
+                            [
+                                {"role": m.get("role", "user"), "content": m.get("content")}
+                                for m in history
+                            ],
+                            chunk_rows=500,
+                        )
+                        db.set_session_title(key, branch_title)
+                    except Exception as exc:
+                        from hermes_state import is_disk_full_error
+
+                        if is_disk_full_error(exc):
+                            raise
+                        try:
+                            db.delete_session(key)
+                        except Exception:
+                            logger.debug(
+                                "branch seed compensation delete failed for %s",
+                                key,
+                                exc_info=True,
+                            )
+                        raise
+                    _sessions[sid]["pending_title"] = None
+        except Exception:
+            # Persistence is best-effort here: a failed write must not break
+            # session.create itself — the lazy first-prompt path remains as the
+            # fallback, exactly as for plain drafts.
+            logger.warning(
+                "seeded-branch persistence failed for %s; falling back to "
+                "lazy row creation",
+                key,
+                exc_info=True,
+            )
 
     # Return the lightweight session immediately so Ink can paint the composer
     # + skeleton panel, then build the real AIAgent just after this response is
@@ -401,9 +477,9 @@ def _(rid, params: dict) -> dict:
     # shared launch db, which outlives the RPC and is never closed here.
     owns_db = False
     if profile_home is not None:
-        from hermes_state import SessionDB
+        from hermes_state import get_shared_session_db
 
-        db = SessionDB(db_path=profile_home / "state.db")
+        db = get_shared_session_db(profile_home / "state.db")
         owns_db = True
     else:
         db = _get_db()
@@ -461,7 +537,8 @@ def _(rid, params: dict) -> dict:
                 if live is not None:
                     if owns_db:
                         with contextlib.suppress(Exception):
-                            db.close()
+                            from hermes_state import release_or_close
+                            release_or_close(db)
                     live["last_active"] = time.time()
                     # This resume reattaches the live record. A lazy session
                     # (no state.db row yet — every fresh Bot Chat) that was
@@ -3301,7 +3378,8 @@ def _(rid, params: dict) -> dict:
             # DEDICATED handle, same ownership rule as session.resume: ours
             # until the branched agent takes it below. _make_agent raising, or
             # _init_session raising, both leave here without that transfer.
-            branch_db = SessionDB(db_path=Path(parent_home) / "state.db")
+            from hermes_state import get_shared_session_db
+            branch_db = get_shared_session_db(Path(parent_home) / "state.db")
             branch_owns_db = True
         home_token = (
             set_hermes_home_override(parent_home) if parent_home else None
@@ -3364,7 +3442,8 @@ def _(rid, params: dict) -> dict:
     finally:
         if branch_owns_db and branch_db is not None:
             with contextlib.suppress(Exception):
-                branch_db.close()
+                from hermes_state import release_or_close
+                release_or_close(branch_db)
     branched_session = _sessions.get(new_sid)
     return _ok(
         rid,
