@@ -312,10 +312,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         try:
             from hermes_cli.models import detect_provider_for_model, parse_model_input
 
+            raw = new_model
             target_provider, new_model = parse_model_input(new_model, current_provider)
-            # When the user typed provider:model, preserve that provider choice
-            # and skip provider auto-detection to avoid cross-provider remapping.
-            if target_provider == current_provider and not explicit_provider_hint:
+            # An explicit ``provider:model`` prefix is a selection; detection is a fallback for bare
+            # names only and must not second-guess it (#59089).
+            if target_provider == current_provider and new_model == raw:
                 detected = detect_provider_for_model(new_model, current_provider)
                 if detected:
                     target_provider, new_model = detected
