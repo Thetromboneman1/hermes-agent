@@ -1,8 +1,8 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
-import type { Translations } from './types'
+import { defineLocale } from './define-locale'
 
-export const zh: Translations = {
+export const zh = defineLocale({
   connectors: {
     title: '连接你的应用',
     connect: '连接',
@@ -26,10 +26,9 @@ export const zh: Translations = {
     ownerMissing: '请重新打开此对话以管理连接。',
     search: '查找应用',
     empty: '没有匹配的应用',
-    continue: '在对话中继续',
-    continueBusy: '等待当前操作完成',
-    continueFailed: '无法继续，请重试。',
     disclaimer: '连接为可选操作。请仅授权你希望 Hermes 使用的应用。',
+    connectTitle: app => `连接 ${app}？`,
+    describe: app => `Hermes 会在浏览器中登录 ${app}，读取任何内容前都会先询问。`,
     execution: '连接器工具'
   },
 
@@ -728,10 +727,10 @@ export const zh: Translations = {
       reactionsTitle: '消息回应',
       reactionsDesc: 'iMessage 风格的表情回应 — 你可以给消息添加回应，Hermes 也能回应你的消息。',
       tipsTitle: '应用内提示',
-      tipsDesc: '指向应用某处的小气泡：空闲时偶尔出现，需要时 Hermes 也会给你一条。每条提示只出现一次。',
+      tipsDesc: '偶尔显示来自应用和 Hermes 的提示，每条提示只出现一次。开始使用满30天后自动关闭，你可以重新开启。',
       tipsReset: (count: number) => `再次显示 ${count} 条提示`,
       toursTitle: '引导导览',
-      toursDesc: '让 Hermes 带你熟悉应用：调暗界面并逐步高亮每个位置。',
+      toursDesc: '让 Hermes 逐步高亮每个位置，带你熟悉应用。开始使用满30天后自动关闭，你可以重新开启。',
       composerPopoutTitle: '悬浮输入框',
       composerPopoutDesc: '允许将输入框拖出底部停靠区。关闭后，输入框会锁定在底部。',
       vibeHeartsTitle: '心情爱心',
@@ -2085,6 +2084,10 @@ export const zh: Translations = {
     restartGateway: '重启网关',
     openBrowser: '打开浏览器',
     gatewayRestartFailed: '网关重启失败。',
+    sharedGatewayRestartTitle: '重启共享网关？',
+    sharedGatewayRestartDescription: bots => `此设备上的所有机器人都会重新连接：${bots}`,
+    sharedGatewayRestartConfirm: '全部重启',
+    sharedGatewayRestarted: count => `共享网关已重启（${count} 个机器人）`,
     updateHermes: '更新 Hermes',
     reloadWindow: '重新载入窗口',
     actionRunning: '运行中',
@@ -2178,6 +2181,7 @@ export const zh: Translations = {
     },
     unknown: '未知',
     hintPendingRestart: '在状态栏重启网关以应用此更改。',
+    sharedListenerUrl: '通过共享网关监听器提供，地址为',
     hintGatewayStopped: '在状态栏启动网关以建立连接。',
     credentialsSet: '凭据已设置',
     needsSetup: '需要设置',
@@ -2204,6 +2208,8 @@ export const zh: Translations = {
     restartToApply: '此更改将在网关重启后生效。',
     setupSaved: name => `${name} 设置已保存`,
     restartToReconnect: '新凭据将在网关重启后生效。',
+    appliedLive: '已应用到正在运行的网关。',
+    connectingLive: '正在运行的网关正在使用新凭据连接。',
     keyCleared: key => `${key} 已清除`,
     setupUpdated: name => `${name} 设置已更新。`,
     failedUpdate: name => `更新 ${name} 失败`,
@@ -4214,6 +4220,8 @@ export const zh: Translations = {
     imageAttach: '附加图片',
     imageWriteFailed: '无法将图片写入磁盘。',
     imageAttachFailed: '附加图片失败',
+    pastedContent: '粘贴内容',
+    pasteAttachFailed: '无法附加粘贴的文本',
     attachImages: '附加图片',
     clipboard: '剪贴板',
     noClipboardImage: '剪贴板中没有图片',
@@ -4300,4 +4308,4 @@ export const zh: Translations = {
       toggle: open => `${open ? '显示' : '隐藏'}侧边栏`
     }
   }
-}
+})

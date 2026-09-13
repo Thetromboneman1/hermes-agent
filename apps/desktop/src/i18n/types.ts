@@ -59,6 +59,12 @@ export interface Translations {
     retry: string
     grant: string
     connected: string
+    checking: string
+    waitingSignIn: string
+    notConnected: string
+    notAvailable: string
+    startWith: (count: number) => string
+    startWithout: string
     skipped: string
     disabled: string
     failed: string
@@ -74,10 +80,9 @@ export interface Translations {
     ownerMissing: string
     search: string
     empty: string
-    continue: string
-    continueBusy: string
-    continueFailed: string
     disclaimer: string
+    connectTitle: (app: string) => string
+    describe: (app: string) => string
     execution: string
   }
   sessionImport: {
@@ -1689,6 +1694,10 @@ export interface Translations {
     restartGateway: string
     openBrowser: string
     gatewayRestartFailed: string
+    sharedGatewayRestartTitle: string
+    sharedGatewayRestartDescription: (bots: string) => string
+    sharedGatewayRestartConfirm: string
+    sharedGatewayRestarted: (count: number) => string
     updateHermes: string
     reloadWindow: string
     actionRunning: string
@@ -1772,6 +1781,7 @@ export interface Translations {
     states: Record<string, string>
     unknown: string
     hintPendingRestart: string
+    sharedListenerUrl: string
     hintGatewayStopped: string
     credentialsSet: string
     needsSetup: string
@@ -1798,6 +1808,8 @@ export interface Translations {
     restartToApply: string
     setupSaved: (name: string) => string
     restartToReconnect: string
+    appliedLive: string
+    connectingLive: string
     keyCleared: (key: string) => string
     setupUpdated: (name: string) => string
     failedUpdate: (name: string) => string
@@ -2434,6 +2446,7 @@ export interface Translations {
     queuedPaused: (count: number) => string
     attachmentOnly: string
     emptyTurn: string
+    hiddenQueued: string
     attachments: (count: number) => string
     editingInComposer: string
     editingQueuedInComposer: string
@@ -2731,6 +2744,14 @@ export interface Translations {
    *  model is told to speak the user's language from its first real turn, and
    *  an English opener above a Japanese reply reads as two different agents.
    *  `nameSuggestion` offers the OS account name as a default. */
+  handoffTour: {
+    profileTitle: string
+    profileText: string
+    sessionsTitle: string
+    sessionsText: string
+    stayTitle: string
+    stayText: string
+  }
   guidedGreeting: {
     line: string
     nameSuggestion: (name: string) => string
@@ -3575,6 +3596,8 @@ export interface Translations {
     imageAttach: string
     imageWriteFailed: string
     imageAttachFailed: string
+    pastedContent: string
+    pasteAttachFailed: string
     attachImages: string
     clipboard: string
     noClipboardImage: string
