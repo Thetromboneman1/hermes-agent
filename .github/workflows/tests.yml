@@ -38,22 +38,16 @@ jobs:
           ref: ${{ inputs.validation_ref || github.sha }}
           persist-credentials: false
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      - name: Install dependencies
-        run: |
-          uv venv .venv --python 3.11 --seed
-          source .venv/bin/activate
-          uv pip install -e ".[all,dev]"
+      - name: Build the locked test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          # Explicit test-only SDK coverage; runtime selection is unchanged.
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
 
       - name: Run ACP regression suite
         run: |
-          source .venv/bin/activate
-          scripts/run_tests.sh tests/acp/test_session.py tests/acp/test_server.py -- -q
+          scripts/run_tests.sh tests/acp_adapter/test_session.py tests/acp_adapter/test_server.py -- -q
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
@@ -61,7 +55,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    # The fork now runs the full isolated suite (4,000+ files), not only ACP.
+    # The fork now runs the full isolated suite (all maintained unit-test files), not only ACP.
     timeout-minutes: 60
     steps:
       - name: Checkout code
@@ -73,24 +67,15 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y ripgrep
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      - name: Install dependencies
-        run: |
-          uv venv .venv --python 3.11 --seed
-          source .venv/bin/activate
-          # [all] deliberately excludes lazy-installed provider SDKs. Unit tests
-          # disable lazy installs, so exercise those integrations with their
-          # existing, exact-pinned extras installed before the hermetic runner.
-          uv pip install -e ".[all,dev,anthropic,bedrock,daytona,fal,hindsight,modal,parallel-web]"
+      - name: Build the locked test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          # Explicit test-only SDK coverage; runtime selection is unchanged.
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
 
       - name: Run tests
         run: |
-          source .venv/bin/activate
           scripts/run_tests.sh tests/ -- -q --ignore=tests/integration --ignore=tests/e2e --tb=short
         env:
           # Ensure tests don't accidentally call real APIs
@@ -108,24 +93,22 @@ jobs:
           ref: ${{ inputs.validation_ref || github.sha }}
           persist-credentials: false
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      - name: Install dependencies
-        run: |
-          uv venv .venv --python 3.11 --seed
-          source .venv/bin/activate
-          # Exercise the native Anthropic streaming integration instead of
-          # silently import-skipping it when the optional SDK is absent.
-          uv pip install -e ".[all,dev,anthropic]"
+      - name: Build the locked test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          # Explicit test-only SDK coverage; runtime selection is unchanged.
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
 
       - name: Run e2e tests
         run: |
-          source .venv/bin/activate
-          scripts/run_tests.sh tests/e2e/ -- -v --tb=short
+          # Keep the existing adapter/relay smoke scope. New upstream core E2E
+          # exercises full installers and desktop builds in dedicated lanes.
+          scripts/run_tests.sh --include-integration \
+            tests/e2e/test_discord_adapter.py \
+            tests/e2e/test_platform_commands.py \
+            tests/e2e/test_relay_native_anthropic_stream.py \
+            tests/e2e/test_relay_native_openai_stream.py -- -v --tb=short
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

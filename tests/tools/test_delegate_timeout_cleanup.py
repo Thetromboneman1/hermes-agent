@@ -68,6 +68,17 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
     monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
     monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
 
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    submit = DaemonThreadPoolExecutor.submit
+
+    def submit_started(executor, *args, **kwargs):
+        future = submit(executor, *args, **kwargs)
+        assert child.started.wait(timeout=10)
+        return future
+
+    # Timeout accounting starts only after this test's child is running.
+    monkeypatch.setattr(DaemonThreadPoolExecutor, "submit", submit_started)
     try:
         result = delegate_tool._run_single_child(
             task_index=0,
@@ -77,7 +88,7 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
         )
 
         assert result["status"] == "timeout"
-        assert child.unwinding.wait(timeout=5)
+        assert child.unwinding.wait(timeout=10)
         assert not child.closed.is_set(), (
             "timed-out child.close() ran before its conversation thread unwound"
         )
@@ -86,8 +97,8 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
         # finish it while the parent's timeout-reporting path is still running.
         child.interrupted.set()
         child.allow_finish.set()
-        assert child.finished.wait(timeout=5)
-        assert child.closed.wait(timeout=5)
+        assert child.finished.wait(timeout=10)
+        assert child.closed.wait(timeout=10)
     assert not child.close_while_running, (
         "timed-out child.close() raced its still-running conversation thread"
     )

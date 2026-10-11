@@ -1,0 +1,50 @@
+{
+  "source_repository": "https://github.com/NousResearch/hermes-agent",
+  "source_commit": "ce966fef7170fc7101cbb40603ee45def8c4e965",
+  "files": {
+    "archive-inputs.yml": {
+      "source_path": ".github/workflows/archive-inputs.yml",
+      "sha256": "95f0ac324e89f76d26a03347f5fd00254707db04715794ca9b1e2b51ba23d1df"
+    },
+    "canary-release.yml": {
+      "source_path": ".github/workflows/canary-release.yml",
+      "sha256": "6cb47a0a84013971a3388211592c4a6ec87bebcc7c92bd4557dc0a3aac8ca872"
+    },
+    "desktop-bundle-smoke.yml": {
+      "source_path": ".github/workflows/desktop-bundle-smoke.yml",
+      "sha256": "792f2d93be84b490afda9d018a53c1dcee511894dc92b89dba62d53c6cf63fa7"
+    },
+    "desktop-bundled-release.yml": {
+      "source_path": ".github/workflows/desktop-bundled-release.yml",
+      "sha256": "5ebbb21bfa5fd76700a0156ecae992e72941b9428cc11d2123f9097d5f0abc24"
+    },
+    "docker.yml": {
+      "source_path": ".github/workflows/docker.yml",
+      "sha256": "a02347829521dd70e436453c3684d6ae29bdbcd0e0a380980d94087c0094636b"
+    },
+    "nix.yml": {
+      "source_path": ".github/workflows/nix.yml",
+      "sha256": "379030922677e25f371c1582a0afb2ce0a9ac850b8b170ec13cbde422fbca7be"
+    },
+    "plugin-catalog-ci.yml": {
+      "source_path": ".github/workflows/plugin-catalog-ci.yml",
+      "sha256": "1a4102042fd18abc2687207b4d78c313e0960d24f86e72f79647d7f28a0b1a12"
+    },
+    "stable-release-publication.yml": {
+      "source_path": ".github/workflows/stable-release-publication.yml",
+      "sha256": "93d14dfa2bc9c6a30ff8005ee0dba611feae9e69841853473be17421436b747a"
+    },
+    "stable-release.yml": {
+      "source_path": ".github/workflows/stable-release.yml",
+      "sha256": "330d16926c5ca4e5a226b4ff8b4eaaf59faad08299c72a365773584df45c88bd"
+    },
+    "termux-verify.yml": {
+      "source_path": ".github/workflows/termux-verify.yml",
+      "sha256": "49514e26cdaeb8ac112ca9e25704d4b28c2e0328108a83c108cf5b1d22c5c18f"
+    },
+    "windows-install-update-e2e.yml": {
+      "source_path": ".github/workflows/windows-install-update-e2e.yml",
+      "sha256": "2ced7d3f6e52513eca8478d219c1be23bec5efc50096393f7ac5a8c8c757561a"
+    }
+  }
+}

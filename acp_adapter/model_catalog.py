@@ -59,7 +59,7 @@ def _named_custom_provider_catalogs() -> list[_NamedProviderCatalog]:
     }
 
     def _entry_catalog(entry: dict) -> _NamedProviderCatalog | None:
-        field = lambda key: str(entry.get(key) or "").strip()  # noqa: E731
+        field = lambda key: str(entry.get(key) or "").strip()
         provider_key, name, base_url = field("provider_key"), field("name"), field("base_url")
         if provider_key.lower() in disabled_keys or not name or not base_url:
             return None
@@ -274,12 +274,36 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
         probe_custom_providers=False, probe_current_custom_provider=False, max_models=ACP_MAX_MODELS_PER_PROVIDER,
     )
 
+    named_catalogs = _named_custom_provider_catalogs()
+    named_slugs = {catalog.slug.strip().lower() for catalog in named_catalogs}
+    current_choice_provider = str(provider or "").strip().lower()
+    current_base = base_url.strip().rstrip("/").lower()
+    # ``build_models_payload`` represents configured ``providers:`` entries by their raw
+    # config key. ACP ids must instead use the durable ``custom:<key>`` identity so the
+    # picker value round-trips through ``parse_model_input``. Only user-defined rows are
+    # replaced by the named catalogs: a ``providers:`` key that shadows a canonical name
+    # (``providers.openrouter:`` → proxy) must leave the canonical row — and a session that
+    # runs on the canonical endpoint — alone, or picking "current" re-routes to the proxy.
+    all_rows = payload.get("providers") or []
+    canonical_current = any(
+        str(r.get("slug") or "").strip().lower() == current_choice_provider and not r.get("is_user_defined")
+        for r in all_rows
+    )
+    inventory_rows: list = []
+    for row in all_rows:
+        slug = str(row.get("slug") or "").strip().lower()
+        if not row.get("is_user_defined") or not {slug, f"custom:{slug}"} & named_slugs:
+            inventory_rows.append(row)
+            continue
+        row_base = str(row.get("api_url") or "").strip().rstrip("/").lower()
+        if slug.removeprefix("custom:") == current_choice_provider and (current_base == row_base or not canonical_current):
+            current_choice_provider = f"custom:{current_choice_provider}"
+
     cat = _ModelCatalog(
         normalize_provider=normalize_provider, current_model=model,
-        current_choice_provider=str(provider or "").strip().lower(),
-        current_base_url=base_url.strip().rstrip("/").lower(),
+        current_choice_provider=current_choice_provider,
+        current_base_url=current_base,
     )
-    named_catalogs = _named_custom_provider_catalogs()
     local_labels = {catalog.slug: catalog.label for catalog in named_catalogs if catalog.is_local}
     local_ids = {
         encode_model_choice(catalog.slug, model_id)
@@ -288,7 +312,7 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
     }
     # Let inventory resolve aliases/current identity before deduplication. Stable
     # local-first ordering then preserves the fork's picker without changing selection.
-    cat.add_inventory_rows(payload.get("providers") or [], provider_label, local_labels)
+    cat.add_inventory_rows(inventory_rows, provider_label, local_labels)
     cat.add_named_catalogs(named_catalogs)
     available_models = sorted(cat.models, key=lambda item: item.model_id not in local_ids)
 

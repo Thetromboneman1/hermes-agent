@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # Validate the maintained container overlay before custom-branch promotion.
+    branches: [main, local-first-acp-optimizations]
   release:
     types: [published]
 
