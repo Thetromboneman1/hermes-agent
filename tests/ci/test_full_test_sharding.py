@@ -4,12 +4,34 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
 
 from tests.ci import test_fork_workflow_dispatch as fork
 from tests.ci import workflow_steps
+
+
+def _test_workflow():
+    return fork._yaml(fork._TESTS)
+
+
+def _validation_step():
+    return next(step for step in _test_workflow()["jobs"]["validation"]["steps"]
+                if step.get("name") == "Require a truthful complete result")
+
+
+def _validation_context(run_heavy, *results):
+    names = ("acp-regression", "test-shards", "test", "e2e")
+    return {"needs": {
+        "plan-tests": {"result": "success", "outputs": {
+            "run_heavy": run_heavy, "reason": "regression fixture",
+        }},
+        **{name: {"result": result, "outputs": {}}
+           for name, result in zip(names, results, strict=True)},
+    }}
 
 
 def test_full_unit_matrix_is_bounded_and_covers_every_file_once():
@@ -28,6 +50,69 @@ def test_full_unit_matrix_is_bounded_and_covers_every_file_once():
         assert calls[0][1:5] == ["-j", "4", "--slice", f'{cell["ctx"]["matrix"]["slice"]}/2']
         assert calls[0][5] == "--report-json"
         assert calls[0][7:] == ["tests/", "--", "-q", "--ignore=tests/integration", "--ignore=tests/e2e", "--tb=short"]
+
+
+@pytest.mark.parametrize("run_heavy,results", [
+    ("true", ("success",) * 4),
+    ("false", ("skipped",) * 4),
+])
+def test_always_reported_validation_accepts_only_truthful_complete_outcomes(run_heavy, results):
+    workflow_steps._run(_validation_step(), _validation_context(run_heavy, *results))
+
+
+@pytest.mark.parametrize("run_heavy,results", [
+    ("true", ("success", "failure", "success", "success")),
+    ("true", ("success", "skipped", "success", "success")),
+    ("true", ("success", "cancelled", "success", "success")),
+    ("false", ("skipped", "success", "skipped", "skipped")),
+    ("", ("skipped",) * 4),
+])
+def test_always_reported_validation_fails_closed_on_inconsistent_outcomes(run_heavy, results):
+    with pytest.raises(AssertionError, match="replayed step exited 1"):
+        workflow_steps._run(_validation_step(), _validation_context(run_heavy, *results))
+
+
+@pytest.mark.parametrize("changed_path,run_heavy", [
+    ("docs/guide.txt", "false"),
+    ("README.md", "false"),
+    ("skills/github/SKILL.md", "true"),
+    ("optional-skills/example/SKILL.md", "true"),
+    ("website/docs/example.md", "true"),
+    ("plugin-catalog/README.md", "true"),
+    ("scripts/tool.py", "true"),
+    (".github/workflows/tests.yml", "true"),
+])
+def test_path_plan_runs_heavy_tests_only_for_non_documentation_changes(tmp_path, changed_path, run_heavy):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
+    baseline = tmp_path / "baseline.txt"
+    baseline.write_text("baseline\n", encoding="utf-8")
+    classifier = tmp_path / "scripts" / "ci" / "classify_changes.py"
+    classifier.parent.mkdir(parents=True)
+    shutil.copyfile(fork._REPO / "scripts" / "ci" / "classify_changes.py", classifier)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=tmp_path, check=True)
+    base = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, text=True,
+        encoding="utf-8", errors="replace",
+    ).strip()
+    changed = tmp_path / changed_path
+    changed.parent.mkdir(parents=True, exist_ok=True)
+    changed.write_text("changed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "change"], cwd=tmp_path, check=True)
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, text=True,
+        encoding="utf-8", errors="replace",
+    ).strip()
+
+    step = deepcopy(next(step for step in _test_workflow()["jobs"]["plan-tests"]["steps"]
+                         if step.get("id") == "classify"))
+    step["env"] = {"VALIDATION_REF": "", "EVENT_NAME": "pull_request",
+                   "BASE_SHA": base, "HEAD_SHA": head}
+    outputs = workflow_steps.outputs(step, {}, Path(tmp_path))
+    assert outputs["run_heavy"] == run_heavy
 
 
 @pytest.mark.parametrize("slice_index", [1, 2])
@@ -60,7 +145,9 @@ def test_shard_logs_keep_retry_output_and_do_not_mask_failures(tmp_path, monkeyp
         else:
             workflow_steps._run(step, cell["ctx"], fork._REPO, receipt=True)
         shard = cell["ctx"]["matrix"]["slice"]
-        assert (tmp_path / f"unit-tests-{shard}" / "output.log").read_text() == "FLAKY: first failure and retry output\n"
+        assert (tmp_path / f"unit-tests-{shard}" / "output.log").read_text(
+            encoding="utf-8-sig",
+        ) == "FLAKY: first failure and retry output\n"
         uploads = [s for s in cell["body"]["steps"] if s.get("uses", "").startswith("actions/upload-artifact@")]
         assert len(uploads) == 1
         upload = uploads[0]
@@ -74,10 +161,13 @@ def test_shard_logs_keep_retry_output_and_do_not_mask_failures(tmp_path, monkeyp
 
 @pytest.mark.parametrize("result", ["success", "failure", "cancelled", "skipped"])
 def test_stable_test_gate_runs_and_fails_closed_on_partial_runs(tmp_path, result):
-    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=fork._REPO, text=True).strip()
+    sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=fork._REPO, text=True,
+        encoding="utf-8", errors="replace",
+    ).strip()
     jobs = fork._run_workflow(fork._TESTS, inputs={"validation_ref": sha}, outcomes={("test-shards",): result})
     gate = jobs["test"]
-    assert fork._needs(gate["body"]) == ["test-shards"]
+    assert fork._needs(gate["body"]) == ["plan-tests", "test-shards"]
     workflow_steps.required(gate["body"], gate["ctx"])
     steps = gate["body"]["steps"]
     downloads = [step for step in steps if step.get("uses", "").startswith("actions/download-artifact@")]
@@ -96,7 +186,7 @@ def test_stable_test_gate_runs_and_fails_closed_on_partial_runs(tmp_path, result
                 "sha": sha, "slice": f"{index}/2", "exit_code": 0, "files": files,
                 "results": [{"file": file, "exit_code": 0, "retries": 0} for file in files],
             }))
-            (output / "output.log").write_text("complete runner output\n")
+            (output / "output.log").write_text("complete runner output\n", encoding="utf-8")
         workflow_steps._run(step, gate["ctx"], fork._REPO)
         (output / "report.json").unlink()
     with pytest.raises(AssertionError, match="replayed step exited 1"):

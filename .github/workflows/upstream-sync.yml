@@ -7,13 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       force_rebase:
-        description: 'Force rebase custom branches even if main unchanged'
+        description: 'Propagate main to custom branches even if unchanged (legacy input name)'
         type: boolean
         default: false
-
-permissions:
-  contents: write
-  issues: write
 
 concurrency:
   group: repository-writes-${{ github.repository }}-refs/heads/main
@@ -22,6 +18,8 @@ concurrency:
 jobs:
   sync-main:
     name: Sync main ← NousResearch/hermes-agent
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.sync.outputs.changed }}
@@ -165,7 +163,14 @@ jobs:
         run: python3 scripts/documentation_health.py --check
 
   rebase-custom-branches:
-    name: Rebase local-first-acp-optimizations
+    name: Merge validated main into local-first-acp-optimizations
+    permissions:
+      contents: write
+      issues: write
+    timeout-minutes: 90
+    concurrency:
+      group: repository-writes-${{ github.repository }}-refs/heads/local-first-acp-optimizations
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     # Do not propagate a failed synchronized revision into the custom overlay.
     needs:
@@ -176,12 +181,14 @@ jobs:
       - validate-main-docs-site
       - validate-main-container
       - validate-main-documentation
-    if: needs.sync-main.outputs.changed == 'true' || inputs.force_rebase == true
+    # Inspect remote ancestry after every successful validation run. A previous
+    # custom propagation may have failed even when this run leaves main unchanged.
 
     steps:
       - name: Checkout fork (full history)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          ref: ${{ needs.sync-main.outputs.after }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -190,117 +197,127 @@ jobs:
           git config user.name "Thetromboneman1"
           git config user.email "Thetromboneman1@users.noreply.github.com"
 
-      - name: Rebase local-first-acp-optimizations onto updated main
+      - name: Preserve validated propagation helper
+        run: |
+          mkdir -p "$RUNNER_TEMP/custom-sync-tools"
+          cp scripts/sync_custom_branch.py scripts/documentation_health.py "$RUNNER_TEMP/custom-sync-tools/"
+
+      - name: Prepare ancestry-preserving custom merge
         id: rebase
         env:
           EXPECTED_MAIN: ${{ needs.sync-main.outputs.after }}
+          FORCE_PROPAGATION: ${{ inputs.force_rebase == true }}
+          REPOSITORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           BRANCH="local-first-acp-optimizations"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          # Check branch exists in fork
-          if ! git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
-            echo "ℹ️  Branch $BRANCH not found in fork — skipping"
+          REMOTE_CUSTOM=$(git ls-remote --heads origin "refs/heads/$BRANCH")
+          if [ -z "$REMOTE_CUSTOM" ]; then
+            echo "Branch $BRANCH not found in fork; skipping"
             exit 0
           fi
-          # actions/checkout starts this dependent job at the workflow's
-          # original SHA. Refresh both refs so the rebase targets the commit
-          # produced by sync-main rather than that stale checkout.
           git fetch --no-tags origin \
             "+refs/heads/main:refs/remotes/origin/main" \
             "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
           ACTUAL_MAIN=$(git rev-parse refs/remotes/origin/main)
           if [ "$ACTUAL_MAIN" != "$EXPECTED_MAIN" ]; then
-            echo "::error::Remote main $ACTUAL_MAIN does not match sync output $EXPECTED_MAIN"
+            echo "::error::Remote main $ACTUAL_MAIN does not match validated sync output $EXPECTED_MAIN"
             exit 1
           fi
-          git checkout -B "$BRANCH" "refs/remotes/origin/$BRANCH"
-          ORIGINAL_SHA=$(git rev-parse HEAD)
-          BACKUP_BRANCH="automation-backups/${BRANCH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ORIGINAL_SHA=$(git rev-parse "refs/remotes/origin/$BRANCH")
           echo "original_sha=$ORIGINAL_SHA" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$EXPECTED_MAIN" "$ORIGINAL_SHA"; then
+            if [ "$FORCE_PROPAGATION" != "true" ]; then
+              echo "Custom branch already contains validated main; skipping backup, build and publication"
+              exit 0
+            fi
+          else
+            ANCESTRY_STATUS=$?
+            if [ "$ANCESTRY_STATUS" -ne 1 ]; then
+              echo "::error::Cannot determine custom branch ancestry"
+              exit "$ANCESTRY_STATUS"
+            fi
+          fi
+          BACKUP_BRANCH="automation-backups/${BRANCH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           echo "backup_branch=$BACKUP_BRANCH" >> "$GITHUB_OUTPUT"
           git push origin "$ORIGINAL_SHA:refs/heads/$BACKUP_BRANCH"
+          # Build on a detached HEAD so failed validation cannot move a local branch.
+          git checkout --detach "$ORIGINAL_SHA"
 
-          # Generated documentation commits are derived, branch-specific
-          # snapshots. Drop them from the rebase todo and regenerate once from
-          # the final tree so repeated syncs cannot accumulate conflicts.
-          SEQUENCE_EDITOR="$RUNNER_TEMP/drop-generated-doc-commits.py"
-          cat > "$SEQUENCE_EDITOR" <<'PY'
-          import pathlib
-          import sys
+          # A rebase would replay the old overlay and discard reviewed merge-only
+          # reconciliation. Keep every original ancestor and fail on real conflicts.
+          python3 "$RUNNER_TEMP/custom-sync-tools/sync_custom_branch.py" \
+            "$EXPECTED_MAIN" --expected-head "$ORIGINAL_SHA"
+          AFTER=$(git rev-parse HEAD)
+          git merge-base --is-ancestor "$ORIGINAL_SHA" "$AFTER"
+          git merge-base --is-ancestor "$EXPECTED_MAIN" "$AFTER"
+          test -z "$(git status --porcelain)"
+          echo "prepared_sha=$AFTER" >> "$GITHUB_OUTPUT"
 
-          todo = pathlib.Path(sys.argv[1])
-          lines = todo.read_text(encoding="utf-8").splitlines()
-          marker = "docs: refresh generated repository state [skip ci]"
-          retained = [line for line in lines if marker not in line]
-          commands = [line for line in retained if line and not line.startswith("#")]
-          if not commands:
-              retained.insert(0, "exec true")
-          todo.write_text(
-              "\n".join(retained) + "\n",
-              encoding="utf-8",
-          )
-          PY
+      - name: Require custom overlay validation contract
+        if: steps.rebase.outputs.prepared_sha != ''
+        run: |
+          test -x scripts/ci/validate_container_overlay.sh
+          test -x scripts/ci/check_container_ssh_image.sh
 
-          REBASE_OK=false
-          if GIT_SEQUENCE_EDITOR="python3 $SEQUENCE_EDITOR" \
-            git rebase -i "refs/remotes/origin/main"; then
-            REBASE_OK=true
-          else
-            # Generated repository fingerprints are branch-specific and may
-            # conflict after main advances. Resolve only those two known files
-            # in favor of the new base; never auto-resolve product/config files.
-            DOC_CONFLICT_ATTEMPTS=0
-            while [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; do
-              DOC_CONFLICT_ATTEMPTS=$((DOC_CONFLICT_ATTEMPTS + 1))
-              if [ "$DOC_CONFLICT_ATTEMPTS" -gt 5 ]; then
-                echo "::error::Generated-documentation conflict retry limit exceeded"
-                break
-              fi
-              CONFLICTS=$(git diff --name-only --diff-filter=U || true)
-              NON_GENERATED=$(printf '%s\n' "$CONFLICTS" | \
-                grep -Ev '^(README\.md|docs/REPOSITORY_STATE\.md)$' || true)
-              if [ -z "$CONFLICTS" ] || [ -n "$NON_GENERATED" ]; then
-                break
-              fi
-              echo "Resolving generated-documentation conflicts against updated main"
-              git checkout --ours -- README.md docs/REPOSITORY_STATE.md
-              git add README.md docs/REPOSITORY_STATE.md
-              if git diff --cached --quiet; then
-                git rebase --skip || break
-              else
-                GIT_EDITOR=true git rebase --continue || true
-              fi
-            done
-            if [ ! -d .git/rebase-merge ] && [ ! -d .git/rebase-apply ] && \
-              git merge-base --is-ancestor "refs/remotes/origin/main" HEAD; then
-              REBASE_OK=true
-            fi
-          fi
+      - name: Set up custom test environment
+        if: steps.rebase.outputs.prepared_sha != ''
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          extras: '[]'
 
-          if [ "$REBASE_OK" = "true" ]; then
-            python3 scripts/documentation_health.py --write
-            if ! git diff --quiet -- README.md docs/REPOSITORY_STATE.md; then
-              git add README.md docs/REPOSITORY_STATE.md
-              git commit -m "docs: refresh generated repository state [skip ci]"
-            fi
-          fi
+      - name: Validate prepared custom overlay
+        if: steps.rebase.outputs.prepared_sha != ''
+        env:
+          PREPARED_SHA: ${{ steps.rebase.outputs.prepared_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$PREPARED_SHA"
+          test -z "$(git status --porcelain)"
+          scripts/ci/validate_container_overlay.sh "$PREPARED_SHA"
 
-          if [ "$REBASE_OK" = "true" ] && git push origin "$BRANCH" \
-            --force-with-lease="refs/heads/$BRANCH:$ORIGINAL_SHA"; then
-            echo "✅ $BRANCH rebased and pushed"
-          else
-            CONFLICTS=$(git diff --name-only --diff-filter=U || true)
-            {
-              echo "conflicts<<EOF"
-              printf '%s\n' "${CONFLICTS:-No unmerged paths were reported; inspect the push and rebase logs.}"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-            git rebase --abort || true
-            echo "::error::Rebase or protected push failed on $BRANCH — manual intervention needed"
+      - name: Validate prepared custom documentation
+        if: steps.rebase.outputs.prepared_sha != ''
+        env:
+          REPOSITORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python3 scripts/documentation_health.py --check
+
+      - name: Build prepared custom image without publishing
+        if: steps.rebase.outputs.prepared_sha != ''
+        run: docker build --tag hermes-agent:custom-validation .
+
+      - name: Smoke test prepared custom image
+        if: steps.rebase.outputs.prepared_sha != ''
+        run: docker run --rm --tmpfs /opt/data hermes-agent:custom-validation --help
+
+      - name: Verify prepared custom image SSH policy
+        if: steps.rebase.outputs.prepared_sha != ''
+        run: scripts/ci/check_container_ssh_image.sh hermes-agent:custom-validation
+
+      - name: Publish validated custom commit
+        if: steps.rebase.outputs.prepared_sha != ''
+        env:
+          EXPECTED_MAIN: ${{ needs.sync-main.outputs.after }}
+          ORIGINAL_SHA: ${{ steps.rebase.outputs.original_sha }}
+          PREPARED_SHA: ${{ steps.rebase.outputs.prepared_sha }}
+          BRANCH: ${{ steps.rebase.outputs.branch }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$PREPARED_SHA"
+          test -z "$(git status --porcelain)"
+          git merge-base --is-ancestor "$ORIGINAL_SHA" "$PREPARED_SHA"
+          git merge-base --is-ancestor "$EXPECTED_MAIN" "$PREPARED_SHA"
+          # Recheck both observed heads immediately before publication. A normal
+          # push also rejects concurrent divergent custom-branch changes.
+          ACTUAL_MAIN=$(git ls-remote --heads origin refs/heads/main | cut -f1)
+          ACTUAL_CUSTOM=$(git ls-remote --heads origin "refs/heads/$BRANCH" | cut -f1)
+          if [ "$ACTUAL_MAIN" != "$EXPECTED_MAIN" ] || [ "$ACTUAL_CUSTOM" != "$ORIGINAL_SHA" ]; then
+            echo "::error::Remote heads changed during propagation; nothing will be published"
             exit 1
           fi
+          git push origin "$PREPARED_SHA:refs/heads/$BRANCH"
+          echo "Preserved custom history and published $PREPARED_SHA"
 
-      - name: Record rebase failure
+      - name: Record custom propagation failure
         if: failure() && steps.rebase.outputs.branch != ''
         env:
           GH_TOKEN: ${{ github.token }}
@@ -312,7 +329,7 @@ jobs:
           TITLE="Upstream sync conflict: ${BRANCH}"
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           BODY=$(cat <<EOF
-          The automated rebase failed and the job was intentionally marked failed.
+          The ancestry-preserving custom merge, its validation, or its publication failed. The job was intentionally marked failed; inspect the logs and recovery branch before retrying.
 
           - Branch: \`${BRANCH}\`
           - Original commit: \`${ORIGINAL_SHA:-unknown}\`
@@ -327,7 +344,7 @@ jobs:
           EOF
           )
           {
-            echo "## Downstream rebase recovery"
+            echo "## Downstream merge recovery"
             printf '%s\n' "$BODY"
           } >> "$GITHUB_STEP_SUMMARY"
 

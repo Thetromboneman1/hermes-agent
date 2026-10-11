@@ -24,8 +24,33 @@ The agent that grows with you
   helper aborts and restores the clean starting tree on any non-workflow conflict.
 - Validation: the sync workflow calls the retained tests, Nix, lockfile, documentation
   and container checks explicitly because a GITHUB_TOKEN push does not trigger them.
-  The custom-overlay rebase waits for all of these checks, preserves a remote backup,
-  and uses an exact lease when publishing the rebased branch.
+  `sync-main` publishes its clean merge to `main`, then each in-run validator checks out
+  the exact published SHA from the sync output. Those check runs remain attached to the
+  workflow's triggering SHA, not to the newly pushed candidate merely because checkout
+  selected it. They are therefore an explicit workflow publication/propagation gate,
+  not evidence that a required status context was recorded on the candidate commit.
+  Custom-overlay propagation waits for all six exact-SHA validators and preserves a
+  remote backup. It merges the validated main commit without rebasing or force-pushing,
+  retaining the original overlay commits and reviewed merge-only reconciliation.
+  The historical `rebase` strategy is superseded for this history-preserving workflow;
+  the `force_rebase` input and job ID remain compatible names for forced propagation.
+  Every successful main-validation run checks actual remote ancestry, even when main
+  did not change, so failed prior custom propagation is retried. If custom already
+  contains the validated main commit, backup, custom validation and publication are
+  skipped unless `force_rebase` requests revalidation; it never permits a force push.
+- Custom-branch conflicts: source, workflow, and human README conflicts fail closed.
+  Only the marked `documentation-health` README block and the wholly generated
+  `docs/REPOSITORY_STATE.md` may be regenerated. Human README text is three-way merged,
+  never replaced wholesale; ambiguous markers and unsupported CR/CRLF README line
+  endings require manual review. A failed merge or documentation check restores the clean
+  starting branch. The prepared commit stays detached until its focused overlay tests,
+  container build, CLI smoke, and read-only SSH image policy check all pass. Missing
+  custom validation files fail closed. The custom branch owns its executable validation
+  entrypoint, shared by its pull-request job and scheduled propagation; overlay tests
+  are checked in that prepared custom tree, not copied onto main.
+  Publication requires unchanged observed remote
+  heads, preserved ancestry, a clean exact tested commit, and a normal fast-forward
+  push. Concurrent divergence is never repaired by force or hidden replay.
 
 ## Workflows
 
@@ -52,6 +77,11 @@ The agent that grows with you
 - Deployment tooling: `GitHub Actions`
 - Run repository-specific build and test commands documented in the root README before promotion.
 - Validate workflow changes with `actionlint`, parse structured configuration, and inspect the resulting GitHub Actions run.
+- `Tests / Test validation` is the stable aggregate result for direct pushes and pull
+  requests. It requires all selected ACP, unit-shard, unit-receipt and E2E jobs to
+  succeed, rejects unexpected skipped/failed/cancelled results, and reports those jobs
+  as intentionally not applicable only when every changed path is Markdown or under
+  `docs/`. Reusable exact-revision and manual runs always select full coverage.
 - For upstream changes, verify downstream configuration and generated artifacts before merging the review branch.
 
 ## Configuration and secrets
