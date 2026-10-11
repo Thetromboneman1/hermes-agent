@@ -16,10 +16,16 @@ The agent that grows with you
 
 ## Upstream synchronization
 
-- Strategy: merge upstream into a dedicated review branch and rebuild downstream overlays
+- Strategy: review genuine upstream conflicts on a repair branch; scheduled clean merges retain the fork workflow set and validate the exact synchronized revision.
 - Automation status: `configured`
 - Schedule and manual recovery: use the repository's registered upstream-sync workflow when configured.
-- Safety rule: synchronize through a dedicated review branch; never discard downstream commits or force-push a shared branch.
+- Safety rule: never choose upstream wholesale to resolve product conflicts. Fork-only
+  documentation keeps its existing paths when upstream moves directories. The merge
+  helper aborts and restores the clean starting tree on any non-workflow conflict.
+- Validation: the sync workflow calls the retained tests, Nix, lockfile, documentation
+  and container checks explicitly because a GITHUB_TOKEN push does not trigger them.
+  The custom-overlay rebase waits for all of these checks, preserves a remote backup,
+  and uses an exact lease when publishing the rebased branch.
 
 ## Workflows
 

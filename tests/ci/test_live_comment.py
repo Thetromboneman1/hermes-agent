@@ -103,7 +103,7 @@ def _workflow_watch_lists(doc: dict):
 
 
 def _watching_workflows():
-    yaml = pytest.importorskip("yaml")
+    yaml = pytest.importorskip("hermes_yaml")
     root = Path(__file__).resolve().parents[2]
     docs = [
         yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -143,6 +143,16 @@ def test_watch_list_discovery_covers_notification_and_poller_workflows(triggers_
         "jobs": {"comment": {"steps": [{"env": {"WATCH_WORKFLOWS": f"{DOCKER}\nCI"}}]}},
     }
     assert list(_workflow_watch_lists(doc)) == [[DOCKER], [DOCKER, "CI"]]
+
+
+@pytest.mark.parametrize("gate", ["all-checks-pass", "All required checks pass (v2)"])
+def test_merge_gate_jobs_are_omitted_from_the_comment(gate):
+    """Infrastructure gates do not appear as user-facing test results."""
+    completed, pending, _ = classify_jobs([
+        {"name": gate, "status": "completed", "conclusion": "success"},
+        {"name": "Python tests", "status": "completed", "conclusion": "failure"},
+    ])
+    assert (completed, pending) == ({"Python tests": "failure"}, [])
 
 
 # ─── runs_all_completed ───────────────────────────────────────────────

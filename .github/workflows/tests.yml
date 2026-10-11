@@ -38,30 +38,29 @@ jobs:
           ref: ${{ inputs.validation_ref || github.sha }}
           persist-credentials: false
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      - name: Install dependencies
-        run: |
-          uv venv .venv --python 3.11 --seed
-          source .venv/bin/activate
-          uv pip install -e ".[all,dev]"
+      - name: Build the locked test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          # Explicit test-only SDK coverage; runtime selection is unchanged.
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
 
       - name: Run ACP regression suite
         run: |
-          source .venv/bin/activate
-          scripts/run_tests.sh tests/acp/test_session.py tests/acp/test_server.py -- -q
+          scripts/run_tests.sh tests/acp_adapter/test_session.py tests/acp_adapter/test_server.py -- -q
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
-  test:
+  test-shards:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        slice: [1, 2]
     runs-on: ubuntu-latest
-    # The fork now runs the full isolated suite (4,000+ files), not only ACP.
+    # Same complete unit inventory, partitioned by the runner across two standard hosts.
     timeout-minutes: 60
     steps:
       - name: Checkout code
@@ -73,30 +72,67 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y ripgrep
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      - name: Install dependencies
-        run: |
-          uv venv .venv --python 3.11 --seed
-          source .venv/bin/activate
-          # [all] deliberately excludes lazy-installed provider SDKs. Unit tests
-          # disable lazy installs, so exercise those integrations with their
-          # existing, exact-pinned extras installed before the hermetic runner.
-          uv pip install -e ".[all,dev,anthropic,bedrock,daytona,fal,hindsight,modal,parallel-web]"
+      - name: Build the locked test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          # Explicit test-only SDK coverage; runtime selection is unchanged.
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
 
       - name: Run tests
+        shell: bash
         run: |
-          source .venv/bin/activate
-          scripts/run_tests.sh tests/ -- -q --ignore=tests/integration --ignore=tests/e2e --tb=short
+          report_dir="$RUNNER_TEMP/unit-tests-${{ matrix.slice }}"
+          mkdir -p "$report_dir"
+          set +e
+          scripts/run_tests.sh -j 4 --slice "${{ matrix.slice }}/2" --report-json "$report_dir/report.json" \
+            tests/ -- -q --ignore=tests/integration --ignore=tests/e2e --tb=short 2>&1 | tee "$report_dir/output.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
+          exit "${statuses[1]}"
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+      - name: Preserve shard receipt and retry output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: unit-tests-${{ matrix.slice }}
+          path: ${{ runner.temp }}/unit-tests-${{ matrix.slice }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Preserve the original required check name and fail closed on partial runs.
+  test:
+    needs: test-shards
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.validation_ref || github.sha }}
+          persist-credentials: false
+
+      - name: Download both unit shard receipts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: unit-tests-*
+          path: ${{ runner.temp }}/unit-test-reports
+
+      - name: Require complete successful unit coverage
+        if: always()
+        env:
+          SHARDS_RESULT: ${{ needs.test-shards.result }}
+          EXPECTED_SHA: ${{ inputs.validation_ref || github.sha }}
+        run: |
+          python3 -m scripts.ci.verify_test_shards \
+            --reports "$RUNNER_TEMP/unit-test-reports" --sha "$EXPECTED_SHA" --result "$SHARDS_RESULT"
 
   e2e:
     runs-on: ubuntu-latest
@@ -108,24 +144,22 @@ jobs:
           ref: ${{ inputs.validation_ref || github.sha }}
           persist-credentials: false
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      - name: Install dependencies
-        run: |
-          uv venv .venv --python 3.11 --seed
-          source .venv/bin/activate
-          # Exercise the native Anthropic streaming integration instead of
-          # silently import-skipping it when the optional SDK is absent.
-          uv pip install -e ".[all,dev,anthropic]"
+      - name: Build the locked test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          # Explicit test-only SDK coverage; runtime selection is unchanged.
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
 
       - name: Run e2e tests
         run: |
-          source .venv/bin/activate
-          scripts/run_tests.sh tests/e2e/ -- -v --tb=short
+          # Keep the existing adapter/relay smoke scope. New upstream core E2E
+          # exercises full installers and desktop builds in dedicated lanes.
+          scripts/run_tests.sh --include-integration \
+            tests/e2e/test_discord_adapter.py \
+            tests/e2e/test_platform_commands.py \
+            tests/e2e/test_relay_native_anthropic_stream.py \
+            tests/e2e/test_relay_native_openai_stream.py -- -v --tb=short
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
