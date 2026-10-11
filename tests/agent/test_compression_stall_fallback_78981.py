@@ -21,9 +21,13 @@ These tests pin the contract:
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from agent import conversation_compression
 from agent.context_compressor import (
     ContextCompressor,
     pin_summary_route,
@@ -52,6 +56,33 @@ def _patch_chain(chain):
     )
 
 
+class _CompressionClock:
+    def __init__(self):
+        self.now = 0.0
+        self.lock = threading.Lock()
+
+    def monotonic(self):
+        with self.lock:
+            return self.now
+
+    def expire_idle(self):
+        with self.lock:
+            self.now += 2.0
+
+
+@pytest.fixture
+def compression_clock(monkeypatch):
+    # Advance only after the worker actually starts. A loaded runner can spend
+    # longer than the old 0.2s ceiling scheduling a healthy thread; that tests
+    # cancellation-before-start, not a summary route that has stalled.
+    clock = _CompressionClock()
+    monkeypatch.setattr(
+        conversation_compression, "time",
+        SimpleNamespace(monotonic=clock.monotonic, sleep=time.sleep),
+    )
+    return clock
+
+
 class _StalledSummaryWorker:
     """A compression worker whose first attempt streams nothing at all.
 
@@ -61,11 +92,13 @@ class _StalledSummaryWorker:
     attempt commits a real summary.
     """
 
-    def __init__(self, compressed, *, stall_attempts=1):
+    def __init__(self, compressed, clock, *, stall_attempts=1):
+        self.clock = clock
         self.compressed = compressed
         self.stall_attempts = stall_attempts
         self.routes = []
         self.fences = []
+        self.finished = []
         self._lock = threading.Lock()
         self.release = threading.Event()
 
@@ -74,23 +107,35 @@ class _StalledSummaryWorker:
         return len(self.routes)
 
     def __call__(self, fence: CompressionCommitFence):
+        finished = threading.Event()
         with self._lock:
             self.routes.append(take_pinned_summary_route())
             self.fences.append(fence)
+            self.finished.append(finished)
             attempt = len(self.routes)
-        if attempt <= self.stall_attempts:
-            # Connection open, zero tokens, zero fence progress.
-            self.release.wait(timeout=10)
-            return ([{"role": "assistant", "content": "late"}], "late-prompt")
-        if not fence.begin_commit():
-            return ([{"role": "assistant", "content": "cancelled"}], "cancelled")
         try:
-            return (self.compressed, "summarized-prompt")
+            if attempt <= self.stall_attempts:
+                # Connection open, zero tokens, zero fence progress. Trigger a
+                # real idle cancellation without racing the worker's startup.
+                self.clock.expire_idle()
+                self.release.wait()
+                return ([{"role": "assistant", "content": "late"}], "late-prompt")
+            if not fence.begin_commit():
+                return ([{"role": "assistant", "content": "cancelled"}], "cancelled")
+            try:
+                return (self.compressed, "summarized-prompt")
+            finally:
+                fence.finish_commit()
         finally:
-            fence.finish_commit()
+            finished.set()
+
+    def close(self):
+        self.release.set()
+        for finished in self.finished:
+            assert finished.wait(timeout=5), "summary worker did not finish cleanup"
 
 
-def _run(worker, *, chain, timeouts, messages, idle=0.05, ceiling=0.2):
+def _run(worker, *, chain, timeouts, messages, idle=2.0, ceiling=10.0):
     with _patch_chain(chain):
         return run_compress_context_with_progress_timeout(
             worker=worker,
@@ -107,10 +152,10 @@ def _run(worker, *, chain, timeouts, messages, idle=0.05, ceiling=0.2):
 # ---------------------------------------------------------------------------
 
 
-def test_stalled_summary_attempts_configured_fallback_chain():
+def test_stalled_summary_attempts_configured_fallback_chain(compression_clock):
     original = [{"role": "user", "content": "keep-me"}]
     compressed = [{"role": "user", "content": "summary of earlier turns"}]
-    worker = _StalledSummaryWorker(compressed)
+    worker = _StalledSummaryWorker(compressed, compression_clock)
     timeouts = []
 
     try:
@@ -118,7 +163,7 @@ def test_stalled_summary_attempts_configured_fallback_chain():
             worker, chain=[CHAIN_ENTRY], timeouts=timeouts, messages=original
         )
     finally:
-        worker.release.set()
+        worker.close()
 
     assert worker.attempts == 2, "the aborted stall must be retried once"
     assert worker.routes[0] is None, "the primary attempt is never pinned"
@@ -131,13 +176,13 @@ def test_stalled_summary_attempts_configured_fallback_chain():
     assert not timeouts, "no continue-without-compression degrade after a recovery"
 
 
-def test_retry_runs_on_a_host_published_fence():
+def test_retry_runs_on_a_host_published_fence(compression_clock):
     """The aborted fence vetoes every future commit, so the retry needs a new
     one — minted through the host so ``/stop`` admits against the attempt that
     is actually running."""
     original = [{"role": "user", "content": "keep-me"}]
     compressed = [{"role": "user", "content": "summary"}]
-    worker = _StalledSummaryWorker(compressed)
+    worker = _StalledSummaryWorker(compressed, compression_clock)
     minted = []
 
     def _new_fence():
@@ -151,12 +196,12 @@ def test_retry_runs_on_a_host_published_fence():
                 worker=worker,
                 messages=original,
                 system_prompt_fallback="degraded-prompt",
-                idle_timeout_seconds=0.05,
-                total_ceiling_seconds=0.2,
+                idle_timeout_seconds=2.0,
+                total_ceiling_seconds=10.0,
                 new_fence=_new_fence,
             )
     finally:
-        worker.release.set()
+        worker.close()
 
     assert msgs == compressed
     assert len(minted) == 1, "exactly one fence is minted for the one retry"
@@ -165,11 +210,11 @@ def test_retry_runs_on_a_host_published_fence():
     assert worker.fences[0].is_cancelled, "the aborted attempt stays cancelled"
 
 
-def test_hard_interrupt_suppresses_the_fallback_attempt():
+def test_hard_interrupt_suppresses_the_fallback_attempt(compression_clock):
     """An explicit stop is not an unhealthy route — don't start another
     summary on the user's behalf after they asked for the turn to end."""
     original = [{"role": "user", "content": "keep-me"}]
-    worker = _StalledSummaryWorker([{"role": "user", "content": "unused"}])
+    worker = _StalledSummaryWorker([{"role": "user", "content": "unused"}], compression_clock)
     stopped = threading.Event()
     stopped.set()
     agent = SimpleNamespace(_hard_interrupt_requested=stopped)
@@ -181,13 +226,13 @@ def test_hard_interrupt_suppresses_the_fallback_attempt():
                 worker=worker,
                 messages=original,
                 system_prompt_fallback="degraded-prompt",
-                idle_timeout_seconds=0.05,
-                total_ceiling_seconds=0.2,
+                idle_timeout_seconds=2.0,
+                total_ceiling_seconds=10.0,
                 on_timeout=lambda *args: timeouts.append(args),
                 telemetry_agent=agent,
             )
     finally:
-        worker.release.set()
+        worker.close()
 
     assert worker.attempts == 1
     assert msgs is original
@@ -195,15 +240,15 @@ def test_hard_interrupt_suppresses_the_fallback_attempt():
     assert len(timeouts) == 1
 
 
-def test_no_fallback_chain_configured_degrades_without_retry():
+def test_no_fallback_chain_configured_degrades_without_retry(compression_clock):
     original = [{"role": "user", "content": "keep-me"}]
-    worker = _StalledSummaryWorker([{"role": "user", "content": "unused"}])
+    worker = _StalledSummaryWorker([{"role": "user", "content": "unused"}], compression_clock)
     timeouts = []
 
     try:
         msgs, prompt = _run(worker, chain=[], timeouts=timeouts, messages=original)
     finally:
-        worker.release.set()
+        worker.close()
 
     assert worker.attempts == 1, "nothing to fall back to — do not burn a retry"
     assert msgs is original
@@ -211,18 +256,18 @@ def test_no_fallback_chain_configured_degrades_without_retry():
     assert len(timeouts) == 1
 
 
-def test_fallback_that_also_stalls_degrades_after_one_attempt():
+def test_fallback_that_also_stalls_degrades_after_one_attempt(compression_clock):
     original = [{"role": "user", "content": "keep-me"}]
     worker = _StalledSummaryWorker(
-        [{"role": "user", "content": "unused"}], stall_attempts=2
+        [{"role": "user", "content": "unused"}], compression_clock, stall_attempts=2
     )
     timeouts = []
-    entry = dict(CHAIN_ENTRY, timeout=0.05)
+    entry = dict(CHAIN_ENTRY, timeout=2.0)
 
     try:
         msgs, prompt = _run(worker, chain=[entry], timeouts=timeouts, messages=original)
     finally:
-        worker.release.set()
+        worker.close()
 
     assert worker.attempts == 2, "the fallback is attempted once, not in a loop"
     assert msgs is original, "no messages may be dropped when both routes stall"
