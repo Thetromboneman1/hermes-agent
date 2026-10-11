@@ -9,14 +9,8 @@ on:
         type: string
   push:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
   workflow_dispatch:
 
 permissions:
@@ -28,7 +22,67 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  plan-tests:
+    name: Plan test coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_heavy: ${{ steps.classify.outputs.run_heavy }}
+      reason: ${{ steps.classify.outputs.reason }}
+    steps:
+      - name: Checkout code for path classification
+        if: inputs.validation_ref == '' && github.event_name != 'workflow_dispatch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify test scope
+        id: classify
+        shell: bash
+        env:
+          VALIDATION_REF: ${{ inputs.validation_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [[ -n "$VALIDATION_REF" ]]; then
+            echo "run_heavy=true" >> "$GITHUB_OUTPUT"
+            echo "reason=exact synchronized revision requires full validation" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "run_heavy=true" >> "$GITHUB_OUTPUT"
+            echo "reason=manual validation requires full coverage" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] || \
+             ! git cat-file -e "$BASE_SHA^{commit}" || \
+             ! git cat-file -e "$HEAD_SHA^{commit}"; then
+            echo "run_heavy=true" >> "$GITHUB_OUTPUT"
+            echo "reason=revision range was unavailable; failing safe to full coverage" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mapfile -d '' changed < <(git diff --name-only -z "$BASE_SHA" "$HEAD_SHA")
+          if (( ${#changed[@]} == 0 )); then
+            echo "run_heavy=true" >> "$GITHUB_OUTPUT"
+            echo "reason=no changed paths were reported; failing safe to full coverage" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for path in "${changed[@]}"; do
+            if [[ "$path" == docs/* || "$path" == *.md ]]; then
+              continue
+            fi
+            echo "run_heavy=true" >> "$GITHUB_OUTPUT"
+            echo "reason=code or configuration changed" >> "$GITHUB_OUTPUT"
+            exit 0
+          done
+          echo "run_heavy=false" >> "$GITHUB_OUTPUT"
+          echo "reason=all changes are Markdown or under docs/" >> "$GITHUB_OUTPUT"
+
   acp-regression:
+    needs: plan-tests
+    if: needs.plan-tests.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -54,6 +108,8 @@ jobs:
           NOUS_API_KEY: ""
 
   test-shards:
+    needs: plan-tests
+    if: needs.plan-tests.outputs.run_heavy == 'true'
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -108,8 +164,8 @@ jobs:
 
   # Preserve the original required check name and fail closed on partial runs.
   test:
-    needs: test-shards
-    if: always()
+    needs: [plan-tests, test-shards]
+    if: always() && needs.plan-tests.result == 'success' && needs.plan-tests.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -135,6 +191,8 @@ jobs:
             --reports "$RUNNER_TEMP/unit-test-reports" --sha "$EXPECTED_SHA" --result "$SHARDS_RESULT"
 
   e2e:
+    needs: plan-tests
+    if: needs.plan-tests.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -164,3 +222,52 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+  validation:
+    name: Test validation
+    needs: [plan-tests, acp-regression, test-shards, test, e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require a truthful complete result
+        shell: bash
+        env:
+          RUN_HEAVY: ${{ needs.plan-tests.outputs.run_heavy }}
+          REASON: ${{ needs.plan-tests.outputs.reason }}
+          PLAN_RESULT: ${{ needs.plan-tests.result }}
+          ACP_RESULT: ${{ needs.acp-regression.result }}
+          SHARDS_RESULT: ${{ needs.test-shards.result }}
+          UNIT_GATE_RESULT: ${{ needs.test.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+        run: |
+          printf 'Test plan: %s (heavy=%s)\n' "$REASON" "$RUN_HEAVY"
+          printf 'Results: plan=%s acp=%s shards=%s unit-gate=%s e2e=%s\n' \
+            "$PLAN_RESULT" "$ACP_RESULT" "$SHARDS_RESULT" "$UNIT_GATE_RESULT" "$E2E_RESULT"
+          if [[ "$PLAN_RESULT" != "success" ]]; then
+            echo "::error::Test planning did not succeed"
+            exit 1
+          fi
+          results=("$ACP_RESULT" "$SHARDS_RESULT" "$UNIT_GATE_RESULT" "$E2E_RESULT")
+          if [[ "$RUN_HEAVY" == "true" ]]; then
+            for result in "${results[@]}"; do
+              if [[ "$result" != "success" ]]; then
+                echo "::error::Selected test coverage did not complete successfully"
+                exit 1
+              fi
+            done
+            echo "Full test coverage completed successfully"
+            exit 0
+          fi
+          if [[ "$RUN_HEAVY" == "false" ]]; then
+            for result in "${results[@]}"; do
+              if [[ "$result" != "skipped" ]]; then
+                echo "::error::Documentation-only validation ran an unexpected test job"
+                exit 1
+              fi
+            done
+            echo "Full test coverage is intentionally not applicable to this documentation-only change"
+            exit 0
+          fi
+          echo "::error::Test plan did not report whether full coverage was selected"
+          exit 1

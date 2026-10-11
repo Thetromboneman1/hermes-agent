@@ -105,11 +105,17 @@ def _run_workflow(rel, *, inputs, outcomes=None, step_outputs=None, github=None,
             for dep in needs:
                 ancestors.update(done[dep]["ancestors"])
             success = all(done[dep]["result"] == "success" for dep in needs)
+            steps = step_outputs.get(path, {})
+            if rel == _TESTS and name == "plan-tests" and "classify" not in steps:
+                steps = {"classify": {"outputs": {
+                    "run_heavy": "true",
+                    "reason": "test replay selects full coverage",
+                }}}
             ctx = {
                 "inputs": inputs, "github": github,
                 "needs": {dep: {"outputs": done[dep]["outputs"], "result": done[dep]["result"]}
                           for dep in needs},
-                "steps": step_outputs.get(path, {}),
+                "steps": steps,
                 "__status__": {
                     "always": True, "success": success,
                     "failure": any(done[dep]["result"] == "failure" for dep in ancestors),
@@ -119,7 +125,8 @@ def _run_workflow(rel, *, inputs, outcomes=None, step_outputs=None, github=None,
             cond = body.get("if")
             uses_status = isinstance(cond, str) and re.search(r"\b(always|success|failure|cancelled)\(", cond)
             active = (success or bool(uses_status)) and gha.condition(cond, ctx)
-            node = {"body": body, "ctx": ctx, "outputs": {}, "result": "skipped", "ancestors": ancestors}
+            node = {"name": name, "body": body, "ctx": ctx, "outputs": {},
+                    "result": "skipped", "ancestors": ancestors}
             done[name] = node
             if not active:
                 continue
@@ -199,6 +206,8 @@ def _assert_checks(run):
             assert isinstance(timeout, int) and 0 < timeout <= 90, f"{name}: unbounded timeout"
             checkouts = [step for step in leaf["body"]["steps"]
                          if step.get("uses", "").startswith("actions/checkout@")]
+            if leaf["name"] in {"plan-tests", "validation"}:
+                continue
             assert checkouts, f"{name}: no checkout"
             for checkout in checkouts:
                 workflow_steps.required(checkout, leaf["ctx"])
@@ -250,7 +259,8 @@ def _selected_tests(node, job, repo=_REPO):
 
 def _assert_test_selection(run, repo=_REPO):
     jobs = run["validate-main-tests"]["jobs"]
-    assert set(jobs) == {*_TEST_STEPS, "test"}, "the bounded test jobs changed"
+    assert set(jobs) == {*_TEST_STEPS, "test", "plan-tests", "validation"}, \
+        "the bounded test jobs changed"
     assert _selected_tests(jobs["acp-regression"], "acp-regression", repo) == _ACP_TESTS
     assert _selected_tests(jobs["e2e"], "e2e", repo) == _E2E_SMOKES
     shards = [_selected_tests(cell, "test-shards", repo) for cell in _leaf_jobs(jobs["test-shards"])]
@@ -317,9 +327,11 @@ def test_fork_runs_full_unit_suite_and_exact_existing_e2e_smokes():
 def test_direct_test_events_use_event_sha_and_reach_all_bounded_jobs(event):
     assert event in _on(_yaml(_TESTS))
     jobs = _run_workflow(_TESTS, inputs={}, github={"event_name": event, "sha": _STALE_SHA})
-    assert set(jobs) == {*_TEST_STEPS, "test"}
-    for node in jobs.values():
+    assert set(jobs) == {*_TEST_STEPS, "test", "plan-tests", "validation"}
+    for name, node in jobs.items():
         assert node["result"] == "success"
+        if name in {"plan-tests", "validation"}:
+            continue
         checkout = next(step for step in node["body"]["steps"] if step.get("uses", "").startswith("actions/checkout@"))
         assert gha.render(checkout["with"]["ref"], node["ctx"]) == _STALE_SHA
 

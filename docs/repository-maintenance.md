@@ -24,6 +24,11 @@ The agent that grows with you
   helper aborts and restores the clean starting tree on any non-workflow conflict.
 - Validation: the sync workflow calls the retained tests, Nix, lockfile, documentation
   and container checks explicitly because a GITHUB_TOKEN push does not trigger them.
+  `sync-main` publishes its clean merge to `main`, then each in-run validator checks out
+  the exact published SHA from the sync output. Those check runs remain attached to the
+  workflow's triggering SHA, not to the newly pushed candidate merely because checkout
+  selected it. They are therefore an explicit workflow publication/propagation gate,
+  not evidence that a required status context was recorded on the candidate commit.
   Custom-overlay propagation waits for all six exact-SHA validators and preserves a
   remote backup. It merges the validated main commit without rebasing or force-pushing,
   retaining the original overlay commits and reviewed merge-only reconciliation.
@@ -72,6 +77,11 @@ The agent that grows with you
 - Deployment tooling: `GitHub Actions`
 - Run repository-specific build and test commands documented in the root README before promotion.
 - Validate workflow changes with `actionlint`, parse structured configuration, and inspect the resulting GitHub Actions run.
+- `Tests / Test validation` is the stable aggregate result for direct pushes and pull
+  requests. It requires all selected ACP, unit-shard, unit-receipt and E2E jobs to
+  succeed, rejects unexpected skipped/failed/cancelled results, and reports those jobs
+  as intentionally not applicable only when every changed path is Markdown or under
+  `docs/`. Reusable exact-revision and manual runs always select full coverage.
 - For upstream changes, verify downstream configuration and generated artifacts before merging the review branch.
 
 ## Configuration and secrets
