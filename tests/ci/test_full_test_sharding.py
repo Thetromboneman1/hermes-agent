@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
@@ -74,6 +75,10 @@ def test_always_reported_validation_fails_closed_on_inconsistent_outcomes(run_he
 @pytest.mark.parametrize("changed_path,run_heavy", [
     ("docs/guide.txt", "false"),
     ("README.md", "false"),
+    ("skills/github/SKILL.md", "true"),
+    ("optional-skills/example/SKILL.md", "true"),
+    ("website/docs/example.md", "true"),
+    ("plugin-catalog/README.md", "true"),
     ("scripts/tool.py", "true"),
     (".github/workflows/tests.yml", "true"),
 ])
@@ -83,6 +88,9 @@ def test_path_plan_runs_heavy_tests_only_for_non_documentation_changes(tmp_path,
     subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
     baseline = tmp_path / "baseline.txt"
     baseline.write_text("baseline\n", encoding="utf-8")
+    classifier = tmp_path / "scripts" / "ci" / "classify_changes.py"
+    classifier.parent.mkdir(parents=True)
+    shutil.copyfile(fork._REPO / "scripts" / "ci" / "classify_changes.py", classifier)
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-qm", "baseline"], cwd=tmp_path, check=True)
     base = subprocess.check_output(

@@ -77,6 +77,19 @@ jobs:
             echo "reason=code or configuration changed" >> "$GITHUB_OUTPUT"
             exit 0
           done
+          # Some Markdown-looking paths are executable or generated contracts:
+          # skills, website pages and the plugin catalog all have Python tests.
+          # Reuse the repository classifier so this shortcut cannot drift from
+          # those maintained consumers.
+          classifier_output="$RUNNER_TEMP/test-classifier-output"
+          printf '%s\n' "${changed[@]}" | \
+            GITHUB_OUTPUT="$classifier_output" python3 scripts/ci/classify_changes.py \
+            > "$RUNNER_TEMP/test-classifier.log"
+          if grep -qx 'python=true' "$classifier_output"; then
+            echo "run_heavy=true" >> "$GITHUB_OUTPUT"
+            echo "reason=documentation path is covered by executable contract tests" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "run_heavy=false" >> "$GITHUB_OUTPUT"
           echo "reason=all changes are Markdown or under docs/" >> "$GITHUB_OUTPUT"
 
