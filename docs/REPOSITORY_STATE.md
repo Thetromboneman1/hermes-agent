@@ -6,7 +6,7 @@ This file is generated from the tracked repository tree. It is committed so
 the documentation record advances with implementation changes.
 
 - Repository: `Thetromboneman1/hermes-agent`
-- Default branch: `detached`
+- Default branch: `main`
 - Implementation fingerprint: `cc9585debbef3bd8`
 - Maintained documents: 1686
 - Architecture assets: 26
