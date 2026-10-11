@@ -1,6 +1,12 @@
 name: Tests
 
 on:
+  workflow_call:
+    inputs:
+      validation_ref:
+        description: Exact synchronized commit to validate
+        required: true
+        type: string
   push:
     branches: [main]
     paths-ignore:
@@ -18,7 +24,7 @@ permissions:
 
 # Cancel in-progress runs for the same PR/branch
 concurrency:
-  group: tests-${{ github.ref }}
+  group: tests-${{ inputs.validation_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -28,6 +34,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.validation_ref || github.sha }}
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
@@ -51,12 +60,15 @@ jobs:
           NOUS_API_KEY: ""
 
   test:
-    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The fork now runs the full isolated suite (4,000+ files), not only ACP.
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.validation_ref || github.sha }}
+          persist-credentials: false
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y ripgrep
@@ -89,6 +101,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.validation_ref || github.sha }}
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
@@ -105,7 +120,7 @@ jobs:
       - name: Run e2e tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/e2e/ -v --tb=short
+          scripts/run_tests.sh tests/e2e/ -- -v --tb=short
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

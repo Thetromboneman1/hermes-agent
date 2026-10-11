@@ -100,6 +100,14 @@ jobs:
             fi
           fi
 
+          # The GITHUB_TOKEN push will not start the documentation self-healer.
+          # Refresh only its known generated outputs before validating this SHA.
+          python3 scripts/documentation_health.py --write
+          if ! git diff --quiet -- README.md docs/REPOSITORY_STATE.md; then
+            git add README.md docs/REPOSITORY_STATE.md
+            git commit -m "docs: refresh generated repository state [skip ci]"
+          fi
+
           PUSHED=false
           for ATTEMPT in 1 2 3; do
             if git push origin main; then
@@ -129,6 +137,77 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "ℹ️  main already up to date"
           fi
+
+  # GITHUB_TOKEN pushes intentionally do not start push-triggered workflows.
+  # Call bounded, read-only checks directly and pin every checkout to the output.
+  # Validate unchanged syncs too: retrying a failed check must not silently skip it.
+  validate-main-tests:
+    needs: sync-main
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests.yml
+    with:
+      validation_ref: ${{ needs.sync-main.outputs.after }}
+
+  validate-main-nix:
+    needs: sync-main
+    permissions:
+      contents: read
+    uses: ./.github/workflows/nix.yml
+    with:
+      validation_ref: ${{ needs.sync-main.outputs.after }}
+
+  validate-main-lockfiles:
+    needs: sync-main
+    permissions:
+      contents: read
+    uses: ./.github/workflows/nix-lockfile-check.yml
+    with:
+      validation_ref: ${{ needs.sync-main.outputs.after }}
+
+  validate-main-docs-site:
+    needs: sync-main
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docs-site-checks.yml
+    with:
+      validation_ref: ${{ needs.sync-main.outputs.after }}
+
+  validate-main-container:
+    needs: sync-main
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.sync-main.outputs.after }}
+          submodules: recursive
+          persist-credentials: false
+      - name: Build synchronized image without publishing
+        run: docker build --tag hermes-agent:sync-validation .
+      - name: Smoke test synchronized image
+        run: docker run --rm -v /tmp/hermes-test:/opt/data hermes-agent:sync-validation --help
+
+  validate-main-documentation:
+    needs: sync-main
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REPOSITORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.sync-main.outputs.after }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install SVG renderer
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends librsvg2-bin
+      - name: Verify generated documentation
+        run: python3 scripts/documentation_health.py --check
 
   rebase-custom-branches:
     name: Rebase local-first-acp-optimizations
