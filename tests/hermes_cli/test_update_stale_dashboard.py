@@ -929,3 +929,32 @@ class TestPostUpdateStaleModuleReload:
 
         assert "hermes_cli._subprocess_compat" in reloaded
         assert "hermes_cli.dashboard_procs" in reloaded
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("processes, expected", [
+    ("", []),
+    ("111 /usr/bin/bash\n222 node /opt/grafana/dashboard-server.js", []),
+    (
+        "12345 python3 -m hermes_cli.main dashboard --port 9119\n"
+        "12346 hermes dashboard --port 9120 --no-open\n"
+        "12347 python /home/x/hermes_cli/main.py dashboard\n"
+        "notapid hermes dashboard --bad\n"
+        "22222 python3 -m hermes_cli.main chat -q 'rewrite my dashboard'\n"
+        "99999 grep hermes dashboard\n",
+        [12345, 12346, 12347],
+    ),
+])
+def test_stale_dashboard_scan_preserves_only_matching_pids(monkeypatch, processes, expected):
+    """The old warn-only tests' process filtering still protects the current cleanup path."""
+    monkeypatch.setattr("hermes_cli.process_identity.ledger_entries", lambda: [])
+    with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout=processes)):
+        assert _find_stale_dashboard_pids() == expected
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("error", [FileNotFoundError(), subprocess.TimeoutExpired("ps", 10)])
+def test_stale_dashboard_scan_failure_is_nonfatal(monkeypatch, error):
+    monkeypatch.setattr("hermes_cli.process_identity.ledger_entries", lambda: [])
+    with patch("subprocess.run", side_effect=error):
+        assert _find_stale_dashboard_pids() == []

@@ -6,6 +6,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from typing import Callable
+from urllib.parse import urlparse
 
 from acp.schema import ModelInfo, SessionModelState
 
@@ -16,8 +17,16 @@ logger = logging.getLogger("acp_adapter.server")
 ACP_MAX_MODELS_PER_PROVIDER = 200
 
 
-def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
-    """``(slug, label, [(model_id, description), ...])`` for named endpoints (v12 ``providers:``
+@dataclass
+class _NamedProviderCatalog:
+    slug: str
+    label: str
+    models: list[tuple[str, str]]
+    is_local: bool = False
+
+
+def _named_custom_provider_catalogs() -> list[_NamedProviderCatalog]:
+    """Model catalogs and endpoint locality for named endpoints (v12 ``providers:``
     and legacy ``custom_providers:``), which canonical provider enumeration never lists.
 
     Models = the entry's declared models, refreshed from the live ``/models`` listing when a
@@ -49,7 +58,7 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
         if isinstance(raw, dict) and not is_provider_enabled(raw)
     }
 
-    def _entry_catalog(entry: dict) -> tuple[str, str, list[tuple[str, str]]] | None:
+    def _entry_catalog(entry: dict) -> _NamedProviderCatalog | None:
         field = lambda key: str(entry.get(key) or "").strip()  # noqa: E731
         provider_key, name, base_url = field("provider_key"), field("name"), field("base_url")
         if provider_key.lower() in disabled_keys or not name or not base_url:
@@ -90,7 +99,11 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
 
         if not model_ids and not isinstance(live, _NativePickerModelList):
             return None
-        return slug, name, [(mid, "") for mid in model_ids]
+        host = urlparse(base_url if "://" in base_url else f"http://{base_url}").hostname
+        is_local = host in {
+            "localhost", "127.0.0.1", "::1", "host.docker.internal", "model-runner.docker.internal",
+        }
+        return _NamedProviderCatalog(slug, name, [(mid, "") for mid in model_ids], is_local=is_local)
 
     catalogs = [_entry_catalog(entry) for entry in entries if isinstance(entry, dict)]
     return [c for c in catalogs if c is not None]
@@ -186,7 +199,9 @@ class _ModelCatalog:
         self.seen_ids.add(choice_id)
         self.seen_semantic_ids.add(semantic_id)
 
-    def add_inventory_rows(self, rows: list, provider_label: Callable[[str], str]) -> None:
+    def add_inventory_rows(
+        self, rows: list, provider_label: Callable[[str], str], local_labels: dict[str, str],
+    ) -> None:
         for row in rows:
             raw_row_provider = str(row.get("slug") or "").strip().lower()
             row_provider = self.normalize_provider(raw_row_provider)
@@ -216,23 +231,31 @@ class _ModelCatalog:
                 is_current = rendered_model == self.current_model and (
                     self.semantic(encoded_provider) == self.semantic(self.current_choice_provider)
                 )
-                self.add(
-                    encoded_provider, rendered_model, f"{provider_name} · {rendered_model}",
-                    f"Provider: {provider_name}" + (" • current" if is_current else ""),
-                )
+                local_label = local_labels.get(encoded_provider)
+                name = f"{local_label}/{rendered_model}" if local_label else f"{provider_name} · {rendered_model}"
+                description = "Local endpoint" if local_label else f"Provider: {provider_name}"
+                self.add(encoded_provider, rendered_model, name, description + (" • current" if is_current else ""))
 
-    def add_named_catalogs(self, catalogs: list, normalized_provider: str) -> None:
+    def add_named_catalogs(self, catalogs: list[_NamedProviderCatalog]) -> None:
         """Named user-defined endpoints (providers: / custom_providers:) are invisible
-        to canonical enumeration — append them like the TUI /model picker. An empty
-        catalog marks that slug authoritative-empty."""
-        for named_slug, named_label, named_catalog in catalogs:
+        to canonical enumeration. An empty catalog marks that slug authoritative-empty;
+        ordering is applied after inventory identity resolution and deduplication."""
+        for catalog in catalogs:
+            named_slug, named_label, named_catalog = catalog.slug, catalog.label, catalog.models
             if not named_catalog:
                 self.empty_authoritative.add(str(named_slug).strip().lower())
                 continue
             for named_model, named_desc in named_catalog:
-                is_current = named_slug == normalized_provider and named_model == self.current_model
-                parts = [f"Provider: {named_label}", str(named_desc or "").strip(), "current" if is_current else ""]
-                self.add(named_slug, named_model, named_model, " • ".join(part for part in parts if part))
+                is_current = (
+                    self.semantic(named_slug) == self.semantic(self.current_choice_provider)
+                    and named_model == self.current_model
+                )
+                parts = [
+                    "Local endpoint" if catalog.is_local else f"Provider: {named_label}",
+                    str(named_desc or "").strip(), "current" if is_current else "",
+                ]
+                name = f"{named_label}/{named_model}" if catalog.is_local else named_model
+                self.add(named_slug, named_model, name, " • ".join(part for part in parts if part))
 
 
 def build_model_state(model: str, provider: str, base_url: str) -> SessionModelState | None:
@@ -256,9 +279,18 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
         current_choice_provider=str(provider or "").strip().lower(),
         current_base_url=base_url.strip().rstrip("/").lower(),
     )
-    cat.add_inventory_rows(payload.get("providers") or [], provider_label)
-    cat.add_named_catalogs(_named_custom_provider_catalogs(), normalized_provider)
-    available_models = cat.models
+    named_catalogs = _named_custom_provider_catalogs()
+    local_labels = {catalog.slug: catalog.label for catalog in named_catalogs if catalog.is_local}
+    local_ids = {
+        encode_model_choice(catalog.slug, model_id)
+        for catalog in named_catalogs if catalog.is_local
+        for model_id, _ in catalog.models
+    }
+    # Let inventory resolve aliases/current identity before deduplication. Stable
+    # local-first ordering then preserves the fork's picker without changing selection.
+    cat.add_inventory_rows(payload.get("providers") or [], provider_label, local_labels)
+    cat.add_named_catalogs(named_catalogs)
+    available_models = sorted(cat.models, key=lambda item: item.model_id not in local_ids)
 
     def empty_applies(provider_id: str) -> bool:
         return _empty_catalog_applies(provider_id, cat.empty_authoritative, normalize_provider)
@@ -272,7 +304,11 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
     current_model_id = "" if current_is_empty else encode_model_choice(cat.current_choice_provider, model)
     if current_model_id and current_model_id not in {item.model_id for item in available_models}:
         provider_name = provider_label(normalized_provider)
-        available_models.insert(0, ModelInfo(
+        insertion_index = next(
+            (index for index, item in enumerate(available_models) if item.model_id not in local_ids),
+            len(available_models),
+        )
+        available_models.insert(insertion_index, ModelInfo(
             model_id=current_model_id, name=f"{provider_name} · {model}",
             description=f"Provider: {provider_name} • current",
         ))

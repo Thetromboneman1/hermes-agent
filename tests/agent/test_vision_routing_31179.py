@@ -167,6 +167,25 @@ auxiliary:
 class TestTextOnlyMainSkippedForVision:
     """Vision auto-detect must not return a text-only main-provider client."""
 
+    @pytest.fixture(autouse=True)
+    def _vision_catalog(self, monkeypatch):
+        """Exercise real capability lookup without a live models.dev/cache hit."""
+        from agent import models_dev
+
+        catalog = {
+            "deepseek": {
+                "models": {
+                    "deepseek-v4-pro": {"modalities": {"input": ["text"]}},
+                },
+            },
+            "anthropic": {
+                "models": {
+                    "claude-sonnet-4-6": {"modalities": {"input": ["text", "image"]}},
+                },
+            },
+        }
+        monkeypatch.setattr(models_dev, "fetch_models_dev", lambda *args, **kwargs: catalog)
+
     def test_text_only_main_skipped_when_no_aggregator(self, isolated_home, monkeypatch):
         """DeepSeek main + no aggregator credentials → no client built.
 

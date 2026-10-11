@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from acp_adapter.model_catalog import _named_custom_provider_catalogs
+from acp_adapter.model_catalog import _NamedProviderCatalog, _named_custom_provider_catalogs
 from acp_adapter.server import HermesACPAgent
 from acp_adapter.session import SessionManager
 from acp.schema import SessionModelState
@@ -51,9 +51,8 @@ class TestNamedCustomProviderCatalogs:
             catalogs = _named_custom_provider_catalogs()
 
         assert len(catalogs) == 1
-        slug, label, models = catalogs[0]
-        assert slug == "custom:relay"
-        assert [m for m, _ in models] == ["model-a", "model-b"]
+        assert catalogs[0].slug == "custom:relay"
+        assert [m for m, _ in catalogs[0].models] == ["model-a", "model-b"]
 
 
     def test_disabled_provider_skipped(self, monkeypatch):
@@ -108,7 +107,7 @@ class TestNamedCustomProviderCatalogs:
             catalogs = _named_custom_provider_catalogs()
 
         assert catalogs == [
-            ("custom:legacy-endpoint", "Legacy Endpoint", [("legacy-model", "")])
+            _NamedProviderCatalog("custom:legacy-endpoint", "Legacy Endpoint", [("legacy-model", "")])
         ]
     def test_no_key_ollama_provider_discovers_native_catalog(self):
         cfg = _cfg(
@@ -128,7 +127,7 @@ class TestNamedCustomProviderCatalogs:
         ) as fetch:
             catalogs = _named_custom_provider_catalogs()
 
-        assert [m for m, _ in catalogs[0][2]] == ["qwen3:1.7b"]
+        assert [m for m, _ in catalogs[0].models] == ["qwen3:1.7b"]
         fetch.assert_called_once_with(
             "",
             "http://127.0.0.1:11434/v1",
@@ -156,7 +155,7 @@ class TestNamedCustomProviderCatalogs:
         ) as fetch:
             catalogs = _named_custom_provider_catalogs()
 
-        assert [m for m, _ in catalogs[0][2]] == ["qwen3:1.7b"]
+        assert [m for m, _ in catalogs[0].models] == ["qwen3:1.7b"]
         fetch.assert_called_once()
 
     def test_native_empty_catalog_is_authoritative_over_default_model(self):
@@ -179,7 +178,7 @@ class TestNamedCustomProviderCatalogs:
             return_value=_NativePickerModelList(),
         ):
             assert _named_custom_provider_catalogs() == [
-                ("custom:ollama", "Ollama", [])
+                _NamedProviderCatalog("custom:ollama", "Ollama", [], is_local=True)
             ]
 
 
@@ -195,7 +194,7 @@ class TestModelStateIncludesNamedProviders:
 
         with patch(
             "acp_adapter.model_catalog._named_custom_provider_catalogs",
-            return_value=[("custom:ollama", "Ollama", [])],
+            return_value=[_NamedProviderCatalog("custom:ollama", "Ollama", [], is_local=True)],
         ):
             resp = await acp_agent.new_session(cwd="/tmp")
 
@@ -218,7 +217,7 @@ class TestModelStateIncludesNamedProviders:
         with patch(
             "acp_adapter.model_catalog._named_custom_provider_catalogs",
             return_value=[
-                (
+                _NamedProviderCatalog(
                     "custom:bedrock-mantle",
                     "AWS Bedrock Mantle",
                     [("openai.gpt-5.5", "")],
@@ -275,3 +274,61 @@ class TestModelStateIncludesNamedProviders:
             )
         assert provider == "custom:local-127.0.0.1:11434"
         assert model == "qwen3:1.7b"
+
+
+@pytest.mark.parametrize("local_url", [
+    "http://localhost:8642/v1",
+    "http://127.0.0.1:8642/v1",
+    "http://[::1]:8642/v1",
+    "http://host.docker.internal:8642/v1",
+    "http://model-runner.docker.internal/engines/llama.cpp/v1",
+])
+@pytest.mark.parametrize("current_in_inventory", [False, True])
+def test_local_catalog_priority_preserves_dedup_and_current_selection(
+    tmp_path, monkeypatch, local_url, current_in_inventory,
+):
+    """Real named config keeps local rows first without hiding cloud choices or moving selection."""
+    import yaml
+    from acp_adapter.model_catalog import build_model_state
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = {"providers": {
+        "local": {"name": "Local", "base_url": local_url, "model": "local-model", "discover_models": False},
+        "remote": {"name": "Relay", "base_url": "https://relay.example/v1", "model": "remote-model"},
+    }}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    inventory = [{"slug": "custom:local", "name": "Local", "models": ["local-model"]}]
+    if current_in_inventory:
+        inventory.insert(0, {"slug": "openrouter", "name": "OpenRouter", "models": ["cloud-model"]})
+
+    with patch("hermes_cli.inventory.build_models_payload", return_value={"providers": inventory}):
+        state = build_model_state("cloud-model", "openrouter", "https://openrouter.ai/api/v1")
+
+    ids = [item.model_id for item in state.available_models]
+    assert ids == ["custom:local:local-model", "openrouter:cloud-model", "custom:remote:remote-model"]
+    assert state.current_model_id == "openrouter:cloud-model"
+    assert state.available_models[0].name == "Local/local-model"
+    assert state.available_models[0].description == "Local endpoint"
+
+
+@pytest.mark.parametrize("provider", ["ollama", "custom:ollama", "custom"])
+def test_local_priority_preserves_ollama_current_identity(tmp_path, monkeypatch, provider):
+    """Local priority must retain the inventory's alias/base-URL identity resolution."""
+    import yaml
+    from acp_adapter.model_catalog import build_model_state
+
+    base_url = "http://localhost:11434/v1"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"providers": {
+        "ollama": {
+            "name": "Ollama", "base_url": base_url, "model": "qwen3:1.7b", "discover_models": False,
+        },
+    }}), encoding="utf-8")
+    inventory = [{"slug": "ollama", "name": "Ollama", "api_url": base_url, "models": ["qwen3:1.7b"]}]
+    with patch("hermes_cli.inventory.build_models_payload", return_value={"providers": inventory}):
+        state = build_model_state("qwen3:1.7b", provider, base_url)
+
+    assert state.current_model_id == "custom:ollama:qwen3:1.7b"
+    assert len(state.available_models) == 1
+    assert state.available_models[0].model_id == state.current_model_id
+    assert "current" in state.available_models[0].description

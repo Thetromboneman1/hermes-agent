@@ -78,7 +78,9 @@ def test_home_keyed_caches_serve_each_profile_its_own_config(tmp_path, monkeypat
         p.parent.mkdir()
         p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         p.chmod(0o755)
-    main = {"model": {"provider": "openai", "model": "gpt-4o"}}
+    # The cache-scope contract needs a native-vision main model, independent
+    # of whether this test machine has a models.dev catalog cached.
+    main = {"model": {"provider": "openai", "model": "gpt-4o", "supports_vision": True}}
     a = _make_home(tmp_path / "A", {**main, "security": {"tirith_path": str(bin_a)},
                                     "auxiliary": {"vision": {"provider": "auto"}, "summary": {"max_concurrency": 2}}})
     b = _make_home(tmp_path / "A" / "profiles" / "B", {**main, "security": {"tirith_path": str(bin_b)},

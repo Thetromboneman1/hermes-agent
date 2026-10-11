@@ -290,43 +290,73 @@ def _yaml(rel: str) -> dict:
 
 def test_every_lane_reaches_the_composite_action():
     """The action is the one surface every consumer reads, so it must carry all
-    of them — ci.yaml, nix.yml and docker.yml each re-export a different subset.
+    of them, even when workflows consume different subsets.
     """
     lanes = set(classify(["run_agent.py"]))
     action_outputs = set(_yaml(".github/actions/detect-changes/action.yml")["outputs"])
     assert lanes - action_outputs == set(), "lane(s) missing from the composite action's outputs"
 
 
-def test_ci_jobs_only_gate_on_detect_outputs_that_detect_actually_declares():
-    """An ``if`` that reads an undeclared output resolves to the empty string.
+def _assert_declared_dependency_outputs(workflow: dict) -> set[tuple[str, str]]:
+    """Check output references against the jobs that publish them."""
+    jobs = workflow["jobs"]
+    referenced = set()
+    for job in jobs.values():
+        needs = job.get("needs", [])
+        if isinstance(needs, str):
+            needs = [needs]
+        for expr in _iter_expressions(job):
+            for dependency, output in re.findall(
+                r"needs\.([\w-]+)\.outputs\.([\w-]+)", expr
+            ):
+                assert dependency in needs, f"{dependency} is not a declared job dependency"
+                assert dependency in jobs, f"{dependency} is not a workflow job"
+                assert output in jobs[dependency].get("outputs", {}), (
+                    f"{dependency}.{output} is not a declared job output"
+                )
+                referenced.add((dependency, output))
+    return referenced
 
-    The lane then reports "skipping" on every PR, forever, and nothing goes red
-    — there is no error for referencing an output a job never declared. That is
-    exactly how the ``rust`` lane shipped dead: the classifier emitted it and
-    the composite action re-exported it, but ci.yaml's ``detect`` job did not,
-    so ``needs.detect.outputs.rust`` was never anything but "".
+
+def test_ci_jobs_only_gate_on_outputs_their_dependencies_actually_declare():
+    """Undeclared outputs resolve to empty strings and silently skip jobs.
+
+    Inspect the workflows that are actually deployed. Forks may replace the
+    upstream ci.yaml orchestrator, but their output wiring has the same contract.
+    Include step inputs and reusable-workflow inputs, not only ``if`` clauses.
     """
-    ci = _yaml(".github/workflows/ci.yaml")
-    declared = set(ci["jobs"]["detect"]["outputs"])
-
-    referenced: set[str] = set()
-    for job in ci["jobs"].values():
-        for expr in _iter_if_expressions(job):
-            referenced.update(re.findall(r"needs\.detect\.outputs\.(\w+)", expr))
-
-    assert referenced, "found no detect-gated jobs — the walk is broken, not the wiring"
-    assert referenced - declared == set(), "job(s) gate on an output detect never declares"
+    referenced = set()
+    paths = sorted((_REPO / ".github/workflows").glob("*.y*ml"))
+    assert paths, "found no workflows to validate"
+    for path in paths:
+        referenced.update(_assert_declared_dependency_outputs(_yaml(str(path.relative_to(_REPO)))))
+    assert referenced, "found no dependency outputs — the walk is broken, not the wiring"
 
 
-def _iter_if_expressions(job: object):
-    """Yield every ``if:`` string in a job, including inside its steps."""
-    if not isinstance(job, dict):
-        return
-    if isinstance(cond := job.get("if"), str):
-        yield cond
-    for step in job.get("steps", []) or []:
-        if isinstance(step, dict) and isinstance(cond := step.get("if"), str):
-            yield cond
+@pytest.mark.parametrize("declared,needs", [(False, ["detect"]), (True, [])])
+def test_dependency_output_contract_rejects_missing_outputs_or_dependencies(declared, needs):
+    workflow = {
+        "jobs": {
+            "detect": {"outputs": {"rust": "true"} if declared else {}},
+            "rust": {"needs": needs, "if": "needs.detect.outputs.rust == 'true'"},
+        }
+    }
+    with pytest.raises(AssertionError):
+        _assert_declared_dependency_outputs(workflow)
+    workflow["jobs"]["detect"]["outputs"]["rust"] = "true"
+    workflow["jobs"]["rust"]["needs"] = ["detect"]
+    assert _assert_declared_dependency_outputs(workflow) == {("detect", "rust")}
+
+
+def _iter_expressions(value: object):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_expressions(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _iter_expressions(nested)
 
 
 def test_ci_review_files_returns_only_sensitive_paths_sorted_and_unique():
