@@ -93,7 +93,12 @@ jobs:
           fi
 
           # --- subprocess with encoded/obfuscated commands ---
-          PROC_HITS=$(echo "$DIFF" | grep -n '^\+' | grep -E 'subprocess\.(Popen|call|run)\s*\(' | grep -iE 'base64|decode|encode|\\x|chr\(' | head -10 || true)
+          PROC_CANDIDATES=$(echo "$DIFF" | grep -n '^\+' | grep -E 'subprocess\.(Popen|call|run)\s*\(' | grep -iE 'base64|decode|encode|\\x|chr\(' || true)
+          if ! PROC_HITS=$(printf '%s\n' "$PROC_CANDIDATES" | python3 -I scripts/ci/filter_encoded_subprocess.py); then
+            echo "::warning::Could not classify subprocess candidates; retaining all findings"
+            PROC_HITS="$PROC_CANDIDATES"
+          fi
+          PROC_HITS=$(printf '%s\n' "$PROC_HITS" | head -10 || true)
           if [ -n "$PROC_HITS" ]; then
             CRITICAL=true
             FINDINGS="${FINDINGS}

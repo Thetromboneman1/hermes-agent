@@ -175,6 +175,8 @@ def _leaf_jobs(node):
 
 def _assert_checks(run):
     assert run["sync-main"]["outputs"]["after"] == _SHA
+    assert run["sync-main"]["body"]["permissions"] == {"contents": "write"}
+    assert run[_REBASE]["body"]["permissions"] == {"contents": "write", "issues": "write"}
     assert set(_needs(run[_REBASE]["body"])) == {"sync-main", *_CHECKS}
     for name in _CHECKS:
         node = run[name]
@@ -274,11 +276,11 @@ def _mutated_yaml(monkeypatch, rel):
 
 
 @pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
-@pytest.mark.parametrize("changed,force,rebase", [(True, False, True), (False, False, False), (False, True, True)])
-def test_sync_dispatch_validates_exact_sha_even_when_unchanged(event, changed, force, rebase):
+@pytest.mark.parametrize("changed,force", [(True, False), (False, False), (False, True)])
+def test_sync_dispatch_validates_exact_sha_and_inspects_custom_even_when_unchanged(event, changed, force):
     run = _sync_run(changed=changed, force=force, event=event)
     _assert_checks(run)
-    assert (run[_REBASE]["result"] == "success") is rebase
+    assert run[_REBASE]["result"] == "success"
 
 
 @pytest.mark.parametrize("dependency", ["sync-main", *_CHECKS])
@@ -439,3 +441,12 @@ def test_unit_receipt_rejects_narrowing_to_only_acp_and_ci(monkeypatch):
     step["run"] = "scripts/run_tests.sh tests/acp_adapter/ tests/ci/ -- -q --tb=short"
     with pytest.raises(AssertionError, match="complete maintained unit tree"):
         _assert_test_selection(_sync_run())
+
+
+
+def test_retry_contract_rejects_gate_based_only_on_latest_main_change(monkeypatch):
+    workflow = _mutated_yaml(monkeypatch, _SYNC)
+    workflow["jobs"][_REBASE]["if"] = "needs.sync-main.outputs.changed == 'true' || inputs.force_rebase == true"
+    with pytest.raises(AssertionError):
+        test_sync_dispatch_validates_exact_sha_and_inspects_custom_even_when_unchanged(
+            "workflow_dispatch", False, False)
