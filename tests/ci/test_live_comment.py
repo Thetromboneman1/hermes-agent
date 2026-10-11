@@ -88,53 +88,61 @@ def test_parse_watch_workflows_keeps_commas_inside_a_name():
     assert _mod.parse_watch_workflows("") == []
 
 
-def test_workflow_watch_list_names_a_workflow_that_exists():
-    """The names the workflow passes must match real workflow ``name:`` values.
+def _workflow_watch_lists(doc: dict):
+    # PyYAML's YAML 1.1 loader reads the GitHub Actions "on" key as True.
+    triggers = doc.get("on", doc.get(True, {}))
+    if isinstance(triggers, dict):
+        workflow_run = triggers.get("workflow_run", {})
+        if isinstance(workflow_run, dict) and "workflows" in workflow_run:
+            yield workflow_run["workflows"]
+    for job in doc.get("jobs", {}).values():
+        for step in job.get("steps", []):
+            env = step.get("env") or {}
+            if "WATCH_WORKFLOWS" in env:
+                yield _mod.parse_watch_workflows(env["WATCH_WORKFLOWS"])
 
-    A name that matches nothing makes the poller silently drop that run
-    from the comment, which no unit test on its own would notice.
-    """
+
+def _watching_workflows():
     yaml = pytest.importorskip("yaml")
     root = Path(__file__).resolve().parents[2]
-    caller = yaml.safe_load(
-        (root / ".github/workflows/ci-review-comment.yml").read_text(encoding="utf-8")
-    )
-    step = next(
-        s for s in caller["jobs"]["comment"]["steps"]
-        if "WATCH_WORKFLOWS" in (s.get("env") or {})
-    )
-    watched = _mod.parse_watch_workflows(step["env"]["WATCH_WORKFLOWS"])
-    assert watched, "the poller is watching nothing"
-
-    known = set()
-    for path in (root / ".github/workflows").glob("*.yml"):
-        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-        if isinstance(doc, dict) and isinstance(doc.get("name"), str):
-            known.add(doc["name"])
-
-    assert set(watched) <= known, f"unknown workflow names: {set(watched) - known}"
+    docs = [
+        yaml.safe_load(path.read_text(encoding="utf-8"))
+        for path in sorted((root / ".github/workflows").glob("*.y*ml"))
+    ]
+    assert docs, "found no workflows to validate"
+    return docs
 
 
-def test_poller_never_watches_its_own_workflow():
-    """The poller's own run must never gate completion.
+def test_workflow_watch_lists_name_workflows_that_exist():
+    """Validate deployed watchers, including fork lifecycle notifications.
 
-    ``runs_all_completed`` waits until every relevant run is completed.
-    The poller's run is in progress for as long as it polls, so watching
-    itself would make the loop wait for itself and only ever exit on
-    timeout.
+    A nonexistent workflow name silently drops that run from the report. The
+    fork uses workflow_run notifications instead of the upstream comment job;
+    both forms must reference the actual workflow names in this checkout.
     """
-    yaml = pytest.importorskip("yaml")
-    root = Path(__file__).resolve().parents[2]
-    doc = yaml.safe_load(
-        (root / ".github/workflows/ci-review-comment.yml").read_text(encoding="utf-8")
-    )
-    own_name = doc["name"]
-    step = next(
-        s for s in doc["jobs"]["comment"]["steps"]
-        if "WATCH_WORKFLOWS" in (s.get("env") or {})
-    )
-    watched = _mod.parse_watch_workflows(step["env"]["WATCH_WORKFLOWS"])
-    assert own_name not in watched
+    docs = _watching_workflows()
+    known = {doc["name"] for doc in docs}
+    watched_lists = [watched for doc in docs for watched in _workflow_watch_lists(doc)]
+    assert watched_lists, "found no workflow watchers — the walk is broken"
+    for watched in watched_lists:
+        assert watched, "the watcher is watching nothing"
+        assert set(watched) <= known, f"unknown workflow names: {set(watched) - known}"
+
+
+def test_workflow_watchers_never_watch_themselves():
+    """Self-watching deadlocks a poller and loops workflow_run notifications."""
+    for doc in _watching_workflows():
+        for watched in _workflow_watch_lists(doc):
+            assert doc["name"] not in watched
+
+
+@pytest.mark.parametrize("triggers_key", ["on", True])
+def test_watch_list_discovery_covers_notification_and_poller_workflows(triggers_key):
+    doc = {
+        triggers_key: {"workflow_run": {"workflows": [DOCKER]}},
+        "jobs": {"comment": {"steps": [{"env": {"WATCH_WORKFLOWS": f"{DOCKER}\nCI"}}]}},
+    }
+    assert list(_workflow_watch_lists(doc)) == [[DOCKER], [DOCKER, "CI"]]
 
 
 # ─── runs_all_completed ───────────────────────────────────────────────

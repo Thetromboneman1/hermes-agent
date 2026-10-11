@@ -118,7 +118,21 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     assert "Local Models" in r.json()["detail"]
 
 
-def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
+@pytest.fixture
+def capable_hardware(monkeypatch):
+    """Keep orchestration tests independent of the runner's available RAM/GPU."""
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    gib = 1 << 30
+    budget = HardwareBudget(
+        usable_vram_bytes=120 * gib, total_device_bytes=128 * gib,
+        ram_available_bytes=120 * gib, uma=True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.hardware.probe_budget", lambda **kw: budget)
+
+
+def test_quickstart_runs_all_three_legs(client, capable_hardware, monkeypatch, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
@@ -159,7 +173,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
         lambda *a, **k: calls.append("assign"))
 
     r = client.post("/api/local-models/quickstart", json={})
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     body = r.json()
     assert body["needs_runtime"] is True
     assert body["needs_download"] is True
@@ -179,13 +193,14 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     assert load_config()["local_runtime"]["enabled"] is True
 
 
-def test_quickstart_skips_satisfied_legs(client, monkeypatch):
+def test_quickstart_skips_satisfied_legs(client, capable_hardware, monkeypatch):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
 
-    monkeypatch.setattr(
-        "hermes_cli.local_runtime.binaries.installed_tags", lambda: ["b10362"])
+    from hermes_cli.local_runtime import binaries
+
+    monkeypatch.setattr(binaries, "installed_tags", lambda: [binaries.default_tag()])
     monkeypatch.setattr(
         "hermes_cli.local_runtime.binaries.ensure_runtime_installed",
         lambda tag, backend, progress=None: calls.append("install"))
@@ -210,7 +225,7 @@ def test_quickstart_skips_satisfied_legs(client, monkeypatch):
         lambda *a, **k: calls.append("assign"))
 
     r = client.post("/api/local-models/quickstart", json={})
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     body = r.json()
     assert body["needs_runtime"] is False
     assert body["needs_download"] is False

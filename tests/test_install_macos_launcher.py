@@ -35,13 +35,16 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
     venv_bin = install_dir / "venv" / "bin"
     command_dir = tmp_path / "command"
     minimal_path = tmp_path / "minimal-path"
+    home = tmp_path / "home"
     result = tmp_path / "launch-result"
     venv_bin.mkdir(parents=True)
     minimal_path.mkdir()
+    home.mkdir()
 
     dirname = shutil.which("dirname")
     assert dirname is not None
     (minimal_path / "dirname").symlink_to(dirname)
+    (minimal_path / "bash").symlink_to("/bin/bash")
 
     _make_executable(
         venv_bin / "python",
@@ -63,11 +66,18 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
             'get_command_link_display_dir() { printf "%s" "$COMMAND_LINK_DIR"; }',
             "log_info() { :; }",
             "log_success() { :; }",
+            "log_warn() { :; }",
             _setup_path_function(),
             "setup_path",
         ]
     )
-    env = os.environ | {
+    # setup_path may edit shell startup files. Keep its HOME and shell inputs
+    # isolated, and do not inherit BASH_ENV or exported shell functions.
+    env = {
+        "HOME": str(home),
+        "SHELL": "/bin/bash",
+        "PATH": os.defpath,
+        "ROOT_FHS_LAYOUT": "false",
         "USE_VENV": "true",
         "INSTALL_DIR": str(install_dir),
         "DISTRO": "macos",
@@ -77,7 +87,7 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
 
     completed = subprocess.run(
         [command_dir / "hermes", "--version"],
-        env=os.environ | {"LAUNCH_RESULT": str(result)},
+        env=env | {"PATH": str(minimal_path), "LAUNCH_RESULT": str(result)},
         text=True,
         capture_output=True,
     )

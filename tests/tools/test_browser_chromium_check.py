@@ -86,3 +86,50 @@ class TestRunBrowserCommandChromiumGuard:
     """
 
 
+
+
+@pytest.mark.parametrize("cache_kind", ["empty", "unrelated", "file"])
+def test_missing_chromium_checks_every_install_source(monkeypatch, tmp_path, cache_kind):
+    """An empty Playwright cache is missing Chromium only when PATH/override are absent."""
+    monkeypatch.delenv("AGENT_BROWSER_EXECUTABLE_PATH", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name, path=None: None)
+    cache = tmp_path / "browsers"
+    if cache_kind == "file":
+        cache.write_text("")
+    else:
+        cache.mkdir()
+        if cache_kind == "unrelated":
+            (cache / "firefox-1234").mkdir()
+    monkeypatch.setattr(bt_install, "_chromium_search_roots", lambda: [str(cache)])
+
+    assert bt_install._chromium_installed() is False
+
+
+@pytest.mark.parametrize("in_docker, hint", [(True, "docker pull"), (False, "agent-browser install")])
+def test_missing_chromium_fails_before_spawning_with_recovery_hint(monkeypatch, tmp_path, in_docker, hint):
+    """Port the copied fail-fast contract to the extracted browser modules and lazy-install gate."""
+    from tools import browser_tool_session
+
+    monkeypatch.delenv("AGENT_BROWSER_EXECUTABLE_PATH", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name, path=None: None)
+    monkeypatch.setattr(bt_install, "_chromium_search_roots", lambda: [str(tmp_path)])
+    monkeypatch.setattr(bt_install, "_find_agent_browser", lambda **kw: "/test/agent-browser")
+    monkeypatch.setattr(bt_install, "_requires_real_termux_browser_install", lambda _: False)
+    monkeypatch.setattr(bt_install, "_running_in_docker", lambda: in_docker)
+    monkeypatch.setattr(bt_install, "_maybe_autoinstall_chromium", lambda: False)
+    monkeypatch.setattr(bt_cloud, "_is_local_mode", lambda: True)
+    monkeypatch.setattr(bt_cloud, "_get_browser_engine", lambda: "chromium")
+    monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+    monkeypatch.setattr(bt, "_is_browser_use_cli_mode", lambda: False)
+    monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override_raw", lambda: None)
+
+    def unexpected_spawn(*args, **kwargs):
+        pytest.fail("Missing Chromium must fail before starting a browser subprocess")
+
+    monkeypatch.setattr("subprocess.Popen", unexpected_spawn)
+    assert bt_install.check_browser_requirements() is False
+    result = browser_tool_session._run_browser_command("task-1", "open", ["https://example.com"])
+    assert result["success"] is False
+    assert "Chromium" in result["error"]
+    assert hint in result["error"]

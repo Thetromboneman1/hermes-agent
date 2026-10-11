@@ -273,6 +273,7 @@ def _time_benign_segments(count):
     return time.perf_counter() - started, result
 
 
+@pytest.mark.timeout(20)
 def test_benign_segment_scaling_benchmark():
     """Retain real metrics without making correctness depend on wall-clock ratios."""
     small, small_result = _time_benign_segments(2_000)
@@ -281,6 +282,26 @@ def test_benign_segment_scaling_benchmark():
     assert small_result == (False, None, None)
     assert large_result == (False, None, None)
     print(f"benign segment benchmark: 2k={small:.3f}s, 4k={large:.3f}s")
+
+
+@pytest.mark.parametrize(
+    ("suffix", "dangerous"),
+    [
+        ('label=ai.hermes.gateway; launchctl bootout "gui/$uid/$label"', True),
+        ('launchctl bootout "gui/$uid/$label"; label=ai.hermes.gateway', True),
+        ("launchctl print ai.hermes.gateway", False),
+        ("launchctl stop com.example.unrelated", False),
+    ],
+)
+def test_launchctl_guard_keeps_whole_command_semantics_after_long_prefix(suffix, dangerous):
+    command = "printf ordinary;\n" * 1_000 + suffix
+    result = detect_dangerous_command(command)
+
+    if dangerous:
+        description = "stop/restart hermes launchd service (kills running agents)"
+        assert result == (True, description, description)
+    else:
+        assert result == (False, None, None)
 
 
 def test_max_accepted_separator_free_input_is_fast():

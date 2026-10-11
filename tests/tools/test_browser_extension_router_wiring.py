@@ -36,6 +36,11 @@ def _route_spy(monkeypatch):
 
     monkeypatch.setattr(browser_tool, "routed_browser_handler", spy)
     monkeypatch.setattr(browser_cdp_tool, "routed_browser_handler", spy)
+    # Every registry action invokes its fallback. Stub all of them, not just
+    # navigate: snapshot/click/etc. must never launch a real browser in this
+    # wiring-only test.
+    for name in BROWSER_ACTIONS:
+        monkeypatch.setattr(browser_tool, name, lambda *a, **k: "legacy-browser")
     monkeypatch.setattr(
         browser_tool,
         "browser_navigate",

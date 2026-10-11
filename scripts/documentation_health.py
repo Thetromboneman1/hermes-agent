@@ -38,7 +38,9 @@ class Finding:
 
 
 def run(args: list[str], *, cwd: Path, timeout: int = 900, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=timeout)
+    result = subprocess.run(
+        args, cwd=cwd, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout,
+    )
     if check and result.returncode != 0:
         raise RuntimeError(
             f"command failed ({result.returncode}): {' '.join(args)}\n"
@@ -274,6 +276,8 @@ def render_mermaid(root: Path, source: str, digest: str) -> tuple[Path, Path, Pa
             mermaid_command(mmd_path, svg_path),
             cwd=root,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=900,
             env=env,
@@ -285,6 +289,8 @@ def render_mermaid(root: Path, source: str, digest: str) -> tuple[Path, Path, Pa
             mermaid_command(mmd_path, png_path),
             cwd=root,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=900,
             env=env,
