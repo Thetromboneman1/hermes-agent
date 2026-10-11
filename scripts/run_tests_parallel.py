@@ -604,6 +604,7 @@ def _run_one_file(
             )
             with _flaky_lock:
                 _FLAKY_RESULTS.append((file, output))
+    summary["retries"] = attempt
     return file, rc, output, summary, subproc_wall
 
 
@@ -1093,6 +1094,40 @@ def _pytest_flag_error(tokens: list[str]) -> Optional[str]:
     return f"unrecognized arguments: {' '.join(unknown)}" if unknown else None
 
 
+def _parse_slice(slice_raw: str | None) -> tuple[int | None, int]:
+    slice_index: int | None = None
+    slice_count: int = 1
+    if slice_raw:
+        try:
+            idx_s, count_s = slice_raw.split("/", 1)
+            slice_index = int(idx_s)
+            slice_count = int(count_s)
+        except (ValueError, AttributeError):
+            print(f"error: --slice must be I/N (e.g. 1/4), got: {slice_raw!r}", file=sys.stderr)
+            sys.exit(2)
+
+    return slice_index, slice_count
+
+
+def _report_sha(repo_root: Path, report_path: Path | None) -> str | None:
+    if report_path is None:
+        return None
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True, timeout=10
+    ).strip()
+
+
+def _write_report(path, sha, slice_raw, files, results, exit_code, repo_root) -> None:
+    if path is None:
+        return
+    path.write_text(json.dumps({
+        "sha": sha, "slice": slice_raw,
+        "files": [_format_file(file, repo_root) for file in files],
+        "results": sorted(results, key=lambda item: item["file"]),
+        "exit_code": exit_code,
+    }, indent=2) + "\n", encoding="utf-8")
+
+
 def main() -> int:
     _make_stdio_glyph_safe()
     parser = argparse.ArgumentParser(
@@ -1144,6 +1179,11 @@ def main() -> int:
             "is reported as FLAKY in the summary. 0 disables. "
             f"Default: {_DEFAULT_FILE_RETRIES}, env: HERMES_TEST_FILE_RETRIES."
         ),
+    )
+    parser.add_argument(
+        "--report-json",
+        type=Path,
+        help="Write selected/completed files, checkout SHA, exit code and retry counts for CI verification.",
     )
     parser.add_argument(
         "--slice",
@@ -1220,7 +1260,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
-        "--files-from",
+        "--files-from", "--report-json",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1327,18 +1367,11 @@ def main() -> int:
     # Read once, here: test processes inherit this env, and a runner they start (the
     # runner's own probe tests) must run its whole file set, not "its" slice of it.
     os.environ.pop("HERMES_TEST_SLICE", None)
-    slice_index: int | None = None
-    slice_count: int = 1
-    if slice_raw:
-        try:
-            idx_s, count_s = slice_raw.split("/", 1)
-            slice_index = int(idx_s)
-            slice_count = int(count_s)
-        except (ValueError, AttributeError):
-            print(f"error: --slice must be I/N (e.g. 1/4), got: {slice_raw!r}", file=sys.stderr)
-            sys.exit(2)
+    slice_index, slice_count = _parse_slice(slice_raw)
 
     repo_root = Path(__file__).resolve().parent.parent
+
+    report_sha = _report_sha(repo_root, args.report_json)
 
     files, roots = _select_files(args, pytest_passthrough, repo_root)
 
@@ -1395,6 +1428,7 @@ def main() -> int:
     # terminal clean rather than interleaving N parallel pytest outputs).
     failures: list[tuple[Path, str, dict[str, int]]] = []
     file_times: list[tuple[Path, float]] = []  # (file, subprocess_wall) for distribution
+    file_results: list[dict] = []
     started = time.monotonic()
     files_done = 0
     tests_done = 0
@@ -1444,6 +1478,8 @@ def main() -> int:
                 for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed")
             )
             file_times.append((fpath, subproc_wall))
+            if args.report_json:
+                file_results.append({"file": _format_file(fpath, repo_root), "exit_code": rc, "retries": summary.get("retries", 0)})
             if rc == 0:
                 pass_count += 1
             else:
@@ -1613,12 +1649,10 @@ def main() -> int:
             print(f"=== {len(no_tests_ran)} file{'s' if len(no_tests_ran) != 1 else ''} where no tests ran (collection/import error, timeout before collection, etc.) ===")
             for file, s in no_tests_ran:
                 print(f"  {_format_file(file, repo_root)}")
-        return 1
 
-    if no_tests_ran_at_all:
-        return 1
-
-    return 0
+    exit_code = int(bool(failures) or no_tests_ran_at_all)
+    _write_report(args.report_json, report_sha, slice_raw, files, file_results, exit_code, repo_root)
+    return exit_code
 
 
 if __name__ == "__main__":

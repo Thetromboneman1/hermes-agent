@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 from functools import cache
+from itertools import product
 from pathlib import Path
 import re
 import sys
@@ -38,7 +39,7 @@ _E2E_SMOKES = {
     "tests/e2e/test_relay_native_openai_stream.py",
 }
 _ACP_TESTS = {"tests/acp_adapter/test_session.py", "tests/acp_adapter/test_server.py"}
-_TEST_STEPS = {"acp-regression": "Run ACP regression suite", "test": "Run tests", "e2e": "Run e2e tests"}
+_TEST_STEPS = {"acp-regression": "Run ACP regression suite", "test-shards": "Run tests", "e2e": "Run e2e tests"}
 
 
 @cache
@@ -133,6 +134,16 @@ def _run_workflow(rel, *, inputs, outcomes=None, step_outputs=None, github=None,
                     called, inputs=node["inputs"], outcomes=outcomes, step_outputs=step_outputs,
                     github=github, prefix=path)
                 result = outcomes.get(path, _aggregate(node["jobs"]))
+            matrix = body.get("strategy", {}).get("matrix")
+            if matrix:
+                assert not {"include", "exclude"}.intersection(matrix), "unsupported matrix override"
+                cells = {}
+                for values in product(*matrix.values()):
+                    cell = {**node, "ctx": {**ctx, "matrix": dict(zip(matrix, values))}}
+                    cell["result"] = outcomes.get((*path, *map(str, values)), "success")
+                    cells[values] = cell
+                node["matrix_jobs"] = cells
+                result = outcomes.get(path, _aggregate(cells))
             if result == "failure" and gha.truthy(gha.render(body.get("continue-on-error", False), ctx)):
                 result = "success"
             node["result"] = result
@@ -152,7 +163,10 @@ def _sync_run(*, changed=True, force=False, outcomes=None, event="workflow_dispa
 
 
 def _leaf_jobs(node):
-    if "jobs" not in node:
+    if "matrix_jobs" in node:
+        for cell in node["matrix_jobs"].values():
+            yield from _leaf_jobs(cell)
+    elif "jobs" not in node:
         yield node
     else:
         for child in node["jobs"].values():
@@ -206,7 +220,14 @@ def _selected_tests(node, job, repo=_REPO):
     split = argv.index("--") if "--" in argv else len(argv)
     selection, passthrough = argv[:split], argv[split + 1:]
     include = "--include-integration" in selection
-    paths = [arg for arg in selection if arg != "--include-integration"]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--include-integration", action="store_true")
+    parser.add_argument("-j", "--jobs", type=int)
+    parser.add_argument("--slice")
+    parser.add_argument("--report-json")
+    parser.add_argument("paths", nargs="*")
+    parsed = parser.parse_args(selection)
+    paths = parsed.paths
     assert paths and all(path.startswith("tests/") for path in paths), argv
     assert all(arg in {"-q", "-v", "--tb=short"} or arg.startswith("--ignore=")
                for arg in passthrough), f"unsupported selection-affecting arguments: {argv}"
@@ -216,6 +237,9 @@ def _selected_tests(node, job, repo=_REPO):
     skips = runner._SKIP_PARTS
     try:
         files, _ = runner._select_files(args, passthrough, repo)
+        if parsed.slice:
+            index, count = map(int, parsed.slice.split("/"))
+            files = runner._slice_files(files, index, count, {}, repo)
     finally:
         runner._SKIP_PARTS = skips
     assert files and all(path.stat().st_size for path in files), f"{job}: empty test selection"
@@ -224,16 +248,19 @@ def _selected_tests(node, job, repo=_REPO):
 
 def _assert_test_selection(run, repo=_REPO):
     jobs = run["validate-main-tests"]["jobs"]
-    assert set(jobs) == set(_TEST_STEPS), "the bounded test jobs changed"
+    assert set(jobs) == {*_TEST_STEPS, "test"}, "the bounded test jobs changed"
     assert _selected_tests(jobs["acp-regression"], "acp-regression", repo) == _ACP_TESTS
     assert _selected_tests(jobs["e2e"], "e2e", repo) == _E2E_SMOKES
-    selected = _selected_tests(jobs["test"], "test", repo)
+    shards = [_selected_tests(cell, "test-shards", repo) for cell in _leaf_jobs(jobs["test-shards"])]
+    selected = set().union(*shards)
     assert _ACP_TESTS <= selected
     expected_units = {path.relative_to(repo).as_posix() for path in (repo / "tests").rglob("test_*.py")
                       if not {"integration", "e2e", "docker"}.intersection(path.relative_to(repo).parts)}
     assert selected == expected_units, "unit validation must cover the complete maintained unit tree"
+    assert sum(map(len, shards)) == len(selected), "unit shards must not repeat files"
     assert not any(path.startswith(("tests/e2e/", "tests/integration/")) for path in selected)
-    for node in jobs.values():
+    for name in _TEST_STEPS:
+        node = next(_leaf_jobs(jobs[name]))
         setups = [step for step in node["body"]["steps"] if step.get("uses") == "./.github/actions/setup-pm"]
         assert len(setups) == 1
         workflow_steps.required(setups[0], node["ctx"])
@@ -268,7 +295,7 @@ def test_any_unsuccessful_dependency_blocks_rebase_even_when_forced(dependency, 
 
 
 @pytest.mark.parametrize("check,job", [
-    *(("validate-main-tests", job) for job in _TEST_STEPS),
+    *(("validate-main-tests", job) for job in (*_TEST_STEPS, "test")),
     ("validate-main-nix", "nix"), ("validate-main-lockfiles", "check"),
     ("validate-main-docs-site", "docs-site-checks"),
 ])
@@ -288,7 +315,7 @@ def test_fork_runs_full_unit_suite_and_exact_existing_e2e_smokes():
 def test_direct_test_events_use_event_sha_and_reach_all_bounded_jobs(event):
     assert event in _on(_yaml(_TESTS))
     jobs = _run_workflow(_TESTS, inputs={}, github={"event_name": event, "sha": _STALE_SHA})
-    assert set(jobs) == set(_TEST_STEPS)
+    assert set(jobs) == {*_TEST_STEPS, "test"}
     for node in jobs.values():
         assert node["result"] == "success"
         checkout = next(step for step in node["body"]["steps"] if step.get("uses", "").startswith("actions/checkout@"))
@@ -330,7 +357,7 @@ def test_validation_contract_rejects_broken_reusable_dispatch(monkeypatch, mutat
             node["secrets"] = "inherit" if mutation == "inherit-secrets" else {"release_token": "${{ secrets.RELEASE_TOKEN }}"}
     else:
         workflow = _mutated_yaml(monkeypatch, _TESTS)
-        node = workflow["jobs"]["test"]
+        node = workflow["jobs"]["test-shards"]
         if mutation == "wrong-checkout":
             node["steps"][0]["with"]["ref"] = "${{ github.sha }}"
         elif mutation == "disabled-child":
@@ -408,7 +435,7 @@ def test_replay_rejects_all_skipped_required_reusable_jobs(monkeypatch):
 
 def test_unit_receipt_rejects_narrowing_to_only_acp_and_ci(monkeypatch):
     workflow = _mutated_yaml(monkeypatch, _TESTS)
-    step = next(step for step in workflow["jobs"]["test"]["steps"] if step.get("name") == _TEST_STEPS["test"])
+    step = next(step for step in workflow["jobs"]["test-shards"]["steps"] if step.get("name") == _TEST_STEPS["test-shards"])
     step["run"] = "scripts/run_tests.sh tests/acp_adapter/ tests/ci/ -- -q --tb=short"
     with pytest.raises(AssertionError, match="complete maintained unit tree"):
         _assert_test_selection(_sync_run())

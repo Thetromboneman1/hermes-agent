@@ -53,9 +53,14 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
-  test:
+  test-shards:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        slice: [1, 2]
     runs-on: ubuntu-latest
-    # The fork now runs the full isolated suite (all maintained unit-test files), not only ACP.
+    # Same complete unit inventory, partitioned by the runner across two standard hosts.
     timeout-minutes: 60
     steps:
       - name: Checkout code
@@ -75,13 +80,59 @@ jobs:
           extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
 
       - name: Run tests
+        shell: bash
         run: |
-          scripts/run_tests.sh tests/ -- -q --ignore=tests/integration --ignore=tests/e2e --tb=short
+          report_dir="$RUNNER_TEMP/unit-tests-${{ matrix.slice }}"
+          mkdir -p "$report_dir"
+          set +e
+          scripts/run_tests.sh -j 4 --slice "${{ matrix.slice }}/2" --report-json "$report_dir/report.json" \
+            tests/ -- -q --ignore=tests/integration --ignore=tests/e2e --tb=short 2>&1 | tee "$report_dir/output.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
+          exit "${statuses[1]}"
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+      - name: Preserve shard receipt and retry output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: unit-tests-${{ matrix.slice }}
+          path: ${{ runner.temp }}/unit-tests-${{ matrix.slice }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Preserve the original required check name and fail closed on partial runs.
+  test:
+    needs: test-shards
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.validation_ref || github.sha }}
+          persist-credentials: false
+
+      - name: Download both unit shard receipts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: unit-tests-*
+          path: ${{ runner.temp }}/unit-test-reports
+
+      - name: Require complete successful unit coverage
+        if: always()
+        env:
+          SHARDS_RESULT: ${{ needs.test-shards.result }}
+          EXPECTED_SHA: ${{ inputs.validation_ref || github.sha }}
+        run: |
+          python3 -m scripts.ci.verify_test_shards \
+            --reports "$RUNNER_TEMP/unit-test-reports" --sha "$EXPECTED_SHA" --result "$SHARDS_RESULT"
 
   e2e:
     runs-on: ubuntu-latest
