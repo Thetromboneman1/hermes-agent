@@ -1,4 +1,8 @@
-"""Native metadata and artifact publication use the same verified bytes."""
+"""Native metadata and artifact publication use the same verified bytes.
+
+Workflow replay uses integrity-checked upstream references to test script
+compatibility, independently of the fork's deployed workflows.
+"""
 import hashlib
 import copy
 import json
@@ -15,6 +19,7 @@ import hermes_yaml
 import pytest
 
 from scripts.bundles.release_artifacts import materialize, record, stamp_matches
+from tests.ci.upstream_workflow_fixtures import reference_workflow_path
 from tests.scripts.test_release_r2 import r2_server
 from tests.scripts.test_stable_release import https_origin
 from tests.scripts.test_release_darwin import _inputs
@@ -274,11 +279,12 @@ def test_promote_refuses_when_one_macos_arch_is_missing(tmp_path, monkeypatch, r
 
 @pytest.fixture
 def candidate_workflow_step(tmp_path, r2_server, staged_candidate):
-    """Run real workflow shell/CLIs; replace only service endpoints and tool setup."""
+    """Replay upstream shell/CLIs; replace only service endpoints and tool setup."""
     manifest, fetched, base = staged_candidate
-    jobs = hermes_yaml.safe_load((ROOT / '.github/workflows/desktop-bundled-release.yml').read_text(encoding='utf-8-sig'))['jobs']
+    jobs = hermes_yaml.safe_load(
+        reference_workflow_path('desktop-bundled-release.yml').read_text(encoding='utf-8-sig'))['jobs']
     stable_jobs = hermes_yaml.safe_load(
-        (ROOT / '.github/workflows/stable-release.yml').read_text(encoding='utf-8-sig'))['jobs']
+        reference_workflow_path('stable-release.yml').read_text(encoding='utf-8-sig'))['jobs']
     render = next(step for step in stable_jobs['complete']['steps']
                   if step.get('name', '').startswith('Render the admitted'))
     jobs['controller-promote'] = {
