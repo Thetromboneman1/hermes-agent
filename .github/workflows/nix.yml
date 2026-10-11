@@ -1,6 +1,12 @@
 name: Nix
 
 on:
+  workflow_call:
+    inputs:
+      validation_ref:
+        description: Exact synchronized commit to validate
+        required: true
+        type: string
   push:
     branches: [main]
     paths:
@@ -31,7 +37,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: nix-${{ github.ref }}
+  group: nix-${{ inputs.validation_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -45,6 +51,9 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.validation_ref || github.sha }}
+          persist-credentials: false
       - uses: ./.github/actions/nix-setup
       - name: Evaluate flake outputs
         if: runner.os == 'Linux'
