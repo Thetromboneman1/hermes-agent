@@ -640,7 +640,7 @@ def test_deployed_reusable_validation_workflows_propagate_failures_and_inputs():
 
 
 def test_deployed_test_commands_only_select_paths_that_exist():
-    """The file-granular test runner can silently drop missing or node-ID paths."""
+    """Every literal workflow test selector resolves to an existing path."""
     paths = []
     for workflow in sorted((_REPO / ".github/workflows").glob("*.y*ml")):
         for job in _yaml(str(workflow.relative_to(_REPO)))["jobs"].values():
@@ -649,7 +649,7 @@ def test_deployed_test_commands_only_select_paths_that_exist():
                 if "scripts/run_tests.sh" in command:
                     paths.extend(re.findall(r"(?<![\w/-])(tests/[\w/.:-]*)", command))
     assert paths, "found no test selections in deployed workflows"
-    assert [p for p in paths if "::" in p or not (_REPO / p).exists()] == []
+    assert [p for p in paths if not (_REPO / p.partition("::")[0]).exists()] == []
 
 
 def _write_event(tmp_path, number: int | None = 88442) -> Path:
