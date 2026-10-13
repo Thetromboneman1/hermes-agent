@@ -1,6 +1,6 @@
 {
   "source_repository": "https://github.com/NousResearch/hermes-agent",
-  "source_commit": "ce966fef7170fc7101cbb40603ee45def8c4e965",
+  "source_commit": "6e7b83a2f1c093e992a8d838ed77ea320fbd8e51",
   "files": {
     "archive-inputs.yml": {
       "source_path": ".github/workflows/archive-inputs.yml",
@@ -16,7 +16,7 @@
     },
     "desktop-bundled-release.yml": {
       "source_path": ".github/workflows/desktop-bundled-release.yml",
-      "sha256": "5ebbb21bfa5fd76700a0156ecae992e72941b9428cc11d2123f9097d5f0abc24"
+      "sha256": "f0de0d99c9bb34d7711aad57ecda2d278ccbc744061c52f5618f8e4b583ab5a3"
     },
     "docker.yml": {
       "source_path": ".github/workflows/docker.yml",
@@ -28,15 +28,15 @@
     },
     "plugin-catalog-ci.yml": {
       "source_path": ".github/workflows/plugin-catalog-ci.yml",
-      "sha256": "1a4102042fd18abc2687207b4d78c313e0960d24f86e72f79647d7f28a0b1a12"
+      "sha256": "68eb64d57e23cd1a8c6a7a8b6f3855f4935c4116633dae38261a25d6f6c8442c"
     },
     "stable-release-publication.yml": {
       "source_path": ".github/workflows/stable-release-publication.yml",
-      "sha256": "93d14dfa2bc9c6a30ff8005ee0dba611feae9e69841853473be17421436b747a"
+      "sha256": "5de6b7c3c4f731f495a6d3872b125fb94e70bc6108424baf4fa2d7c02f1b1571"
     },
     "stable-release.yml": {
       "source_path": ".github/workflows/stable-release.yml",
-      "sha256": "330d16926c5ca4e5a226b4ff8b4eaaf59faad08299c72a365773584df45c88bd"
+      "sha256": "4d4667f5b4e27f5b1b87ca46ebad2e669372a2776ac0f341623bd8f043fb593f"
     },
     "termux-verify.yml": {
       "source_path": ".github/workflows/termux-verify.yml",

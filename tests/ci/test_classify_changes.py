@@ -47,12 +47,13 @@ DEFAULT = {
     "bootstrap": True,
     "desktop_updater": True,
     "rust": True,
+    "remote_backends": True,
 }
 
 SLOW_LANES = {"docker", "nix", "e2e", "e2e_upgrade", "e2e_desktop_core", "e2e_desktop_update"}
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, bootstrap=False, desktop_updater=False, rust=False, docker_meta=False, python_prod=None, nix=False, docker=None, e2e=False, e2e_upgrade=False, e2e_desktop_core=False, e2e_desktop_update=False) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, bootstrap=False, desktop_updater=False, rust=False, docker_meta=False, python_prod=None, nix=False, docker=None, e2e=False, e2e_upgrade=False, e2e_desktop_core=False, e2e_desktop_update=False, remote_backends=False) -> dict[str, bool]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
     #
@@ -80,6 +81,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "bootstrap": bootstrap,
         "desktop_updater": desktop_updater,
         "rust": rust,
+        "remote_backends": remote_backends,
     }
 
 
@@ -323,6 +325,38 @@ CASES = {
     ),
     # Slow lanes on a pull request: an ordinary product change starts none of
     # them; the suite, its harness, or the code it guards starts its own.
+    "ssh backend → remote_backends": (
+        ["tools/environments/ssh.py"],
+        _lanes(python=True, scan=True, remote_backends=True),
+    ),
+    "docker backend → remote_backends": (
+        ["tools/environments/docker.py"],
+        _lanes(python=True, scan=True, remote_backends=True),
+    ),
+    "terminal tool sibling → remote_backends": (
+        ["tools/terminal_tool_backends.py"],
+        _lanes(python=True, scan=True, remote_backends=True),
+    ),
+    "real docker backend test → remote_backends": (
+        ["tests/tools/test_docker_backend_real.py"],
+        _lanes(python=True, python_prod=False, scan=True, remote_backends=True),
+    ),
+    "mocked docker unit test → no remote_backends": (
+        ["tests/tools/test_docker_environment.py"],
+        _lanes(python=True, python_prod=False, scan=True),
+    ),
+    "sshd harness → remote_backends": (
+        ["scripts/ci/start_test_sshd.sh"],
+        _lanes(python=True, remote_backends=True),
+    ),
+    "sshd container setup → remote_backends": (
+        ["scripts/ci/test_sshd_container_setup.sh"],
+        _lanes(python=True, remote_backends=True),
+    ),
+    "other tool → no remote_backends": (
+        ["tools/file_tools.py"],
+        _lanes(python=True, scan=True),
+    ),
     "gateway python → no slow lane": (["gateway/run.py", "agent/x.py"], _lanes(python=True, scan=True)),
     "desktop renderer → no slow lane": (["apps/desktop/src/app/chat/composer.tsx"], _lanes(frontend=True)),
     "python e2e suite → e2e only": (
@@ -421,7 +455,12 @@ def test_every_slow_lane_path_matches_a_tracked_file():
     if tracked.returncode != 0:
         pytest.skip("not a git checkout")
     files = tracked.stdout.splitlines()
-    tables = {**_mod._E2E_LANES, "docker": _mod._DOCKER_PATHS, "nix": _mod._NIX_LANE_PATHS}
+    tables = {
+        **_mod._E2E_LANES,
+        "docker": _mod._DOCKER_PATHS,
+        "nix": _mod._NIX_LANE_PATHS,
+        "remote_backends": _mod._REMOTE_BACKEND_PATHS,
+    }
     dead = {
         (lane, prefix)
         for lane, prefixes in tables.items()
