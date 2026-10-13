@@ -1128,6 +1128,23 @@ def _write_report(path, sha, slice_raw, files, results, exit_code, repo_root) ->
     }, indent=2) + "\n", encoding="utf-8")
 
 
+def _report_skips(
+    skipped_files: list[tuple[Path, int]], repo_root: Path,
+) -> bool:
+    """Report parsed skips when a coverage-critical lane forbids them."""
+    total = sum(n for _, n in skipped_files)
+    if not total:
+        return False
+    print()
+    print(
+        f"=== ✗ {total} test{'s' if total != 1 else ''} SKIPPED under "
+        "--fail-on-skip. This is NOT a pass. ==="
+    )
+    for file, count in sorted(skipped_files, key=lambda item: str(item[0])):
+        print(f"  {_format_file(file, repo_root)}  ({count} skipped)")
+    return True
+
+
 def main() -> int:
     _make_stdio_glyph_safe()
     parser = argparse.ArgumentParser(
@@ -1184,6 +1201,14 @@ def main() -> int:
         "--report-json",
         type=Path,
         help="Write selected/completed files, checkout SHA, exit code and retry counts for CI verification.",
+    )
+    parser.add_argument(
+        "--fail-on-skip",
+        action="store_true",
+        help=(
+            "Fail the run if any test is skipped. Use for lanes whose "
+            "coverage would otherwise disappear behind a platform skip."
+        ),
     )
     parser.add_argument(
         "--slice",
@@ -1260,7 +1285,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
-        "--files-from", "--report-json",
+        "--files-from", "--report-json", "--fail-on-skip",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1437,6 +1462,7 @@ def main() -> int:
     tests_passed = 0
     tests_failed = 0
     tests_skipped = 0
+    skipped_files: list[tuple[Path, int]] = []
     # Every collected outcome, not just pass/fail: a legitimately all-skipped
     # (platform-gated) file reports "2 skipped" and must NOT trip the
     # nothing-ran guard, whereas a file that died before collection reports
@@ -1472,6 +1498,8 @@ def main() -> int:
             tests_passed += summary.get("passed", 0)
             tests_failed += summary.get("failed", 0)
             tests_skipped += summary.get("skipped", 0)
+            if summary.get("skipped", 0):
+                skipped_files.append((fpath, summary["skipped"]))
             files_crashed += summary.get("crashed", 0)
             tests_collected += sum(
                 summary.get(k, 0)
@@ -1650,7 +1678,10 @@ def main() -> int:
             for file, s in no_tests_ran:
                 print(f"  {_format_file(file, repo_root)}")
 
-    exit_code = int(bool(failures) or no_tests_ran_at_all)
+    skips_fail_the_run = bool(args.fail_on_skip) and _report_skips(
+        skipped_files, repo_root
+    )
+    exit_code = int(bool(failures) or no_tests_ran_at_all or skips_fail_the_run)
     _write_report(args.report_json, report_sha, slice_raw, files, file_results, exit_code, repo_root)
     return exit_code
 

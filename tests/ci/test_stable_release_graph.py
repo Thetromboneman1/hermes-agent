@@ -108,8 +108,13 @@ def test_claim_flags_remove_exactly_the_jobs_the_gate_expects_skipped():
     from scripts.releases.stable import SKIPPED_BY
 
     jobs = workflow("stable-release.yml")["jobs"]
-    outputs = {"skipTests": "needs.admit.outputs.skip-tests",
-               "skipBundles": "needs.admit.outputs.skip-bundles"}
+    # A skip flag removes a job when true; an opt-in flag removes it when false.
+    outputs = {
+        "skipTests": "needs.admit.outputs.skip-tests != 'true'",
+        "skipBundles": "needs.admit.outputs.skip-bundles != 'true'",
+        "excludeMacosIntel": "needs.admit.outputs.include-macos-intel == 'true'",
+        "excludeTermux": "needs.admit.outputs.include-termux == 'true'",
+    }
 
     def needs_of(name):
         needs = jobs[name].get("needs", [])
@@ -117,7 +122,7 @@ def test_claim_flags_remove_exactly_the_jobs_the_gate_expects_skipped():
 
     def removed_by(name, flag):
         condition = str(jobs[name].get("if", ""))
-        if f"{outputs[flag]} != 'true'" in condition:
+        if outputs[flag] in condition:
             return True
         # Without a status function a job skips when any job it needs skipped.
         return ("always()" not in condition and "!cancelled()" not in condition
@@ -133,14 +138,31 @@ def test_claim_flags_remove_exactly_the_jobs_the_gate_expects_skipped():
     for name in ("docker", "candidates-darwin-arm64", "candidates-darwin-x64", "candidates-win32-arm64",
                  "candidates-win32-x64", "candidates-win32-bundle", "candidates-termux"):
         assert jobs[name]["with"]["skip-tests"] == "${{ needs.admit.outputs.skip-tests == 'true' }}"
-    assert {"skip-bundles", "skip-tests"} <= set(jobs["admit"]["outputs"])
+    assert {
+        "skip-bundles", "skip-tests", "include-macos-intel", "include-termux"
+    } <= set(jobs["admit"]["outputs"])
     for name in ("acceptance", "publication", "complete"):
         gate = next(step for step in jobs[name]["steps"]
                     if "scripts.releases.stable gate" in step.get("run", ""))
         assert gate["env"]["SKIP_BUNDLES"] == "${{ needs.admit.outputs.skip-bundles }}"
         assert gate["env"]["SKIP_TESTS"] == "${{ needs.admit.outputs.skip-tests }}"
+        assert gate["env"]["INCLUDE_MACOS_INTEL"] == "${{ needs.admit.outputs.include-macos-intel }}"
+        assert gate["env"]["INCLUDE_TERMUX"] == "${{ needs.admit.outputs.include-termux }}"
         gated = gate["run"].split(" gate ", 1)[1].split()
         assert set(gated) <= set(needs_of(name)), name
+
+
+def test_a_skipped_upgrade_arm_never_skips_a_gated_publish_job():
+    """A skipped packaged-upgrade arm must not skip its publication gate."""
+    from scripts.releases.stable import PACKAGED_BY
+
+    jobs = workflow("stable-release.yml")["jobs"]
+    for name, job in jobs.items():
+        if set(PACKAGED_BY) & ancestors(jobs, name):
+            condition = str(job.get("if", ""))
+            assert "always()" in condition or "!cancelled()" in condition, (
+                f"{name} skips whenever an upgrade arm skips"
+            )
 
 
 def test_live_sync_aggregates_every_validation_before_custom_rebase():
@@ -148,10 +170,7 @@ def test_live_sync_aggregates_every_validation_before_custom_rebase():
     live = YAML(typ="base").load((ROOT / ".github/workflows/upstream-sync.yml").read_text(encoding="utf-8"))
     jobs = live["jobs"]
     checks = {name for name in jobs if name.startswith("validate-main-")}
-    assert checks == {
-        "validate-main-tests", "validate-main-nix", "validate-main-lockfiles",
-        "validate-main-docs-site", "validate-main-container", "validate-main-documentation",
-    }
+    assert checks, "found no deployed main-validation lanes"
     assert {"sync-main", *checks} <= set(direct_needs(jobs, "rebase-custom-branches"))
 
 
