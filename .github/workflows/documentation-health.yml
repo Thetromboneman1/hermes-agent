@@ -39,7 +39,7 @@ jobs:
             exit 1
           fi
       - name: Commit self-healed documentation
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
         run: |
           if ! git status --porcelain | grep -q .; then
             exit 0
