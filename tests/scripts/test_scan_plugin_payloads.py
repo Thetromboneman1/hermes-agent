@@ -115,6 +115,26 @@ def test_zip_hiding_a_binary_fails(tmp_path):
     assert any("not reviewable source" in f for f in findings), findings
 
 
+@pytest.mark.parametrize("name", ["reviewed.png", "reviewed.py"])
+def test_zip_cannot_disguise_a_binary_as_reviewable_content(tmp_path, name):
+    arc = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(arc, "w") as zf:
+        zf.writestr(name, b"MZ\x90\x00" + b"\x00" * 32)
+    findings = _scan(tmp_path)
+    assert any(name in f and "compiled binary" in f for f in findings), findings
+
+
+def test_zip_symlink_member_fails(tmp_path):
+    arc = tmp_path / "bundle.zip"
+    info = zipfile.ZipInfo("reviewed.py")
+    info.create_system = 3
+    info.external_attr = 0o120777 << 16
+    with zipfile.ZipFile(arc, "w") as zf:
+        zf.writestr(info, "target.py")
+    findings = _scan(tmp_path)
+    assert any("non-regular member" in f for f in findings), findings
+
+
 def test_symlinks_are_not_followed(tmp_path):
     (tmp_path / "real.py").write_text("x=1\n")
     try:

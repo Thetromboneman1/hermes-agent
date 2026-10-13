@@ -91,8 +91,23 @@ def _archive_problem(path: Path, data: bytes) -> str | None:
     try:
         if zipfile.is_zipfile(io.BytesIO(data)):
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                bad = [n for n in zf.namelist() if not _is_source_member(n)]
-                return f"archive member not reviewable source: {bad[0]}" if bad else None
+                for member in zf.infolist():
+                    if member.is_dir():
+                        continue
+                    # Unix-created ZIPs preserve the file type in the upper
+                    # mode bits. A symlink or other special member is not
+                    # reviewable source; mode 0 is the ordinary DOS/Windows
+                    # representation and is accepted as a regular file.
+                    mode = member.external_attr >> 16
+                    file_type = mode & 0o170000
+                    if file_type not in (0, 0o100000):
+                        return f"archive has a non-regular member: {member.filename}"
+                    if not _is_source_member(member.filename):
+                        return f"archive member not reviewable source: {member.filename}"
+                    with zf.open(member) as stream:
+                        if _magic_kind(stream.read(8)):
+                            return f"archive member is a compiled binary: {member.filename}"
+                return None
         bio = io.BytesIO(data)
         with tarfile.open(fileobj=bio) as tf:  # autodetects gzip/bz2/xz
             for member in tf.getmembers():
@@ -110,7 +125,7 @@ def _archive_problem(path: Path, data: bytes) -> str | None:
             return None
     except tarfile.ReadError:
         return _single_stream_problem(path, data)
-    except (tarfile.TarError, zipfile.BadZipFile, OSError, EOFError):
+    except (tarfile.TarError, zipfile.BadZipFile, OSError, EOFError, RuntimeError):
         # Not a parseable archive we recognise. A file carrying an archive
         # suffix we cannot open is itself unreviewable.
         return "archive could not be opened for review"
